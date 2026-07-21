@@ -121,6 +121,7 @@ function openModal(node, cornersWidget) {
 
   const view = { s: 1, tx: 0, ty: 0 };   // screen = baseScreen * s + (tx,ty)
   let gridN = 4;                          // grid divisions (0 = off)
+  let dim = 0.35;                         // darken the image beneath the overlay (0..0.8)
   let inited = false;                     // first-resize view framing done?
 
   const overlay = document.createElement("div");
@@ -150,10 +151,23 @@ function openModal(node, cornersWidget) {
   refreshGridLbl();
   const gridMinus = mkBtn("−", () => { gridN = Math.max(0, gridN - 1); refreshGridLbl(); draw(); });
   const gridPlus = mkBtn("+", () => { gridN = Math.min(16, gridN + 1); refreshGridLbl(); draw(); });
-  const resetBtn = mkBtn("Reset view", () => { resetView(); draw(); });
+  const resetView_ = mkBtn("Reset view", () => { resetView(); draw(); });
+  const resetPts = mkBtn("↺ Reset points", () => {
+    state.corners = JSON.parse(JSON.stringify(DEFAULT.corners));
+    draw();
+  });
+  // Darken slider (like fSpy Camera): dims the photo so the quad and grid read clearly.
+  const dimWrap = document.createElement("label");
+  dimWrap.style.cssText = "display:flex;align-items:center;gap:6px;color:#8a92a4";
+  dimWrap.title = "Darken the image beneath the overlay";
+  const dimRng = document.createElement("input");
+  dimRng.type = "range"; dimRng.min = "0"; dimRng.max = "0.8"; dimRng.step = "0.05";
+  dimRng.value = String(dim); dimRng.style.width = "80px";
+  dimRng.oninput = () => { dim = parseFloat(dimRng.value); draw(); };
+  dimWrap.append(document.createTextNode("Darken"), dimRng);
   const closeBtn = mkBtn("Save & close", () => save());
   closeBtn.style.borderColor = "#4ab4ff"; closeBtn.style.color = "#4ab4ff";
-  head.append(gridMinus, gridLbl, gridPlus, resetBtn, closeBtn);
+  head.append(gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_, closeBtn);
 
   const wrap = document.createElement("div");
   wrap.style.cssText = "position:relative;flex:1 1 auto;min-height:0;background:#0b0d12;display:flex";
@@ -240,7 +254,11 @@ function openModal(node, cornersWidget) {
     const cw = canvas.width / dpr, ch = canvas.height / dpr;
     ctx.clearRect(0, 0, cw, ch); ctx.fillStyle = "#0b0d12"; ctx.fillRect(0, 0, cw, ch);
     const [ox, oy, w, h] = baseFit();
-    if (url) ctx.drawImage(imgObj, ox * view.s + view.tx, oy * view.s + view.ty, w * view.s, h * view.s);
+    if (url) {
+      const sx = ox * view.s + view.tx, sy = oy * view.s + view.ty;
+      ctx.drawImage(imgObj, sx, sy, w * view.s, h * view.s);
+      if (dim > 0) { ctx.fillStyle = `rgba(0,0,0,${dim})`; ctx.fillRect(sx, sy, w * view.s, h * view.s); }
+    }
 
     // Internal perspective grid (projective, so it matches real lines).
     if (gridN > 1) {
@@ -326,21 +344,22 @@ function openModal(node, cornersWidget) {
       const r = toRel(mx, my);
       const delta = sub(r, drag.lastRel);
       drag.lastRel = r;
-      // Slide the whole side while keeping the perspective: both corners must land
-      // on ONE line through the vanishing point where the two adjacent edges
-      // (the corners' rails) meet. Projecting the drag onto each rail independently
-      // moves the corners by different amounts and tilts the side — instead, form
-      // the moved side-line through that VP and re-intersect it with each rail, so
-      // the two corners stay locked to a single line (no tilt, VP preserved).
+      // Slide the whole side while keeping the perspective. The side keeps aiming at
+      // ITS vanishing point: where this side and the opposite side meet (the opposite
+      // side runs through the two anchors). Move the side's midpoint by the drag, draw
+      // the new side-line through that VP, then re-intersect it with each rail (the two
+      // adjacent edges the corners ride on). Both corners land on one line → no tilt;
+      // each stays on its rail → adjacent angles preserved. The rails do NOT pass
+      // through this VP, so the intersections are proper finite points.
       const [c0, c1] = drag.e.c;
       const [a0, a1] = drag.e.anchor;
       const P0 = state.corners[c0], P1 = state.corners[c1];
       const A0 = state.corners[a0], A1 = state.corners[a1];
       const mid = [(P0[0] + P1[0]) / 2 + delta[0], (P0[1] + P1[1]) / 2 + delta[1]];
-      // VP = where the two rails meet (null when they're parallel — VP at infinity).
-      const vp = lineIntersect(P0, A0, P1, A1);
-      // Second point defining the new side-line: the VP, or (rails parallel) a point
-      // that keeps the side parallel to itself.
+      // VP where this side meets the opposite side (null when they're parallel).
+      const vp = lineIntersect(P0, P1, A0, A1);
+      // Second point of the new side-line: the VP, or (sides parallel) a point that
+      // keeps the side parallel to itself.
       const q = vp || [mid[0] + (P1[0] - P0[0]), mid[1] + (P1[1] - P0[1])];
       const n0 = lineIntersect(mid, q, P0, A0);
       const n1 = lineIntersect(mid, q, P1, A1);
