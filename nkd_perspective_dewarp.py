@@ -300,8 +300,13 @@ if _HAS_COMFY:
                 is_output_node=True,
                 inputs=[
                     io.Image.Input("image"),
+                    # multiline=False on purpose: the JS widget hides this input and
+                    # drives it from the on-image corner editor. A multiline String is a
+                    # real DOM textarea that survives type='hidden'/computeSize and paints
+                    # as a giant column below the node; single-line is a canvas widget that
+                    # actually disappears when hidden.
                     io.String.Input("corners", default=json.dumps(_DEFAULT_STATE),
-                                    socketless=True, multiline=True),
+                                    socketless=True, multiline=False),
                     io.Combo.Input("aspect_source",
                                    options=["Auto", "Metric", "Manual"], default="Auto",
                                    display_name="Aspect Source",
