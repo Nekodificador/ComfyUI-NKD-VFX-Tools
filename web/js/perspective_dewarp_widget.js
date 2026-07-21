@@ -71,6 +71,16 @@ function updateVisibility(node) {
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
 
+// Intersection point of line (a,b) with line (c,d). null if near-parallel.
+function lineIntersect(a, b, c, d) {
+  const rx = b[0] - a[0], ry = b[1] - a[1];
+  const sx = d[0] - c[0], sy = d[1] - c[1];
+  const den = rx * sy - ry * sx;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((c[0] - a[0]) * sy - (c[1] - a[1]) * sx) / den;
+  return [a[0] + t * rx, a[1] + t * ry];
+}
+
 // Solve the 3x3 homography mapping the unit square [(0,0),(1,0),(1,1),(0,1)] to
 // the four dst points, via Gaussian elimination on the 8x8 DLT system.
 function homography(dst) {
@@ -316,19 +326,26 @@ function openModal(node, cornersWidget) {
       const r = toRel(mx, my);
       const delta = sub(r, drag.lastRel);
       drag.lastRel = r;
-      // Slide each corner of this side along its perpendicular edge line, so the
-      // adjacent lines keep their angle (perspective preserved).
-      drag.e.c.forEach((ci, k) => {
-        const ai = drag.e.anchor[k];
-        let dir = sub(state.corners[ci], state.corners[ai]);
-        const len = Math.hypot(dir[0], dir[1]) || 1;
-        dir = [dir[0] / len, dir[1] / len];
-        const proj = dot(delta, dir);
-        state.corners[ci] = [
-          state.corners[ci][0] + dir[0] * proj,
-          state.corners[ci][1] + dir[1] * proj,
-        ];
-      });
+      // Slide the whole side while keeping the perspective: both corners must land
+      // on ONE line through the vanishing point where the two adjacent edges
+      // (the corners' rails) meet. Projecting the drag onto each rail independently
+      // moves the corners by different amounts and tilts the side — instead, form
+      // the moved side-line through that VP and re-intersect it with each rail, so
+      // the two corners stay locked to a single line (no tilt, VP preserved).
+      const [c0, c1] = drag.e.c;
+      const [a0, a1] = drag.e.anchor;
+      const P0 = state.corners[c0], P1 = state.corners[c1];
+      const A0 = state.corners[a0], A1 = state.corners[a1];
+      const mid = [(P0[0] + P1[0]) / 2 + delta[0], (P0[1] + P1[1]) / 2 + delta[1]];
+      // VP = where the two rails meet (null when they're parallel — VP at infinity).
+      const vp = lineIntersect(P0, A0, P1, A1);
+      // Second point defining the new side-line: the VP, or (rails parallel) a point
+      // that keeps the side parallel to itself.
+      const q = vp || [mid[0] + (P1[0] - P0[0]), mid[1] + (P1[1] - P0[1])];
+      const n0 = lineIntersect(mid, q, P0, A0);
+      const n1 = lineIntersect(mid, q, P1, A1);
+      if (n0) state.corners[c0] = n0;
+      if (n1) state.corners[c1] = n1;
     } else if (drag.kind === "pan") {
       view.tx += mx - drag.lastX; view.ty += my - drag.lastY;
       drag.lastX = mx; drag.lastY = my;
