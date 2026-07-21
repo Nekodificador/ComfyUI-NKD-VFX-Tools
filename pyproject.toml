@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-nkd-vfx-tools"
+version = "1.2.1"
+description = "VFX control for AI pipelines: art-direct generation with light, camera, depth, 3D placement and perspective. Relight, lens blur, 3D/splat preview, fSpy camera solve, perspective unwarp"
+readme = "README.md"
+license = { file = "LICENSE" }
+dependencies = ["numpy"]
+
+[project.urls]
+Repository = "https://github.com/Nekodificador/ComfyUI-NKD-VFX-Tools"
+
+[tool.comfy]
+PublisherId = "nekodificador"
+DisplayName = "NKD VFX Tools"
+Icon = ""
