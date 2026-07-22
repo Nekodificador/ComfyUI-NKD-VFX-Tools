@@ -41,6 +41,8 @@ Restart ComfyUI. Nothing to download, no extra setup.
 
 ### 😺NKD Relight
 
+https://github.com/user-attachments/assets/ebd779d3-cc0e-48b2-9b8f-a5b5c573941a
+
 Relight a photo from its depth and normal passes. Add lights, drag them around a sphere,
 and the image updates live on the node without queueing anything. You get screen-space
 shadows, ambient colour, and material response if you also feed albedo and roughness.
