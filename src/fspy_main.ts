@@ -110,7 +110,7 @@ comfyApp.registerExtension({
       function openViewer() {
         if (vueApp) return;                        // already open
         const url = sentUrl || upstreamUrl();
-        if (!url) comfyApp.extensionManager?.toast?.add?.({ severity: "warn", summary: "fSpy Camera", detail: "Conecta una imagen al input y ejecuta este nodo una vez (play azul) para cargar la foto.", life: 6000 });
+        if (!url) comfyApp.extensionManager?.toast?.add?.({ severity: "warn", summary: "fSpy Camera", detail: "Connect an image to the input and run this node once (blue play) to load the photo.", life: 6000 });
         host = document.createElement("div");
         document.body.appendChild(host);
         vueApp = createApp(FSpyWidget, {

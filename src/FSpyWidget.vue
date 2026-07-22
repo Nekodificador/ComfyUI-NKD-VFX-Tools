@@ -74,7 +74,7 @@ function redraw() {
   ctx.fillStyle = "#0b0d12"; ctx.fillRect(0, 0, W, H);
   const [ix, iy, iw, ih] = imgRect();
   if (img) ctx.drawImage(img, ix, iy, iw, ih);
-  else { ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = "13px system-ui"; ctx.fillText("Conecta una imagen al input del nodo.", 16, 28); }
+  else { ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.font = "13px system-ui"; ctx.fillText("Connect an image to the node's input.", 16, 28); }
   if (img && dim.value > 0) { ctx.fillStyle = `rgba(0,0,0,${dim.value})`; ctx.fillRect(ix, iy, iw, ih); }  // darken under overlays
   const res = solveNow();
   const toPx = (p: [number, number]): [number, number] => [ix + p[0] * iw, iy + p[1] * ih];
@@ -211,7 +211,7 @@ onBeforeUnmount(() => { ro?.disconnect(); window.removeEventListener("keydown", 
   <div class="nkd-fspy-modal" @pointerdown.self="close">
     <div class="nkd-fspy-panel">
       <div class="nkd-head">
-        <span>😺 fSpy Camera — arrastra los tiradores sobre dos direcciones ortogonales</span>
+        <span>😺 fSpy Camera — drag the handles along two orthogonal directions</span>
         <button class="nkd-x" @click="close">✕</button>
       </div>
       <div class="nkd-canvas-wrap" ref="wrap">
@@ -220,26 +220,26 @@ onBeforeUnmount(() => { ro?.disconnect(); window.removeEventListener("keydown", 
       <div class="nkd-bar">
         <span class="nkd-hud" :class="{ bad: !hud.ok }">
           <template v-if="hud.ok">FOV {{ hud.fovV.toFixed(1) }}°v · {{ hud.fovH.toFixed(1) }}°h &nbsp;|&nbsp; {{ hud.focal.toFixed(1) }}mm &nbsp;|&nbsp; pitch {{ hud.pitch.toFixed(1) }}° · yaw {{ hud.yaw.toFixed(1) }}°</template>
-          <template v-else>líneas degeneradas — ajusta los tiradores</template>
+          <template v-else>degenerate lines — adjust the handles</template>
         </span>
         <span class="nkd-spacer" />
         <button class="nkd-tog" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
-        <button class="nkd-tog" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Ejes</button>
-        <button class="nkd-tog" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Caja</button>
-        <label class="nkd-lbl" title="Oscurecer la imagen bajo los overlays">Atenuar
+        <button class="nkd-tog" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
+        <button class="nkd-tog" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
+        <label class="nkd-lbl" title="Darken the image beneath the overlay">Darken
           <input type="range" class="nkd-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
         </label>
-        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp1 }" title="Eje de mundo al que apunta la fuga naranja (VP1)">VP1→
+        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp1 }" title="World axis the orange vanishing point (VP1) maps to">VP1→
           <select v-model="state.vp1Axis" class="nkd-sel" @change="onAxis">
             <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
           </select>
         </label>
-        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp2 }" title="Eje de mundo al que apunta la fuga azul (VP2)">VP2→
+        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp2 }" title="World axis the blue vanishing point (VP2) maps to">VP2→
           <select v-model="state.vp2Axis" class="nkd-sel" @change="onAxis">
             <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
           </select>
         </label>
-        <button class="nkd-save" @click="close">Guardar y cerrar</button>
+        <button class="nkd-save" @click="close">Save & close</button>
       </div>
     </div>
   </div>

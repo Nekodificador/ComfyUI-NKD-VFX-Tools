@@ -22,6 +22,10 @@ export default defineConfig({
   },
 
   build: {
+    // web/js also holds a hand-written extension (perspective_dewarp_widget.js) that
+    // is NOT a Vite entry. emptyOutDir defaults to true here (outDir is inside root),
+    // which wipes that file on every build — that is how it was lost once already.
+    emptyOutDir: false,
     rollupOptions: {
       input: {
         relighting_widget: "./src/main.ts",

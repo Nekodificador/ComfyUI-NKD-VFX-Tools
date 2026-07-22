@@ -124,20 +124,34 @@ function openModal(node, cornersWidget) {
   let dim = 0.35;                         // darken the image beneath the overlay (0..0.8)
   let inited = false;                     // first-resize view framing done?
 
+  // Centered floating panel, matching the fSpy Camera editor's chrome.
   const overlay = document.createElement("div");
   overlay.style.cssText =
-    "position:fixed;inset:0;z-index:100000;display:flex;flex-direction:column;" +
-    "background:#000c;backdrop-filter:blur(3px);font:12px system-ui,sans-serif;color:#c8d0e0";
+    "position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;" +
+    "background:rgba(0,0,0,0.8);backdrop-filter:blur(3px);font:12px system-ui,sans-serif;color:#c8d0e0";
+  const panel = document.createElement("div");
+  panel.style.cssText =
+    "display:flex;flex-direction:column;width:92vw;height:92vh;max-width:1800px;background:#111318;" +
+    "color:#c8d0e0;border:1px solid #3a3d46;border-radius:10px;box-shadow:0 12px 48px rgba(0,0,0,0.7);overflow:hidden";
+
   const head = document.createElement("div");
-  head.style.cssText = "padding:8px 14px;background:#1a1c22;display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+  head.style.cssText =
+    "display:flex;align-items:center;gap:10px;padding:10px 14px;background:#1a1c22;" +
+    "border-bottom:1px solid rgba(255,255,255,0.07);font-weight:500";
   const title = document.createElement("span");
   title.textContent = "😺 Perspective Unwarp";
   const hint = document.createElement("span");
-  hint.style.cssText = "color:#ffffff66;font-size:11px";
+  hint.style.cssText = "color:#ffffff66;font-size:11px;font-weight:400";
   hint.textContent = "corners distort · sides stretch · scroll zoom · drag empty to pan";
-  const spacer = document.createElement("span");
-  spacer.style.cssText = "flex:1 1 auto";
-  head.append(title, hint, spacer);
+  const headSpacer = document.createElement("span");
+  headSpacer.style.cssText = "flex:1 1 auto";
+  const xBtn = document.createElement("button");
+  xBtn.textContent = "✕";
+  xBtn.style.cssText = "background:transparent;border:none;color:#c8d0e0;font-size:16px;cursor:pointer;padding:2px 8px;border-radius:4px";
+  xBtn.onmouseenter = () => { xBtn.style.background = "rgba(255,77,77,0.25)"; xBtn.style.color = "#ff6b6b"; };
+  xBtn.onmouseleave = () => { xBtn.style.background = "transparent"; xBtn.style.color = "#c8d0e0"; };
+  xBtn.onclick = () => save();
+  head.append(title, hint, headSpacer, xBtn);
 
   const mkBtn = (label, fn) => {
     const b = document.createElement("button");
@@ -158,23 +172,32 @@ function openModal(node, cornersWidget) {
   });
   // Darken slider (like fSpy Camera): dims the photo so the quad and grid read clearly.
   const dimWrap = document.createElement("label");
-  dimWrap.style.cssText = "display:flex;align-items:center;gap:6px;color:#8a92a4";
+  dimWrap.style.cssText = "display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.55)";
   dimWrap.title = "Darken the image beneath the overlay";
   const dimRng = document.createElement("input");
   dimRng.type = "range"; dimRng.min = "0"; dimRng.max = "0.8"; dimRng.step = "0.05";
-  dimRng.value = String(dim); dimRng.style.width = "80px";
+  dimRng.value = String(dim); dimRng.style.cssText = "width:80px;accent-color:#4ab4ff;cursor:pointer";
   dimRng.oninput = () => { dim = parseFloat(dimRng.value); draw(); };
   dimWrap.append(document.createTextNode("Darken"), dimRng);
   const closeBtn = mkBtn("Save & close", () => save());
-  closeBtn.style.borderColor = "#4ab4ff"; closeBtn.style.color = "#4ab4ff";
-  head.append(gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_, closeBtn);
+  closeBtn.style.borderColor = "#4ab4ff"; closeBtn.style.color = "#4ab4ff"; closeBtn.style.fontWeight = "500";
 
   const wrap = document.createElement("div");
   wrap.style.cssText = "position:relative;flex:1 1 auto;min-height:0;background:#0b0d12;display:flex";
   const canvas = document.createElement("canvas");
   canvas.style.cssText = "width:100%;height:100%;touch-action:none;cursor:crosshair";
   wrap.appendChild(canvas);
-  overlay.append(head, wrap);
+
+  // Bottom control bar, matching the fSpy Camera editor.
+  const bar = document.createElement("div");
+  bar.style.cssText =
+    "display:flex;align-items:center;gap:12px;padding:8px 14px;background:#1a1c22;border-top:1px solid rgba(255,255,255,0.07)";
+  const barSpacer = document.createElement("span");
+  barSpacer.style.cssText = "flex:1 1 auto";
+  bar.append(barSpacer, gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_, closeBtn);
+
+  panel.append(head, wrap, bar);
+  overlay.append(panel);
   document.body.appendChild(overlay);
 
   const ctx = canvas.getContext("2d");
