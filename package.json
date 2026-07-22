@@ -1,6 +1,6 @@
 {
   "name": "comfyui-nkd-vfx-tools",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "NKD VFX Tools — relighting, lens blur and mask scheduling for ComfyUI",
   "scripts": {
     "dev": "vite",

@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-nkd-vfx-tools"
-version = "1.2.1"
+version = "1.2.2"
 description = "VFX control for AI pipelines: art-direct generation with light, camera, depth, 3D placement and perspective. Relight, lens blur, 3D/splat preview, fSpy camera solve, perspective unwarp"
 readme = "README.md"
 license = { file = "LICENSE" }
