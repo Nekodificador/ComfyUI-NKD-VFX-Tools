@@ -26,7 +26,6 @@ try:
         _mask_grow,
         _megapixels_to_pixels,
         _post_blend,
-        _resize_auto,
     )
 except ImportError:  # pragma: no cover - standalone test path
     from nkd_vfx_helpers import (
@@ -35,7 +34,6 @@ except ImportError:  # pragma: no cover - standalone test path
         _mask_grow,
         _megapixels_to_pixels,
         _post_blend,
-        _resize_auto,
     )
 
 # comfy_api only exists inside ComfyUI. The pure geometry/pipeline functions
@@ -101,6 +99,17 @@ def _warp_image(image: torch.Tensor, H_out_to_in: np.ndarray, out_h: int, out_w:
     inside = ((sx >= 0) & (sx <= in_w) & (sy >= 0) & (sy <= in_h)).float()
     mask = inside.unsqueeze(0).expand(b, -1, -1).contiguous()
     return warped, mask
+
+
+def _box_down(t: torch.Tensor, k: int) -> torch.Tensor:
+    """Area-average a [B,H,W,C] tensor down by integer factor k (H,W are multiples
+    of k). Averaging the supersampled render is what makes minification clean —
+    grid_sample takes one tap per pixel, so a raw downscale aliases."""
+    if k <= 1:
+        return t
+    x = t.permute(0, 3, 1, 2)                       # [B,C,H,W]
+    x = F.avg_pool2d(x, kernel_size=k, stride=k)
+    return x.permute(0, 2, 3, 1).contiguous()
 
 
 def _aspect_auto(quad: np.ndarray) -> float:
@@ -239,16 +248,40 @@ def _rewarp_pipeline(flat_image, data: "NKDWarpData", feather, edge_hardness,
     device = flat_image.device
     # The edit may have been resized (sampler snaps to /8, an upscaler, etc.).
     # The homography is defined in the flat frame's native dims, so restore them.
-    out_w, out_h = data.output_size
-    if flat_image.shape[1] != out_h or flat_image.shape[2] != out_w:
-        flat_image = _resize_auto(flat_image, out_w, out_h)
     bg = data.background.to(device)
     # Batch align: one background repeated to match a batched edit.
     if bg.shape[0] == 1 and flat_image.shape[0] > 1:
         bg = bg.repeat(flat_image.shape[0], 1, 1, 1)
 
-    H_orig_to_flat = np.linalg.inv(data.H_flat_to_orig)
-    warped, mask = _warp_image(flat_image, H_orig_to_flat, ih, iw)   # into orig frame
+    # Sample straight from the edit at its ACTUAL resolution. The homography lives in
+    # the flat's original out_w×out_h pixel space, so rescale it to the edit's dims
+    # instead of shrinking the edit first (that threw away any detail painted on an
+    # upscaled flat — the main cause of soft rewarps). Per-axis scale also absorbs a
+    # sampler's /8 aspect snap.
+    out_w, out_h = data.output_size
+    eh0, ew0 = flat_image.shape[1], flat_image.shape[2]
+    S_flat_to_edit = np.diag([ew0 / out_w, eh0 / out_h, 1.0])
+    H_orig_to_edit = S_flat_to_edit @ np.linalg.inv(data.H_flat_to_orig)
+
+    # Supersample the warp when the edit is denser than its footprint in the original
+    # frame (minification), then area-average down — clean detail instead of aliasing.
+    fw = 0.5 * (np.linalg.norm(data.quad[1] - data.quad[0]) +
+                np.linalg.norm(data.quad[2] - data.quad[3]))   # quad width  in orig px
+    fh = 0.5 * (np.linalg.norm(data.quad[3] - data.quad[0]) +
+                np.linalg.norm(data.quad[2] - data.quad[1]))   # quad height in orig px
+    minif = max(ew0 / max(fw, 1.0), eh0 / max(fh, 1.0))
+    ss = max(1, min(3, int(np.ceil(minif))))
+    # ponytail: cap supersampled work at ~48 MP so a huge frame can't OOM.
+    while ss > 1 and ss * ss * ih * iw > 48_000_000:
+        ss -= 1
+
+    if ss > 1:
+        M = H_orig_to_edit @ np.diag([1.0 / ss, 1.0 / ss, 1.0])
+        w_ss, m_ss = _warp_image(flat_image, M, ih * ss, iw * ss)
+        warped = _box_down(w_ss, ss)
+        mask = _box_down(m_ss.unsqueeze(-1), ss)[..., 0]
+    else:
+        warped, mask = _warp_image(flat_image, H_orig_to_edit, ih, iw)   # into orig frame
 
     if feather > 0:
         f = int(feather)
