@@ -1,5 +1,7 @@
 # 😺 NKD VFX Tools
 
+https://github.com/user-attachments/assets/f442473d-7b4b-4a6d-b2b9-d89e340be24a
+
 VFX craft, wired into an AI pipeline.
 
 These aren't compositing nodes. They exist so you can art-direct what the model generates,
@@ -115,6 +117,8 @@ so you don't have to leave the graph to do it.
 <!-- video: fspy -->
 
 ### 😺NKD Perspective Unwarp / Rewarp
+
+https://github.com/user-attachments/assets/8550c726-3662-4e8a-a6cb-7772bd3b9b21
 
 Two nodes for editing anything flat that you're seeing at an angle: a poster on a wall, a
 label, a sign, a screen.
