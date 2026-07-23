@@ -1,3 +1,10 @@
+# How to use it
+
+A quick and silly guide until the example workflows are ready. Enjoy the Spanish accent!
+
+https://github.com/user-attachments/assets/a9621694-62a4-43cf-85c8-52dffc6df7f1
+
+
 # 😺 NKD VFX Tools
 
 https://github.com/user-attachments/assets/f442473d-7b4b-4a6d-b2b9-d89e340be24a
