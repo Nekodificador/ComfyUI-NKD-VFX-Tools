@@ -18,7 +18,7 @@ const EXT_NAME = 'NKD.Preview3D.Vue'
 const EVENT_SCENE = 'nkd-preview3d-scene'
 
 // Version stamp: printed once at load so a cached stale bundle is immediately visible.
-const REV = 'rev 2026-07-17r (splat Y-up flip on a wrapper group)'
+const REV = 'rev 2026-07-24 (Smooth = Laplacian normal diffusion, range 0-200; debug log removed)'
 console.log(`[NKD Preview 3D] ${REV}`)
 
 const VIEW_W = 360
@@ -64,6 +64,14 @@ function keepDomWidgetSized(node: any, container: HTMLElement): () => void {
   return () => { ro.disconnect(); clearInterval(iv) }
 }
 
+
+// djb2 over a string — cheap, good enough to tell two renders apart. Length is mixed in to
+// shrink the already-tiny collision chance for same-length data URLs.
+function hashStr(s: string): string {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+  return `${s.length}:${h >>> 0}`
+}
 
 async function uploadTempImage(dataUrl: string, prefix: string) {
   const blob = await fetch(dataUrl).then((r) => r.blob())
@@ -152,22 +160,38 @@ comfyApp.registerExtension({
         const vpIdx = node.inputs?.findIndex((inp: any) => inp.name === 'viewport')
         if (vpIdx !== undefined && vpIdx >= 0) node.removeInput(vpIdx)
 
+        // Stable when the render is unchanged: uploads produce unique filenames, so
+        // re-capturing every queue makes `viewport` differ each time and the node (plus
+        // everything downstream — a seed-locked sampler included) re-runs for nothing. We
+        // hash the rendered pixels + camera + size; an identical render returns the SAME
+        // paths, so ComfyUI sees unchanged inputs and caches instead of re-executing.
+        let lastRenderHash = ''
+        let lastValue = ''
         viewportWidget.serializeValue = async () => {
           const api_ = vp()
-          if (!api_) return ''
+          if (!api_) return lastValue
           const width = node.widgets?.find((w: any) => w.name === 'width')?.value ?? 1024
           const height = node.widgets?.find((w: any) => w.name === 'height')?.value ?? 1024
           try {
             const shot = await api_.capture(width, height)
+            const hash = hashStr(
+              `${width}x${height}|${JSON.stringify(shot.camera_info)}|` +
+              `${shot.scene}${shot.object}${shot.depth}`
+            )
+            // Nothing moved since the last capture → reuse the already-uploaded paths so the
+            // widget value is byte-identical and the node stays cached.
+            if (hash === lastRenderHash && lastValue) return lastValue
             const [image, object, depth] = await Promise.all([
               uploadTempImage(shot.scene, 'scene'),
               uploadTempImage(shot.object, 'scene_object'),
               uploadTempImage(shot.depth, 'scene_depth'),
             ])
-            return JSON.stringify({ image, object, depth, camera_info: shot.camera_info })
+            lastRenderHash = hash
+            lastValue = JSON.stringify({ image, object, depth, camera_info: shot.camera_info })
+            return lastValue
           } catch (e) {
             console.error('[NKD Preview 3D] capture failed:', e)
-            return '' // the backend reports this where it matters, if anything reads the outputs
+            return lastValue // keep the last good render rather than dropping to no-capture
           }
         }
       }

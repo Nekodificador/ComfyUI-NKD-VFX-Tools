@@ -24,6 +24,7 @@ const hud = reactive({ ok: false, fovV: 0, fovH: 0, focal: 0, pitch: 0, yaw: 0 }
 const showGrid = ref(true);
 const showAxes = ref(true);
 const showBox = ref(false);
+const showHorizon = ref(true);
 const dim = ref(0);        // darken the background image beneath the overlays (0..0.8)
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -120,6 +121,27 @@ function redraw() {
     if (vp) { ctx.globalAlpha = 0.3; seg([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2], vp); seg([(pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2], vp); ctx.globalAlpha = 1; }
     for (const p of pts) { const [x, y] = toPx(p); ctx.beginPath(); ctx.arc(x, y, HANDLE_R, 0, Math.PI * 2); ctx.fillStyle = VP_COLORS[key]; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke(); }
   }
+  // ── Horizon: the line through both vanishing points. Drag it up/down to raise/lower the
+  // camera pitch — it translates the 8 handles in Y, moving both VPs and re-aiming everything.
+  horizonLine = null;
+  if (showHorizon.value && res.ok && res.Fu && res.Fv) {
+    const A = res.Fu, B = res.Fv, dhx = B[0] - A[0];
+    if (Math.abs(dhx) > 1e-6) {                                   // skip a near-vertical horizon
+      const yAt = (x: number) => A[1] + (B[1] - A[1]) * (x - A[0]) / dhx;
+      horizonLine = { A, B };
+      const p0 = toPx([0, yAt(0)]), p1 = toPx([1, yAt(1)]);
+      ctx.save();
+      ctx.setLineDash([8, 5]); ctx.strokeStyle = "rgba(255,209,102,0.9)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); ctx.stroke();
+      ctx.restore();
+      const g = toPx([0.5, yAt(0.5)]);                            // draggable grip at mid-width
+      ctx.beginPath(); ctx.arc(g[0], g[1], 6, 0, Math.PI * 2); ctx.fillStyle = "#ffd166"; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke();
+      ctx.fillStyle = "rgba(0,0,0,0.8)"; ctx.font = "9px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("⇕", g[0], g[1] + 3); ctx.textAlign = "left";
+    }
+  }
+
   ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 1;
   const c = toPx([0.5, 0.5]); ctx.beginPath(); ctx.moveTo(c[0] - 7, c[1]); ctx.lineTo(c[0] + 7, c[1]); ctx.moveTo(c[0], c[1] - 7); ctx.lineTo(c[0], c[1] + 7); ctx.stroke();
 
@@ -130,7 +152,7 @@ function redraw() {
 
   // Magnifier loupe while dragging — CLEAN image only (no handles/lines), placed next to the cursor,
   // with just a precision crosshair, so you can see the exact pixel under the point.
-  if (drag && img) {
+  if (drag && drag.key !== "horizon" && img) {
     const hp = drag.key === "origin" ? state.origin : state[drag.key][drag.idx];
     const [hx, hy] = toPx(hp);
     const z = 3.5, L = 140, m = 8, gap = 22;
@@ -165,7 +187,17 @@ function solveNow() {
 function emit() { props.onChange?.(JSON.stringify(state)); }
 
 // ── Dragging ──────────────────────────────────────────────────────────────────
-let drag: { key: "vp1" | "vp2" | "origin"; idx: number } | null = null;
+let drag: { key: "vp1" | "vp2" | "origin" | "horizon"; idx: number } | null = null;
+// Horizon line (through the two VPs), in Relative coords — set each redraw, used for hit-testing.
+let horizonLine: { A: [number, number]; B: [number, number] } | null = null;
+// Snapshot taken when the horizon drag starts. Each of the 4 control lines pivots around its
+// endpoint FARTHEST from the horizon (kept anchored on the image edge); only the near endpoint
+// moves, re-aiming the line at the vanishing point's new (raised/lowered) position.
+let horizonSnap: {
+  startY: number;
+  Fu: [number, number]; Fv: [number, number];
+  lines: { key: "vp1" | "vp2"; moverIdx: number; anchor: [number, number]; dist: number }[];
+} | null = null;
 function eventNorm(e: PointerEvent): [number, number] {
   const cv = canvas.value!; const rect = cv.getBoundingClientRect();
   const [lw, lh] = dims();
@@ -173,23 +205,66 @@ function eventNorm(e: PointerEvent): [number, number] {
   const [ix, iy, iw, ih] = imgRect();
   return [(px - ix) / iw, (py - iy) / ih];
 }
-function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin"; idx: number } | null {
+function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin" | "horizon"; idx: number } | null {
   const [, , iw, ih] = imgRect(); const tolX = (HANDLE_R + 8) / iw, tolY = (HANDLE_R + 8) / ih;
   for (const key of ["vp1", "vp2"] as const)
     for (let i = 0; i < 4; i++) { const p = state[key][i]; if (Math.abs(p[0] - n[0]) < tolX && Math.abs(p[1] - n[1]) < tolY) return { key, idx: i }; }
   if (Math.abs(state.origin[0] - n[0]) < tolX && Math.abs(state.origin[1] - n[1]) < tolY) return { key: "origin", idx: 0 };
+  // Horizon line last (handles win): perpendicular distance from the cursor to the line.
+  if (horizonLine) {
+    const { A, B } = horizonLine; const ab: [number, number] = [B[0] - A[0], B[1] - A[1]];
+    const len = Math.hypot(ab[0], ab[1]);
+    if (len > 1e-6 && Math.abs(ab[0] * (n[1] - A[1]) - ab[1] * (n[0] - A[0])) / len < 0.02) return { key: "horizon", idx: 0 };
+  }
   return null;
 }
-function onDown(e: PointerEvent) { const hit = hitTest(eventNorm(e)); if (hit) { drag = hit; canvas.value!.setPointerCapture(e.pointerId); e.preventDefault(); } }
+function onDown(e: PointerEvent) {
+  const hit = hitTest(eventNorm(e));
+  if (!hit) return;
+  drag = hit;
+  if (hit.key === "horizon") {
+    const res = solveNow();
+    if (!res.Fu || !res.Fv) { drag = null; return; }
+    const Fu = res.Fu, Fv = res.Fv;
+    const linesFor = (key: "vp1" | "vp2", vp: [number, number]) =>
+      ([[0, 1], [2, 3]] as const).map(([ia, ib]) => {
+        const A = state[key][ia], B = state[key][ib];
+        const dA = Math.hypot(A[0] - vp[0], A[1] - vp[1]), dB = Math.hypot(B[0] - vp[0], B[1] - vp[1]);
+        const anchorIdx = dA >= dB ? ia : ib, moverIdx = dA >= dB ? ib : ia; // anchor = farther from VP
+        const anchor: [number, number] = [state[key][anchorIdx][0], state[key][anchorIdx][1]];
+        const m = state[key][moverIdx];
+        return { key, moverIdx, anchor, dist: Math.hypot(m[0] - anchor[0], m[1] - anchor[1]) };
+      });
+    horizonSnap = { startY: eventNorm(e)[1], Fu, Fv, lines: [...linesFor("vp1", Fu), ...linesFor("vp2", Fv)] };
+  }
+  canvas.value!.setPointerCapture(e.pointerId); e.preventDefault();
+}
 function onMove(e: PointerEvent) {
   if (!drag) return;
   const raw = eventNorm(e);
+  if (drag.key === "horizon") {
+    if (!horizonSnap) return;
+    const dy = raw[1] - horizonSnap.startY;                 // how far the horizon was dragged in Y
+    const FuN: [number, number] = [horizonSnap.Fu[0], horizonSnap.Fu[1] + dy]; // VPs ride the horizon
+    const FvN: [number, number] = [horizonSnap.Fv[0], horizonSnap.Fv[1] + dy];
+    const cl = (v: number) => Math.max(0, Math.min(1, v));
+    for (const ln of horizonSnap.lines) {
+      const vp = ln.key === "vp1" ? FuN : FvN;             // re-aim this line at its VP's new spot
+      const vx = vp[0] - ln.anchor[0], vy = vp[1] - ln.anchor[1];
+      const len = Math.hypot(vx, vy);
+      if (len < 1e-6) continue;
+      // Far endpoint (anchor) stays; the near endpoint pivots to the same distance along the new aim.
+      state[ln.key][ln.moverIdx] = [cl(ln.anchor[0] + ln.dist * vx / len), cl(ln.anchor[1] + ln.dist * vy / len)];
+    }
+    redraw(); emit();
+    return;
+  }
   const n: [number, number] = [Math.max(0, Math.min(1, raw[0])), Math.max(0, Math.min(1, raw[1]))];
   if (drag.key === "origin") state.origin = n;
   else state[drag.key][drag.idx] = n;
   redraw(); emit();
 }
-function onUp(e: PointerEvent) { if (drag) { drag = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
+function onUp(e: PointerEvent) { if (drag) { drag = null; horizonSnap = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
 
 function onAxis() { redraw(); emit(); }
 function close() { props.onClose?.({ ok: hud.ok, fovV: hud.fovV, focal: hud.focal }); }
@@ -226,6 +301,7 @@ onBeforeUnmount(() => { ro?.disconnect(); window.removeEventListener("keydown", 
         <button class="nkd-tog" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
         <button class="nkd-tog" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
         <button class="nkd-tog" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
+        <button class="nkd-tog" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch">Horizon</button>
         <label class="nkd-lbl" title="Darken the image beneath the overlay">Darken
           <input type="range" class="nkd-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
         </label>

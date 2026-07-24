@@ -13,6 +13,9 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
+import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
+import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
 import { defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 
 // Scrub-drag number field, the only control that works on a LiteGraph canvas: HORIZONTAL
@@ -25,6 +28,7 @@ const DragNumber = defineComponent({
     min: { type: Number, default: -Infinity },
     max: { type: Number, default: Infinity },
     decimals: { type: Number, default: 2 },
+    resetTo: { type: Number, default: null }, // when set, a ↺ appears while the value differs
   },
   emits: ['update:modelValue'],
   setup(p, { emit }) {
@@ -80,7 +84,21 @@ const DragNumber = defineComponent({
         : h(
             'div',
             { class: 'nkd-drag', onPointerdown: onDown, onPointermove: onMove, onPointerup: onUp },
-            Number.isFinite(p.modelValue) ? p.modelValue.toFixed(p.decimals) : '0'
+            [
+              Number.isFinite(p.modelValue) ? p.modelValue.toFixed(p.decimals) : '0',
+              p.resetTo != null && p.modelValue !== p.resetTo
+                ? h('span', {
+                    class: 'nkd-drag-reset',
+                    title: 'Reset',
+                    // stopPropagation so the reset click doesn't start a scrub-drag or open edit.
+                    onPointerdown: (e: PointerEvent) => {
+                      e.stopPropagation()
+                      e.preventDefault()
+                      emit('update:modelValue', clamp(p.resetTo as number))
+                    },
+                  }, '↺')
+                : null,
+            ]
           )
   },
 })
@@ -96,11 +114,10 @@ const emit = defineEmits<{ calibrated: [near: number, far: number] }>()
 const host = ref<HTMLDivElement | null>(null)
 const showGrid = ref(true)
 const status = ref('')
-const modelName = ref('')
 // One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
 // only counts the first .nkd-panel it finds.
-const activePanel = ref<'' | 'light' | 'object'>('')
-const togglePanel = (p: 'light' | 'object') => { activePanel.value = activePanel.value === p ? '' : p }
+const activePanel = ref<'' | 'light' | 'object' | 'occlude'>('')
+const togglePanel = (p: 'light' | 'object' | 'occlude') => { activePanel.value = activePanel.value === p ? '' : p }
 
 // Look-dev state. It lives here rather than in node widgets on purpose: the render — and
 // the capture taken from it — happens in this browser, so a light change needs no round
@@ -112,6 +129,35 @@ const lightInt = ref(2.0)
 const shadows = ref(true)
 const shadowSoft = ref(3)
 const shadowStr = ref(0.5)
+// Contact shadow: a soft grounding blob rendered from below (three's RTT technique),
+// independent of the key light — anchors the object to the floor regardless of key dir.
+const contact = ref(false)
+const contactStr = ref(0.8)
+const contactBlur = ref(1.5)
+const contactSpread = ref(0.25) // fraction of object height that casts — low = tight AO contact
+// Occlusion is a MATTE (depth-key), not physical: the injected map is thresholded and the
+// chosen grey band hides the object — no 3D calibration. occFrom/occTo pick the band, invert
+// flips the map. Only meaningful with a scene_depth connected. Serialised with the widget.
+const occlude = ref(false)
+const depthInvertUI = ref(false)
+const occFrom = ref(0.5)
+const occTo = ref(1.0)
+
+// Fill lights on TOP of the directional key: soft area (RectAreaLight, LTC) lights the user
+// grows. Point/spot were dropped — three can't blur a point's shadow and the area gives the
+// soft fill + shadow the whole feature is for. Each aims at a target (default: the origin).
+type LightCfg = {
+  id: number
+  x: number; y: number; z: number
+  tx: number; ty: number; tz: number // aim target
+  color: string
+  intensity: number
+  size: number  // area edge (scene units) — also the shadow softness
+  shadow: boolean
+}
+const lights = reactive<LightCfg[]>([])
+const selectedLightId = ref<number | null>(null)
+let lightSeq = 1
 
 // Object transform, applied on TOP of whatever Model Info handed over (that stays on the
 // model itself; this lives on a wrapper group). Rotation/scale happen around a chosen
@@ -120,11 +166,26 @@ const objPos = reactive({ x: 0, y: 0, z: 0 })
 const objRot = reactive({ x: 0, y: 0, z: 0 }) // degrees
 const objScale = ref(1)
 const pivotMode = ref<'bottom' | 'center' | 'origin'>('bottom')
+const gizmoMode = ref<'off' | 'translate' | 'rotate' | 'scale'>('off')
+// Splat→mesh converters (Tripo & co.) often ship the texture baked into an UNLIT material or the
+// emissive channel, so the object self-lights and ignores shadows. Unbake rebuilds a lit
+// MeshStandard using that texture as albedo, so lights and shadows land on it.
+const unbake = ref(false)
+// Splat meshes are a faceted triangle soup → harsh per-face shading. Smooth averages face normals
+// per spatial-grid cell (fast, O(n)); 0 = original, higher = coarser cells = softer shading.
+const smooth = ref(0)
 
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null)
 const scene = new THREE.Scene()
 const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 10000)
 let controls: OrbitControls | null = null
+let transformControls: TransformControls | null = null
+let gizmoHelper: THREE.Object3D | null = null // what actually gets added to the scene in r0.18x
+const gizmoLightId = ref<number | null>(null) // when the gizmo is dragging a light body
+const gizmoTargetId = ref<number | null>(null) // when the gizmo is dragging a light's aim target
+let extraLightsGroup: THREE.Group | null = null
+const lightObjs = new Map<number, { light: THREE.Light; caster?: THREE.SpotLight; helper?: THREE.Object3D; target?: THREE.Object3D }>()
+let rectLibReady = false
 
 // Background lives in its own scene, drawn before the model with depth off.
 const bgScene = new THREE.Scene()
@@ -144,27 +205,22 @@ const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (
 const DEPTH_FRAG = `
 uniform sampler2D depthMap;
 uniform float invert;
-uniform float camNear;
-uniform float camFar;
-uniform float dNear;
-uniform float dFar;
+uniform float occFrom;
+uniform float occTo;
 in vec2 vUvD;
 out vec4 fragColor;
 void main() {
   float d = texture(depthMap, vUvD).r;
   if (invert > 0.5) d = 1.0 - d;
-  // A monocular depth map has no scale: dNear/dFar are what tie its 0..1 to scene units.
-  float z = mix(dFar, dNear, clamp(d, 0.0, 1.0));
-  z = max(z, camNear + 1e-4);
-  // Window depth is linear in 1/z under a perspective projection — this is what makes the
-  // value comparable with what the model writes, even though this quad is drawn orthographically.
-  float w = clamp((1.0 / z - 1.0 / camNear) / (1.0 / camFar - 1.0 / camNear), 0.0, 1.0);
-  gl_FragDepth = w;
+  float dc = clamp(d, 0.0, 1.0);
+  // MATTE occlusion (depth-key), NOT physical: the injected map is used directly as a
+  // foreground mask. Where the (post-invert) grey lands inside the chosen [occFrom, occTo]
+  // band, the scene counts as FOREGROUND and hides the object — depth 0 (nearest) rejects
+  // it whatever its own 3D depth. Outside the band, depth 1 (farthest) lets it through.
+  float occ = step(occFrom, dc) * step(dc, occTo);
+  gl_FragDepth = occ > 0.5 ? 0.0 : 1.0;
   // The depth EXPORT's base layer is the scene map VERBATIM (post-invert, near = white).
-  // It is the reference: the map arrives already calculated, so the OBJECT remaps into
-  // its dNear/dFar space — never the scene through the camera's nonlinear window depth,
-  // which crushes a full-range map into near-black.
-  fragColor = vec4(vec3(clamp(d, 0.0, 1.0)), 1.0);
+  fragColor = vec4(vec3(dc), 1.0);
 }
 `
 
@@ -173,8 +229,9 @@ const bgDepthMaterial = new THREE.ShaderMaterial({
   uniforms: {
     depthMap: { value: null },
     invert: { value: 0 },
-    camNear: { value: 0.01 },
-    camFar: { value: 10000 },
+    occFrom: { value: 0.5 }, // occlude where the (post-invert) grey is in [occFrom, occTo]
+    occTo: { value: 1.0 },   // near = white = 1, so [0.5,1] hides behind the nearer half
+    // dNear/dFar drive the depth EXPORT's object tone (linearDepthMaterial), not occlusion.
     dNear: { value: 1 },
     dFar: { value: 30 },
   },
@@ -234,6 +291,41 @@ let pivotGroup: THREE.Group | null = null // wraps the model; carries the user t
 let pivotP = new THREE.Vector3() // pivot point in group-local space, cached
 let keyLight: THREE.DirectionalLight | null = null
 let shadowCatcher: THREE.Mesh | null = null
+
+// ── Contact shadow (RTT) ─ three's webgl_shadow_contact technique: an ortho camera under
+// the object renders its depth into a target, two blur passes soften it, and a ground plane
+// shows the result. Recomputed only when the object moves (contactDirty) — light-independent.
+let contactGroup: THREE.Group | null = null
+let contactRT: THREE.WebGLRenderTarget | null = null
+let contactRTBlur: THREE.WebGLRenderTarget | null = null
+let contactPlane: THREE.Mesh | null = null
+let contactBlurPlane: THREE.Mesh | null = null
+let contactCam: THREE.OrthographicCamera | null = null
+let contactDepthMat: THREE.MeshDepthMaterial | null = null
+let contactHBlur: THREE.ShaderMaterial | null = null
+let contactVBlur: THREE.ShaderMaterial | null = null
+let contactDirty = true
+const CONTACT_RES = 512
+
+// Separable 9-tap gaussian, ported from three's Horizontal/VerticalBlurShader.
+const BLUR_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`
+const blurFrag = (axis: 'x' | 'y') => `
+  uniform sampler2D tDiffuse; uniform float amount; varying vec2 vUv;
+  void main() {
+    vec4 sum = vec4(0.0);
+    vec2 d = ${axis === 'x' ? 'vec2(amount, 0.0)' : 'vec2(0.0, amount)'};
+    sum += texture2D(tDiffuse, vUv - 4.0*d) * 0.051;
+    sum += texture2D(tDiffuse, vUv - 3.0*d) * 0.0918;
+    sum += texture2D(tDiffuse, vUv - 2.0*d) * 0.12245;
+    sum += texture2D(tDiffuse, vUv - 1.0*d) * 0.1531;
+    sum += texture2D(tDiffuse, vUv) * 0.1633;
+    sum += texture2D(tDiffuse, vUv + 1.0*d) * 0.1531;
+    sum += texture2D(tDiffuse, vUv + 2.0*d) * 0.12245;
+    sum += texture2D(tDiffuse, vUv + 3.0*d) * 0.0918;
+    sum += texture2D(tDiffuse, vUv + 4.0*d) * 0.051;
+    gl_FragColor = sum;
+  }
+`
 let pmrem: THREE.PMREMGenerator | null = null
 let envRT: THREE.WebGLRenderTarget | null = null
 let model: THREE.Object3D | null = null
@@ -262,6 +354,7 @@ function initScene() {
   keyLight.castShadow = true
   keyLight.shadow.mapSize.set(2048, 2048)
   keyLight.shadow.bias = -0.0015
+  keyLight.shadow.blurSamples = 25 // VSM gaussian samples for the soft blur
   scene.add(keyLight)
   scene.add(keyLight.target)
 
@@ -276,6 +369,8 @@ function initScene() {
   scene.add(shadowCatcher)
 
   applyLighting()
+  initContactShadow()
+  initExtraLights()
 
   bgMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(2, 2),
@@ -467,9 +562,146 @@ function updateEnvironment() {
   scene.environmentIntensity = env.value
 }
 
-// The scene depth NEVER occludes the colour renders: the object composites over the
-// backdrop by design, and the depth map exists only so the depth EXPORT can composite
-// the object's depth into the scene's (making them read as one space downstream).
+function initContactShadow() {
+  contactRT = new THREE.WebGLRenderTarget(CONTACT_RES, CONTACT_RES)
+  contactRT.texture.generateMipmaps = false
+  contactRTBlur = new THREE.WebGLRenderTarget(CONTACT_RES, CONTACT_RES)
+  contactRTBlur.texture.generateMipmaps = false
+
+  contactGroup = new THREE.Group()
+  contactGroup.visible = false
+  scene.add(contactGroup)
+
+  // 1×1 plane lying in XZ; scaled to the object footprint at render time.
+  const geo = new THREE.PlaneGeometry(1, 1).rotateX(Math.PI / 2)
+  contactPlane = new THREE.Mesh(
+    geo,
+    new THREE.MeshBasicMaterial({ map: contactRT.texture, transparent: true, depthWrite: false, opacity: 1 })
+  )
+  contactPlane.rotation.x = Math.PI // the depth buffer is captured upside down
+  contactPlane.renderOrder = 2
+  contactPlane.position.y = 0.001 // hair above the floor so it never z-fights the grid
+  contactGroup.add(contactPlane)
+
+  contactBlurPlane = new THREE.Mesh(geo)
+  contactBlurPlane.visible = false
+  contactGroup.add(contactBlurPlane)
+
+  // Looks straight up from y=0; near/far span the object's height, set per render.
+  contactCam = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0, 1)
+  contactCam.rotation.x = Math.PI / 2
+  contactGroup.add(contactCam)
+
+  // MeshDepthMaterial patched to paint black with distance-faded alpha (near = dark).
+  contactDepthMat = new THREE.MeshDepthMaterial()
+  contactDepthMat.depthTest = false
+  contactDepthMat.depthWrite = false
+  const darkness = { value: contactStr.value }
+  ;(contactDepthMat as any).userData.darkness = darkness
+  contactDepthMat.onBeforeCompile = (shader) => {
+    shader.uniforms.darkness = darkness
+    shader.fragmentShader =
+      'uniform float darkness;\n' +
+      shader.fragmentShader.replace(
+        'gl_FragColor = vec4( vec3( 1.0 - fragCoordZ ), opacity );',
+        'gl_FragColor = vec4( vec3( 0.0 ), ( 1.0 - fragCoordZ ) * darkness );'
+      )
+  }
+
+  const blurUniforms = () => ({ tDiffuse: { value: null }, amount: { value: 1 / CONTACT_RES } })
+  contactHBlur = new THREE.ShaderMaterial({ uniforms: blurUniforms(), vertexShader: BLUR_VERT, fragmentShader: blurFrag('x') })
+  contactVBlur = new THREE.ShaderMaterial({ uniforms: blurUniforms(), vertexShader: BLUR_VERT, fragmentShader: blurFrag('y') })
+}
+
+/** Centre the contact rig under the object and size it to the footprint. y stays at the
+ *  fSpy floor (0), so the shadow lands on the ground even as the object floats/scales. */
+function updateContactBounds() {
+  if (!contactGroup || !contactCam || !contactPlane || !contactBlurPlane || !model) return
+  const box = new THREE.Box3().setFromObject(model)
+  if (box.isEmpty()) return
+  const c = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const foot = Math.max(size.x, size.z) * 1.15 + 0.02
+  // AO-style contact: capture only the LOWER slab of the object (contactSpread × height up
+  // from the floor). Arms/limbs above it are clipped, so the shadow stays a tight grounding
+  // footprint instead of the full spread-out silhouette.
+  const slab = Math.max(size.y * contactSpread.value, 0.03)
+  contactGroup.position.set(c.x, 0, c.z)
+  contactCam.left = -foot / 2; contactCam.right = foot / 2
+  contactCam.top = foot / 2; contactCam.bottom = -foot / 2
+  contactCam.far = slab
+  contactCam.updateProjectionMatrix()
+  contactPlane.scale.set(foot, 1, foot)
+  contactBlurPlane.scale.set(foot, 1, foot)
+}
+
+function blurContact(amount: number) {
+  const r = renderer.value
+  if (!r || !contactBlurPlane || !contactHBlur || !contactVBlur || !contactRT || !contactRTBlur || !contactCam) return
+  contactBlurPlane.visible = true
+  contactBlurPlane.material = contactHBlur
+  contactHBlur.uniforms.tDiffuse.value = contactRT.texture
+  contactHBlur.uniforms.amount.value = amount / CONTACT_RES
+  r.setRenderTarget(contactRTBlur)
+  r.render(contactBlurPlane, contactCam)
+  contactBlurPlane.material = contactVBlur
+  contactVBlur.uniforms.tDiffuse.value = contactRTBlur.texture
+  contactVBlur.uniforms.amount.value = amount / CONTACT_RES
+  r.setRenderTarget(contactRT)
+  r.render(contactBlurPlane, contactCam)
+  contactBlurPlane.visible = false
+}
+
+/** Render the grounding shadow into contactRT. Splats have no mesh depth → skipped. */
+function renderContactShadow() {
+  const r = renderer.value
+  if (!r || !contactGroup || !contactCam || !contactDepthMat || !contactRT || !model || modelIsSplat) return
+  updateContactBounds()
+  ;(contactDepthMat as any).userData.darkness.value = contactStr.value
+
+  const prevRT = r.getRenderTarget()
+  const prevClear = r.getClearColor(new THREE.Color())
+  const prevAlpha = r.getClearAlpha()
+  const wasGrid = grid?.visible; const wasCatcher = shadowCatcher?.visible
+  if (grid) grid.visible = false // only the object should cast into the map
+  if (shadowCatcher) shadowCatcher.visible = false
+  // Keep the group visible so the blur plane (its child) can render; hide only the
+  // display plane so it doesn't capture itself into the depth map.
+  contactGroup.visible = true
+  if (contactPlane) contactPlane.visible = false
+
+  scene.overrideMaterial = contactDepthMat
+  r.setRenderTarget(contactRT)
+  r.setClearColor(0x000000, 0) // transparent = no shadow; the depth mat writes black + alpha
+  r.clear()
+  r.render(scene, contactCam)
+  scene.overrideMaterial = null
+
+  blurContact(contactBlur.value)
+  blurContact(contactBlur.value * 0.4)
+
+  r.setRenderTarget(prevRT)
+  r.setClearColor(prevClear, prevAlpha)
+  if (grid) grid.visible = !!wasGrid
+  if (shadowCatcher) shadowCatcher.visible = !!wasCatcher
+  if (contactPlane) contactPlane.visible = true
+  contactGroup.visible = contact.value
+}
+
+/** Lay the matte into the depth buffer (colour off): occluder-band pixels get depth 0 so the
+ *  object is rejected there. Only called in the composite pass when Occlude is on. */
+function layBackdropDepth() {
+  const r = renderer.value
+  if (!r) return
+  bgDepthMaterial.colorWrite = false
+  r.render(bgDepthScene, bgCamera)
+  bgDepthMaterial.colorWrite = true
+}
+
+// By default the scene depth never occludes the colour renders (the object composites over
+// the backdrop). With Occlude on, the composite pass lays the photo's depth first so nearer
+// foreground hides the model. The mask/object pass (drawBackdrop=false) never occludes — the
+// silhouette must stay whole.
 function renderFrame(drawBackdrop = true) {
   const r = renderer.value
   if (!r) return
@@ -480,16 +712,39 @@ function renderFrame(drawBackdrop = true) {
     r.toneMapping = THREE.NoToneMapping
     r.render(bgScene, bgCamera)
     r.toneMapping = tone
+    if (occlude.value && sceneDepthTexture) layBackdropDepth()
   }
   r.render(scene, camera)
   r.autoClear = true
 }
 
+// The active LiteGraph canvas zoom. The widget renders at this scale so it stays crisp when
+// the graph is zoomed in (the zoom is a CSS transform the renderer can't otherwise see).
+function lgScale(): number {
+  const a = (window as any).comfyAPI?.app?.app ?? (window as any).app
+  const s = a?.canvas?.ds?.scale
+  return typeof s === 'number' && s > 0 ? s : 1
+}
+
+let lastScale = 0
 function loop() {
   controls?.update()
+  // Re-fit the resolution when the canvas zoom changes — a CSS transform that fires no
+  // ResizeObserver, so it must be polled. Reading a number (no layout reflow) is cheap.
+  const s = lgScale()
+  if (Math.abs(s - lastScale) > 0.001) { lastScale = s; resize() }
+  if (contact.value && contactDirty) { renderContactShadow(); contactDirty = false }
   renderFrame()
   raf = requestAnimationFrame(loop)
 }
+
+// Toggling on/off shows or hides the ground plane; turning on forces a fresh bake.
+watch(contact, (on) => {
+  if (contactGroup) contactGroup.visible = on
+  if (on) contactDirty = true
+})
+// Darkness/blur/spread changes only need a re-bake, not a transform recompute.
+watch([contactStr, contactBlur, contactSpread], () => { contactDirty = true })
 
 /**
  * The box's height comes from CSS (aspect-ratio bound to the width/height widgets), so
@@ -506,6 +761,14 @@ function resize() {
   const w = el.clientWidth
   const h = el.clientHeight || Math.round((w * props.aspect.h) / props.aspect.w)
   if (w < 1 || h < 1) return
+  // The displayed size is clientWidth × the LiteGraph canvas zoom (a CSS transform that
+  // clientWidth doesn't see). Render at dpr × zoom × 2 so the buffer matches the on-screen
+  // pixels with 2× supersampling — crisp at any zoom. Capped so a big zoom can't allocate a
+  // giant target. updateStyle=false keeps the canvas CSS at 100%; only the backing buffer grows.
+  const MAX_BUF = 4096
+  const target = Math.min(window.devicePixelRatio, 2) * lgScale() * 2
+  const ratio = Math.max(0.5, Math.min(target, MAX_BUF / Math.max(w, h)))
+  r.setPixelRatio(ratio)
   r.setSize(w, h, false)
   camera.aspect = props.aspect.w / props.aspect.h
   camera.updateProjectionMatrix()
@@ -579,6 +842,166 @@ async function isGaussianPly(url: string): Promise<boolean> {
   return /property\s+\S+\s+(f_dc_0|opacity|scale_0)\b/.test(header)
 }
 
+/** Log what materials a freshly-loaded model uses — surfaces the "baked / unlit" case. */
+function logModelMaterials() {
+  if (!model || modelIsSplat) return
+  const types = new Set<string>()
+  let unlit = 0
+  let emissiveBaked = 0
+  model.traverse((c) => {
+    if (!(c instanceof THREE.Mesh)) return
+    const m: any = Array.isArray(c.material) ? c.material[0] : c.material
+    if (!m) return
+    types.add(m.type)
+    if (m.type === 'MeshBasicMaterial') unlit++
+    if (m.emissiveMap && !m.map) emissiveBaked++
+  })
+  console.log(
+    `[NKD Preview 3D] model materials: ${[...types].join(', ') || '(none)'}; ` +
+    `unlit=${unlit}, emissive-baked=${emissiveBaked}` +
+    (unlit || emissiveBaked ? ' — self-lit, will not receive shadows. Try Unbake in the Object panel.' : '')
+  )
+}
+
+/** Rebuild lit materials from baked/unlit ones so the model responds to lights and shadows.
+ *  Reversible: the source material is stashed on the mesh and restored when Unbake is off. */
+function applyUnbake() {
+  if (!model || modelIsSplat) return
+  model.traverse((c) => {
+    if (!(c instanceof THREE.Mesh)) return
+    const mesh = c as THREE.Mesh
+    if (unbake.value) {
+      if (!mesh.userData.nkdOrigMat) mesh.userData.nkdOrigMat = mesh.material
+      const src: any = Array.isArray(mesh.userData.nkdOrigMat) ? mesh.userData.nkdOrigMat[0] : mesh.userData.nkdOrigMat
+      // Use whatever carries the colour — baseColor map first, else the emissive bake.
+      const tex = src?.map ?? src?.emissiveMap ?? null
+      if (tex) tex.colorSpace = THREE.SRGBColorSpace
+      const lit = new THREE.MeshStandardMaterial({
+        map: tex,
+        color: src?.map ? (src.color?.clone?.() ?? new THREE.Color(0xffffff)) : new THREE.Color(0xffffff),
+        vertexColors: !!src?.vertexColors,
+        roughness: 0.85,
+        metalness: 0.0,
+        side: src?.side ?? THREE.FrontSide,
+      })
+      if (!mesh.geometry.attributes.normal) mesh.geometry.computeVertexNormals() // lit shading needs normals
+      mesh.material = lit
+    } else if (mesh.userData.nkdOrigMat) {
+      ;(mesh.material as THREE.Material)?.dispose?.()
+      mesh.material = mesh.userData.nkdOrigMat
+      delete mesh.userData.nkdOrigMat
+    }
+  })
+}
+watch(unbake, applyUnbake)
+
+/** Fast normal smoothing for millions-of-tris splat meshes. Welds ONLY coincident vertices (a
+ *  tiny `cell` epsilon — distinct surface vertices stay distinct, so no blocky "decimation"
+ *  look), averaging the area-weighted face normals sharing each position into a true smooth
+ *  vertex normal. Then blends the original (faceted) normal toward that smooth one by `blend`
+ *  (0..1), so the slider softens facets gradually. One accumulate pass + one write pass. */
+function gridSmoothNormals(geo: THREE.BufferGeometry, cell: number, blend: number) {
+  const pos = geo.attributes.position
+  const idx = geo.index
+  const vcount = pos.count
+  const triCount = (idx ? idx.count : vcount) / 3
+  if (!geo.attributes.normal) geo.computeVertexNormals() // baseline to blend from
+  const orig = geo.attributes.normal
+  const inv = 1 / cell
+  const acc = new Map<string, [number, number, number]>()
+  const key = (i: number) =>
+    Math.round(pos.getX(i) * inv) + ',' + Math.round(pos.getY(i) * inv) + ',' + Math.round(pos.getZ(i) * inv)
+  const bump = (i: number, nx: number, ny: number, nz: number) => {
+    const k = key(i), e = acc.get(k)
+    if (e) { e[0] += nx; e[1] += ny; e[2] += nz } else acc.set(k, [nx, ny, nz])
+  }
+  for (let t = 0; t < triCount; t++) {
+    const ia = idx ? idx.getX(t * 3) : t * 3, ib = idx ? idx.getX(t * 3 + 1) : t * 3 + 1, ic = idx ? idx.getX(t * 3 + 2) : t * 3 + 2
+    const ax = pos.getX(ia), ay = pos.getY(ia), az = pos.getZ(ia)
+    const ux = pos.getX(ib) - ax, uy = pos.getY(ib) - ay, uz = pos.getZ(ib) - az
+    const vx = pos.getX(ic) - ax, vy = pos.getY(ic) - ay, vz = pos.getZ(ic) - az
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx // area-weighted
+    bump(ia, nx, ny, nz); bump(ib, nx, ny, nz); bump(ic, nx, ny, nz)
+  }
+  const out = new Float32Array(vcount * 3)
+  for (let i = 0; i < vcount; i++) {
+    const ox = orig.getX(i), oy = orig.getY(i), oz = orig.getZ(i)
+    const e = acc.get(key(i))
+    let sx = ox, sy = oy, sz = oz
+    if (e) {
+      const l = Math.hypot(e[0], e[1], e[2]) || 1
+      sx = e[0] / l; sy = e[1] / l; sz = e[2] / l
+      if (sx * ox + sy * oy + sz * oz < 0) { sx = -sx; sy = -sy; sz = -sz } // align to the original hemisphere
+    }
+    let bx = ox + (sx - ox) * blend, by = oy + (sy - oy) * blend, bz = oz + (sz - oz) * blend
+    const bl = Math.hypot(bx, by, bz) || 1
+    out[i * 3] = bx / bl; out[i * 3 + 1] = by / bl; out[i * 3 + 2] = bz / bl
+  }
+  geo.setAttribute('normal', new THREE.BufferAttribute(out, 3))
+}
+
+/** Laplacian diffusion of the normal field over an INDEXED mesh: each iteration replaces every
+ *  vertex normal with the average of the normals of the triangles it belongs to (its one-ring),
+ *  so bumpy normals flatten toward the local surface trend. Reduces GEOMETRIC bumpiness in the
+ *  shading, not just faceting. Typed-array only (no Map/strings) → fast. More iterations = softer. */
+function laplacianSmoothNormals(geo: THREE.BufferGeometry, iterations: number) {
+  const idx = geo.index!
+  const tri = idx.array
+  const tcount = idx.count / 3
+  const vcount = geo.attributes.position.count
+  if (!geo.attributes.normal) geo.computeVertexNormals()
+  const na = geo.attributes.normal
+  const N = new Float32Array(vcount * 3)
+  for (let i = 0; i < vcount; i++) { N[i * 3] = na.getX(i); N[i * 3 + 1] = na.getY(i); N[i * 3 + 2] = na.getZ(i) }
+  const acc = new Float32Array(vcount * 3)
+  for (let it = 0; it < iterations; it++) {
+    acc.fill(0)
+    for (let t = 0; t < tcount; t++) {
+      const a3 = tri[t * 3] * 3, b3 = tri[t * 3 + 1] * 3, c3 = tri[t * 3 + 2] * 3
+      const sx = N[a3] + N[b3] + N[c3], sy = N[a3 + 1] + N[b3 + 1] + N[c3 + 1], sz = N[a3 + 2] + N[b3 + 2] + N[c3 + 2]
+      acc[a3] += sx; acc[a3 + 1] += sy; acc[a3 + 2] += sz
+      acc[b3] += sx; acc[b3 + 1] += sy; acc[b3 + 2] += sz
+      acc[c3] += sx; acc[c3 + 1] += sy; acc[c3 + 2] += sz
+    }
+    for (let i = 0; i < vcount; i++) {
+      const i3 = i * 3, x = acc[i3], y = acc[i3 + 1], z = acc[i3 + 2]
+      const l = Math.hypot(x, y, z)
+      if (l > 1e-9) { N[i3] = x / l; N[i3 + 1] = y / l; N[i3 + 2] = z / l }
+    }
+  }
+  geo.setAttribute('normal', new THREE.BufferAttribute(N, 3))
+}
+
+/** Smooth the faceted shading of a splat-derived mesh. Reversible (pristine geometry stashed,
+ *  restored at 0). Runs on a clone so the original normals survive. Always uses the grid average:
+ *  it welds by POSITION cell, so it works whether or not the mesh is indexed — a "native
+ *  computeVertexNormals" fast path silently does nothing when the index doesn't actually share
+ *  vertices (the usual splat case), which read as "the slider has no effect". */
+function applySmoothNormals() {
+  if (!model || modelIsSplat) return
+  const amount = smooth.value
+  model.traverse((c) => {
+    if (!(c instanceof THREE.Mesh)) return
+    const mesh = c as THREE.Mesh
+    if (!mesh.userData.nkdOrigGeom) mesh.userData.nkdOrigGeom = mesh.geometry
+    const orig = mesh.userData.nkdOrigGeom as THREE.BufferGeometry
+    if (mesh.geometry !== orig) mesh.geometry.dispose()
+    if (amount <= 0) { mesh.geometry = orig; return }
+    const g = orig.clone()
+    if (g.index) {
+      laplacianSmoothNormals(g, Math.max(1, Math.round(amount / 7))) // amount 0..200 → ~1..29 passes
+    } else {
+      if (!g.boundingBox) g.computeBoundingBox()
+      const s = g.boundingBox!.getSize(new THREE.Vector3())
+      gridSmoothNormals(g, Math.max((Math.max(s.x, s.y, s.z) || 1) * 1e-4, 1e-7), amount / 100)
+    }
+    // The lit material must use these vertex normals; unlit (MeshBasic) ignores them → enable Unbake.
+    const mat: any = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
+    if (mat && mat.flatShading) { mat.flatShading = false; mat.needsUpdate = true }
+    mesh.geometry = g
+  })
+}
+
 /** One load in flight; a newer call wins and the stale one drops its result. */
 async function setModel(ref: { filename: string; type: string; subfolder: string } | null) {
   const generation = ++loadGeneration
@@ -621,13 +1044,20 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     model.name = 'NKDModel'
     if (!modelIsSplat) {
       model.traverse((child) => {
-        if (child instanceof THREE.Mesh) child.castShadow = true
+        if (child instanceof THREE.Mesh) {
+          child.castShadow = true
+          // Receive too, or the object shows no self-shadowing (an arm over the body) and the
+          // per-light Size (shadow.radius) has nothing to soften on the model itself.
+          child.receiveShadow = true
+        }
       })
+      logModelMaterials()
+      applyUnbake() // re-apply if Unbake was left on for the previous model
+      applySmoothNormals()
     }
     ;(pivotGroup ?? scene).add(model)
     recomputePivot()
     applyObjectTransform()
-    modelName.value = ref.filename
     status.value = ''
   } catch (e: any) {
     if (generation === loadGeneration) status.value = `Model failed: ${e?.message ?? e}`
@@ -708,6 +1138,7 @@ function applyObjectTransform() {
   g.position.set(objPos.x, objPos.y, objPos.z)
     .add(pivotP)
     .sub(pivotP.clone().multiplyScalar(s).applyQuaternion(q))
+  contactDirty = true // the footprint moved — re-bake the grounding shadow
 }
 
 function setPivotMode(m: 'bottom' | 'center' | 'origin') {
@@ -725,12 +1156,206 @@ function setPivotMode(m: 'bottom' | 'center' | 'origin') {
   }
 }
 
-function resetObjectTransform() {
-  objPos.x = objPos.y = objPos.z = 0
-  objRot.x = objRot.y = objRot.z = 0
-  objScale.value = 1
-  applyObjectTransform()
+// The gizmo drags pivotGroup directly. Decompose its pose back into the panel values so the
+// two never diverge, inverting applyObjectTransform's position formula so a later panel edit
+// (which re-runs that formula) reproduces the exact same pose — no jump.
+function readbackGizmo() {
+  // The gizmo may be dragging a light's aim target — route the position into tx/ty/tz.
+  if (gizmoTargetId.value != null) {
+    const e = lightObjs.get(gizmoTargetId.value)
+    const cfg = lights.find((c) => c.id === gizmoTargetId.value)
+    if (e?.target && cfg) {
+      cfg.tx = +e.target.position.x.toFixed(3)
+      cfg.ty = +e.target.position.y.toFixed(3)
+      cfg.tz = +e.target.position.z.toFixed(3)
+      applyLightCfg(cfg)
+    }
+    return
+  }
+  // The gizmo may be dragging a light body instead of the object — route the position back.
+  if (gizmoLightId.value != null) {
+    const e = lightObjs.get(gizmoLightId.value)
+    const cfg = lights.find((c) => c.id === gizmoLightId.value)
+    if (e && cfg) {
+      cfg.x = +e.light.position.x.toFixed(3)
+      cfg.y = +e.light.position.y.toFixed(3)
+      cfg.z = +e.light.position.z.toFixed(3)
+      applyLightCfg(cfg) // re-aim at the origin + refresh helper/caster
+    }
+    return
+  }
+  const g = pivotGroup
+  if (!g) return
+  const q = g.quaternion.clone()
+  const s = g.scale.x
+  objScale.value = s
+  const e = new THREE.Euler().setFromQuaternion(q, 'XYZ')
+  objRot.x = +THREE.MathUtils.radToDeg(e.x).toFixed(2)
+  objRot.y = +THREE.MathUtils.radToDeg(e.y).toFixed(2)
+  objRot.z = +THREE.MathUtils.radToDeg(e.z).toFixed(2)
+  const off = pivotP.clone().multiplyScalar(s).applyQuaternion(q) // q·(s·pivotP)
+  objPos.x = +(g.position.x - pivotP.x + off.x).toFixed(4)
+  objPos.y = +(g.position.y - pivotP.y + off.y).toFixed(4)
+  objPos.z = +(g.position.z - pivotP.z + off.z).toFixed(4)
+  contactDirty = true
 }
+
+function setGizmoMode(m: 'off' | 'translate' | 'rotate' | 'scale') {
+  gizmoMode.value = m
+  gizmoLightId.value = null // switching to the object (or off) releases any light/target
+  gizmoTargetId.value = null
+  if (!transformControls || !gizmoHelper) return
+  if (m === 'off' || !pivotGroup) {
+    transformControls.detach()
+    transformControls.enabled = false
+    gizmoHelper.removeFromParent() // out of the scene so its updateMatrixWorld can't run unattached
+  } else {
+    transformControls.attach(pivotGroup)
+    transformControls.setMode(m)
+    transformControls.enabled = true
+    gizmoHelper.visible = true
+    if (!gizmoHelper.parent) scene.add(gizmoHelper)
+  }
+}
+
+// ── Extra lights rig ─────────────────────────────────────────────────────────
+function initExtraLights() {
+  extraLightsGroup = new THREE.Group()
+  scene.add(extraLightsGroup)
+}
+
+/** Build the RectAreaLight + helper + aim-target proxy for a cfg and register them. */
+function makeLightObjects(cfg: LightCfg) {
+  if (!extraLightsGroup) return
+  if (!rectLibReady) { RectAreaLightUniformsLib.init(); rectLibReady = true }
+  const light = new THREE.RectAreaLight(cfg.color, cfg.intensity, cfg.size, cfg.size)
+  const helper = new RectAreaLightHelper(light)
+  light.add(helper) // the RectAreaLightHelper must be a child of the light it visualises
+  const target = new THREE.Object3D() // RectAreaLight has no target; a proxy the gizmo can grab
+  extraLightsGroup.add(target)
+  light.name = `nkdLight${cfg.id}`
+  extraLightsGroup.add(light)
+  lightObjs.set(cfg.id, { light, helper, target })
+  applyLightCfg(cfg)
+}
+
+/** Push a cfg onto its live objects. The RectAreaLight gives the soft LTC fill; since three's
+ *  area lights can't cast, a paired spot caster provides the (soft) shadow when Shadow is on. */
+function applyLightCfg(cfg: LightCfg) {
+  const e = lightObjs.get(cfg.id)
+  if (!e) return
+  const l = e.light as any
+  l.position.set(cfg.x, cfg.y, cfg.z)
+  l.color.set(cfg.color)
+  l.intensity = cfg.intensity
+  // Aim at the user's target. If the target coincides with the light position the direction is
+  // zero-length (NaN), so aim straight down instead until one of them is moved.
+  const degenerate = cfg.x === cfg.tx && cfg.y === cfg.ty && cfg.z === cfg.tz
+  const aimX = degenerate ? cfg.x : cfg.tx
+  const aimY = degenerate ? cfg.y - 1 : cfg.ty
+  const aimZ = degenerate ? cfg.z : cfg.tz
+  // Keep the target proxy on the real target coords so the gizmo grabs it in the right place.
+  if (e.target) { e.target.position.set(cfg.tx, cfg.ty, cfg.tz); e.target.updateMatrixWorld() }
+  l.width = Math.max(cfg.size, 0.1)
+  l.height = Math.max(cfg.size, 0.1)
+  l.lookAt(aimX, aimY, aimZ)
+  // Paired spot caster for the shadow. Size scales the softness (radius ×2.5 so it reads).
+  if (cfg.shadow && !e.caster) {
+    const c = new THREE.SpotLight(cfg.color, cfg.intensity)
+    c.penumbra = 0.5
+    c.angle = 1.2 // wide enough to cover the object at the origin
+    c.castShadow = true
+    c.shadow.mapSize.set(1024, 1024)
+    c.shadow.bias = -0.001
+    c.shadow.blurSamples = 25
+    extraLightsGroup!.add(c)
+    extraLightsGroup!.add(c.target)
+    e.caster = c
+  } else if (!cfg.shadow && e.caster) {
+    e.caster.removeFromParent()
+    e.caster.target.removeFromParent()
+    e.caster.dispose()
+    e.caster = undefined
+  }
+  if (e.caster) {
+    e.caster.position.set(cfg.x, cfg.y, cfg.z)
+    e.caster.color.set(cfg.color)
+    e.caster.intensity = cfg.intensity
+    e.caster.shadow.radius = cfg.size * 2.5
+    e.caster.target.position.set(aimX, aimY, aimZ)
+    e.caster.target.updateMatrixWorld()
+  }
+  if ((e.helper as any)?.update) (e.helper as any).update()
+}
+
+function selectLight(id: number) {
+  selectedLightId.value = selectedLightId.value === id ? null : id
+}
+
+function addLight() {
+  // Born at the origin — centred in frame and right under the gizmo, so it can be grabbed
+  // and dragged out into the scene. It aims down until moved off the origin.
+  const cfg: LightCfg = {
+    id: lightSeq++, x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0, color: '#ffffff',
+    intensity: 8, size: 3, shadow: true,
+  }
+  lights.push(cfg)
+  makeLightObjects(cfg)
+  selectedLightId.value = cfg.id
+}
+
+function removeLight(id: number) {
+  const e = lightObjs.get(id)
+  if (e) {
+    const l = e.light as any
+    e.helper?.removeFromParent?.()
+    e.target?.removeFromParent?.()
+    l.target?.removeFromParent?.()
+    l.removeFromParent?.()
+    l.dispose?.()
+    if (e.caster) { e.caster.target.removeFromParent(); e.caster.removeFromParent(); e.caster.dispose() }
+    lightObjs.delete(id)
+  }
+  const idx = lights.findIndex((c) => c.id === id)
+  if (idx >= 0) lights.splice(idx, 1)
+  if (gizmoLightId.value === id || gizmoTargetId.value === id) setGizmoMode('off')
+  if (selectedLightId.value === id) selectedLightId.value = null
+}
+
+/** Attach the translate gizmo to a light so it can be dragged in the viewport. */
+function gizmoLight(id: number) {
+  const e = lightObjs.get(id)
+  if (!transformControls || !gizmoHelper || !e) return
+  if (gizmoLightId.value === id) { setGizmoMode('off'); return } // toggle off
+  transformControls.attach(e.light)
+  transformControls.setMode('translate')
+  transformControls.enabled = true
+  gizmoHelper.visible = true
+  if (!gizmoHelper.parent) scene.add(gizmoHelper)
+  gizmoMode.value = 'off' // the object-gizmo buttons are not the active target now
+  gizmoTargetId.value = null
+  gizmoLightId.value = id
+}
+
+/** Attach the translate gizmo to a light's aim target (spot/area). */
+function gizmoLightTarget(id: number) {
+  const e = lightObjs.get(id)
+  if (!transformControls || !gizmoHelper || !e?.target) return
+  if (gizmoTargetId.value === id) { setGizmoMode('off'); return } // toggle off
+  transformControls.attach(e.target)
+  transformControls.setMode('translate')
+  transformControls.enabled = true
+  gizmoHelper.visible = true
+  if (!gizmoHelper.parent) scene.add(gizmoHelper)
+  gizmoMode.value = 'off'
+  gizmoLightId.value = null
+  gizmoTargetId.value = id
+}
+
+function setHelpersVisible(v: boolean) {
+  for (const e of lightObjs.values()) if (e.helper) e.helper.visible = v
+}
+
 
 function cameraInfo() {
   const q = camera.quaternion
@@ -757,8 +1382,11 @@ async function capture(width: number, height: number) {
   const prevAspect = camera.aspect
   const prevRatio = r.getPixelRatio()
   const gridWasVisible = !!grid?.visible
+  const gizmoWasVisible = !!gizmoHelper?.visible
 
   if (grid) grid.visible = false // never bake the grid into an export
+  if (gizmoHelper) gizmoHelper.visible = false // nor the transform gizmo
+  setHelpersVisible(false) // nor the light helpers
   // The viewport renders at devicePixelRatio, but the export must be EXACTLY width×height
   // pixels — at ratio 2 the PNG would come out doubled.
   r.setPixelRatio(1)
@@ -767,7 +1395,10 @@ async function capture(width: number, height: number) {
   camera.updateProjectionMatrix()
   fitBackground()
 
-  // 1. The full composite: model over the backdrop.
+  // 1. The full composite: model over the backdrop (with the grounding shadow, and the
+  //    photo's depth occluding the model if Occlude is on). Re-bake the contact shadow so
+  //    it matches the export camera exactly.
+  if (contact.value) { renderContactShadow(); contactDirty = false }
   renderFrame()
   const scene_ = r.domElement.toDataURL('image/png')
 
@@ -777,6 +1408,10 @@ async function capture(width: number, height: number) {
   //    lives in the composite above.
   const catcherWasVisible = !!shadowCatcher?.visible
   if (shadowCatcher) shadowCatcher.visible = false
+  // The grounding shadow is not part of the silhouette (nor of the depth surface below) —
+  // hide it for the mask AND the depth pass; restored with the catcher at the end.
+  const contactWasVisible = !!contactGroup?.visible
+  if (contactGroup) contactGroup.visible = false
   r.setClearColor(0x000000, 0)
   renderFrame(false)
   const object = r.domElement.toDataURL('image/png')
@@ -835,20 +1470,27 @@ async function capture(width: number, height: number) {
   if (sparkRenderer) sparkRenderer.visible = false
   const modelWasVisible = model?.visible ?? false
   if (modelIsSplat && model) model.visible = false
-  scene.traverse((child) => {
-    if (child instanceof THREE.Mesh && child !== sparkRenderer) {
-      originals.set(child, child.material)
-      child.material = overrideMat
-    }
-  })
+  // Override ONLY the model's meshes, not the whole scene: light helpers (RectAreaLightHelper
+  // et al.) and the gizmo run their own updateMatrixWorld that reads material.color, which
+  // MeshDepthMaterial lacks — swapping their material there throws. Everything non-model is
+  // hidden in this pass anyway, so it never needed the depth material.
+  if (model && !modelIsSplat) {
+    model.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        originals.set(child, child.material)
+        child.material = overrideMat
+      }
+    })
+  }
   r.setClearColor(0x000000, 1)
   r.autoClear = false
   r.clear()
   if (sceneDepthTexture) {
-    bgDepthMaterial.uniforms.camNear.value = camera.near
-    bgDepthMaterial.uniforms.camFar.value = camera.far
     r.render(bgDepthScene, bgCamera)
-    r.clearDepth() // the object composites OVER the scene layer, never clips against it
+    // Occlude on: keep the scene depth so the object is depth-tested against it (masked by
+    // nearer scene geometry) — the depth output occludes just like the colour composite.
+    // Off: clear it so the object always wins (composite-over, the original behaviour).
+    if (!occlude.value) r.clearDepth()
   }
   r.render(scene, camera)
   r.autoClear = true
@@ -861,7 +1503,10 @@ async function capture(width: number, height: number) {
   camera.near = prevNear
   camera.far = prevFar
   if (shadowCatcher) shadowCatcher.visible = catcherWasVisible
+  if (contactGroup) contactGroup.visible = contactWasVisible
   if (grid) grid.visible = gridWasVisible
+  if (gizmoHelper) gizmoHelper.visible = gizmoWasVisible
+  setHelpersVisible(true)
   r.setClearColor(0x000000, 0)
   r.setPixelRatio(prevRatio)
   r.setSize(prevSize.x, prevSize.y, false)
@@ -961,10 +1606,22 @@ function autoCalibrateDepth() {
   // Apply locally NOW: capture runs before the backend folds the widgets back.
   bgDepthMaterial.uniforms.dNear.value = +near.toFixed(3)
   bgDepthMaterial.uniforms.dFar.value = +far.toFixed(2)
+  syncDepthUI()
   emit('calibrated', +near.toFixed(3), +far.toFixed(2))
   status.value = `Auto Z: near ${near.toFixed(2)} / far ${far.toFixed(1)}`
   window.setTimeout(() => { if (status.value.startsWith('Auto Z:')) status.value = '' }, 4000)
 }
+
+// Mirror the invert uniform into the panel (loadScene sets it from the node's widget).
+function syncDepthUI() {
+  depthInvertUI.value = bgDepthMaterial.uniforms.invert.value > 0.5
+}
+function setDepthInvertUI(b: boolean) {
+  depthInvertUI.value = b
+  bgDepthMaterial.uniforms.invert.value = b ? 1 : 0
+}
+function setOccFrom(v: number) { occFrom.value = v; bgDepthMaterial.uniforms.occFrom.value = v }
+function setOccTo(v: number) { occTo.value = v; bgDepthMaterial.uniforms.occTo.value = v }
 
 /** Payload pushed by the backend on execute. */
 async function loadScene(payload: any) {
@@ -972,6 +1629,7 @@ async function loadScene(payload: any) {
   await setBackground(payload.bg_image ?? null)
   await setSceneDepth(payload.scene_depth ?? null)
   bgDepthMaterial.uniforms.invert.value = payload.scene_depth_invert ? 1 : 0
+  // Still tracked for the depth EXPORT's object-tone remap (linearDepthMaterial), not occlusion.
   sceneDepthInverseSpace = payload.scene_depth_inverse_space !== false
   if (typeof payload.scene_depth_near === 'number') {
     bgDepthMaterial.uniforms.dNear.value = payload.scene_depth_near
@@ -979,6 +1637,7 @@ async function loadScene(payload: any) {
   if (typeof payload.scene_depth_far === 'number') {
     bgDepthMaterial.uniforms.dFar.value = payload.scene_depth_far
   }
+  syncDepthUI()
   if (payload.camera_info) applyCameraInfo(payload.camera_info)
   if (payload.model_3d_info) applyModelInfo(payload.model_3d_info)
 }
@@ -1018,6 +1677,16 @@ function serialise(): string {
     shadows: shadows.value,
     shadowSoft: shadowSoft.value,
     shadowStr: shadowStr.value,
+    contact: contact.value,
+    contactStr: contactStr.value,
+    contactBlur: contactBlur.value,
+    contactSpread: contactSpread.value,
+    occlude: occlude.value,
+    occFrom: occFrom.value,
+    occTo: occTo.value,
+    unbake: unbake.value,
+    smooth: smooth.value,
+    lights: lights.map((c) => ({ ...c })),
     object: {
       pos: { ...objPos },
       rot: { ...objRot },
@@ -1043,7 +1712,37 @@ function deserialise(json: string) {
     num(s.lightInt, lightInt)
     num(s.shadowSoft, shadowSoft)
     num(s.shadowStr, shadowStr)
+    num(s.contactStr, contactStr)
+    num(s.contactBlur, contactBlur)
+    num(s.contactSpread, contactSpread)
     if (typeof s.shadows === 'boolean') shadows.value = s.shadows
+    if (typeof s.contact === 'boolean') contact.value = s.contact
+    if (typeof s.occlude === 'boolean') occlude.value = s.occlude
+    if (typeof s.unbake === 'boolean') unbake.value = s.unbake
+    if (typeof s.smooth === 'number') { smooth.value = s.smooth; applySmoothNormals() }
+    if (typeof s.occFrom === 'number') setOccFrom(s.occFrom)
+    if (typeof s.occTo === 'number') setOccTo(s.occTo)
+    if (Array.isArray(s.lights)) {
+      for (const id of [...lightObjs.keys()]) removeLight(id) // clear any current rig
+      lights.length = 0
+      lightSeq = 1
+      for (const c of s.lights) {
+        if (!c || typeof c !== 'object') continue // old point/spot lights load as fill too
+        const cfg: LightCfg = {
+          id: lightSeq++,
+          x: +c.x || 0, y: +c.y || 0, z: +c.z || 0,
+          tx: +c.tx || 0, ty: +c.ty || 0, tz: +c.tz || 0,
+          color: typeof c.color === 'string' ? c.color : '#ffffff',
+          intensity: +c.intensity || 0,
+          size: typeof c.size === 'number' ? c.size : 3,
+          shadow: !!c.shadow,
+        }
+        lights.push(cfg)
+        makeLightObjects(cfg)
+      }
+      selectedLightId.value = null
+    }
+    if (contactGroup) contactGroup.visible = contact.value
     if (s.object) {
       const o = s.object
       if (o.pos) Object.assign(objPos, o.pos)
@@ -1065,9 +1764,16 @@ function cleanup() {
   cancelAnimationFrame(raf)
   ro?.disconnect()
   controls?.dispose()
+  transformControls?.dispose()
+  for (const id of [...lightObjs.keys()]) removeLight(id)
   bgTexture?.dispose()
   sceneDepthTexture?.dispose()
   bgDepthMaterial.dispose()
+  contactRT?.dispose()
+  contactRTBlur?.dispose()
+  contactDepthMat?.dispose()
+  contactHBlur?.dispose()
+  contactVBlur?.dispose()
   envRT?.dispose()
   pmrem?.dispose()
   renderer.value?.dispose()
@@ -1077,12 +1783,13 @@ function cleanup() {
 onMounted(() => {
   const el = host.value!
   const r = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true })
-  r.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+  r.setPixelRatio(Math.max(window.devicePixelRatio, 2)) // resize() refines this with the canvas zoom
   r.setClearColor(0x000000, 0)
   r.shadowMap.enabled = true
-  // PCF, not PCFSoft: PCFSoft's kernel is fixed and ignores shadow.radius outright, so the
-  // softness control would move nothing. Measured — PCF spreads with radius, PCFSoft doesn't.
-  r.shadowMap.type = THREE.PCFShadowMap
+  // VSM, not PCF: PCF honours shadow.radius for directional/spot but IGNORES it for point
+  // lights (the cube-shadow path has no radius blur), so a point light's Size did nothing.
+  // VSM blurs the shadow map by shadow.radius for EVERY light type, point included.
+  r.shadowMap.type = THREE.VSMShadowMap
   el.appendChild(r.domElement)
   renderer.value = r
 
@@ -1092,6 +1799,19 @@ onMounted(() => {
   controls.dampingFactor = 0.12
   // The key light's world position depends on the camera yaw — track it while orbiting.
   controls.addEventListener('change', applyLighting)
+
+  // Transform gizmo: drag the object in the viewport. r0.18x's TransformControls is a Controls
+  // (not an Object3D) — add its getHelper() to the scene, not the control itself.
+  transformControls = new TransformControls(camera, r.domElement)
+  transformControls.addEventListener('dragging-changed', (e: any) => {
+    if (controls) controls.enabled = !e.value // don't orbit while dragging a handle
+  })
+  transformControls.addEventListener('objectChange', readbackGizmo)
+  gizmoHelper = (transformControls as any).getHelper?.() ?? (transformControls as unknown as THREE.Object3D)
+  // NOT added to the scene until a gizmo mode is active: the helper's updateMatrixWorld runs
+  // on every render regardless of visibility, and with no object attached it throws
+  // (undefined.clone()). It joins the scene only in setGizmoMode/gizmoLight.
+  transformControls.enabled = false
 
   ro = new ResizeObserver(() => resize())
   ro.observe(el)
@@ -1107,16 +1827,16 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 <template>
   <div class="nkd-p3d">
     <div class="nkd-bar">
-      <button :class="{ on: showGrid }" @click="toggleGrid">Grid</button>
-      <button @click="frameModel">Frame</button>
-      <button v-if="hasSceneDepth" @click="autoCalibrateDepth"
-        title="Fit scene_depth_near/far against the fSpy ground plane">Auto Z</button>
-      <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
       <button :class="{ on: activePanel === 'object' }" @click="togglePanel('object')">Object</button>
-      <span class="nkd-name">{{ modelName }}</span>
+      <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
+      <button v-if="hasSceneDepth" :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
+        title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
+      <button v-if="hasSceneDepth" @click="autoCalibrateDepth"
+        title="Fit the exported depth's object tone against the fSpy ground plane">Auto Z</button>
       <span v-if="status" class="nkd-status">{{ status }}</span>
     </div>
-    <div v-if="activePanel === 'light'" class="nkd-panel" @pointerdown.stop @wheel.stop>
+    <div v-if="activePanel === 'light'" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+      <div class="nkd-light-main">
       <div class="nkd-sphere-box">
         <canvas ref="sphereCv" width="92" height="92" class="nkd-sphere" @pointerdown="onSphereDown" />
         <span>{{ lightAz }}° / {{ lightEl }}°</span>
@@ -1129,10 +1849,72 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         </label>
         <label>Soft<input type="range" min="0" max="12" step="0.5" v-model.number="shadowSoft" :disabled="!shadows" @input="applyLighting"><span>{{ shadowSoft }}</span></label>
         <label>Str<input type="range" min="0" max="1" step="0.02" v-model.number="shadowStr" :disabled="!shadows" @input="applyLighting"><span>{{ shadowStr.toFixed(2) }}</span></label>
+        <label class="nkd-check">
+          <input type="checkbox" v-model="contact"> Contact shadow
+        </label>
+        <label>Dark<input type="range" min="0" max="1" step="0.02" v-model.number="contactStr" :disabled="!contact"><span>{{ contactStr.toFixed(2) }}</span></label>
+        <label>Blur<input type="range" min="0" max="8" step="0.1" v-model.number="contactBlur" :disabled="!contact"><span>{{ contactBlur.toFixed(1) }}</span></label>
+        <label>Size<input type="range" min="0.08" max="1" step="0.02" v-model.number="contactSpread" :disabled="!contact"><span>{{ contactSpread.toFixed(2) }}</span></label>
+        <label class="nkd-check" title="For baked/unlit models (Tripo, splat→mesh): move the texture to albedo so the object takes lights and shadows">
+          <input type="checkbox" v-model="unbake"> Unbake → relight
+        </label>
+        <label title="Diffuse the surface normals to soften bumpy splat-mesh shading. 0 = original; higher = smoother (and slower — it's a full mesh pass per step). Applied on release. Needs Unbake (lit material) to show.">Smooth<input type="range" min="0" max="200" step="5" v-model.number="smooth" @change="applySmoothNormals()"><span>{{ smooth }}</span></label>
+      </div>
+      </div>
+      <div class="nkd-lights">
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Fill</span>
+          <button class="nkd-gizmo" @click="addLight()" title="Add a soft fill light">+ Fill light</button>
+        </div>
+        <div v-for="(l, i) in lights" :key="l.id" class="nkd-light-item">
+          <div class="nkd-obj-row">
+            <button class="nkd-gizmo" :class="{ on: selectedLightId === l.id }" @click="selectLight(l.id)">Fill {{ i + 1 }}</button>
+            <button class="nkd-obj-reset" @click="removeLight(l.id)" title="Delete light">✕</button>
+          </div>
+          <template v-if="selectedLightId === l.id">
+            <div class="nkd-obj-row">
+              <span class="nkd-obj-tag">Pos</span>
+              <DragNumber :model-value="l.x" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.x = v; applyLightCfg(l) }" />
+              <DragNumber :model-value="l.y" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.y = v; applyLightCfg(l) }" />
+              <DragNumber :model-value="l.z" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.z = v; applyLightCfg(l) }" />
+              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoLightId === l.id }" @click="gizmoLight(l.id)" title="Move light in the viewport">⤢</button>
+            </div>
+            <div class="nkd-obj-row">
+              <span class="nkd-obj-tag">Aim</span>
+              <DragNumber :model-value="l.tx" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.tx = v; applyLightCfg(l) }" />
+              <DragNumber :model-value="l.ty" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.ty = v; applyLightCfg(l) }" />
+              <DragNumber :model-value="l.tz" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.tz = v; applyLightCfg(l) }" />
+              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoTargetId === l.id }" @click="gizmoLightTarget(l.id)" title="Move aim target in the viewport">⤢</button>
+            </div>
+            <div class="nkd-sliders">
+              <label>Int<input type="range" min="0" max="150" step="1" v-model.number="l.intensity" @input="applyLightCfg(l)"><span>{{ l.intensity.toFixed(0) }}</span></label>
+              <label title="Light size — bigger area, softer light and softer shadow">Size<input type="range" min="0" max="12" step="0.1" v-model.number="l.size" @input="applyLightCfg(l)"><span>{{ l.size.toFixed(1) }}</span></label>
+            </div>
+            <div class="nkd-obj-row">
+              <span class="nkd-obj-tag">Color</span>
+              <input type="color" class="nkd-color" v-model="l.color" @input="applyLightCfg(l)">
+              <label class="nkd-check" style="flex:1 1 0"><input type="checkbox" v-model="l.shadow" @change="applyLightCfg(l)"> Soft shadow</label>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+    <div v-if="activePanel === 'occlude'" class="nkd-panel" @pointerdown.stop @wheel.stop>
+      <div class="nkd-sliders">
+        <label class="nkd-check"><input type="checkbox" v-model="occlude"> Occlusion (depth-key matte)</label>
+        <label title="Front of the occluding grey band. Near reads as white, so a band ending at 1 keys out the foreground">From<input type="range" min="0" max="1" step="0.01" v-model.number="occFrom" :disabled="!occlude" @input="setOccFrom(occFrom)"><span>{{ occFrom.toFixed(2) }}</span></label>
+        <label title="Back of the occluding grey band. Everything between From and To hides the object">To<input type="range" min="0" max="1" step="0.01" v-model.number="occTo" :disabled="!occlude" @input="setOccTo(occTo)"><span>{{ occTo.toFixed(2) }}</span></label>
+        <label class="nkd-check"><input type="checkbox" :checked="depthInvertUI" @change="setDepthInvertUI(($event.target as HTMLInputElement).checked)"> Invert depth map</label>
       </div>
     </div>
     <div v-if="activePanel === 'object'" class="nkd-panel" @pointerdown.stop @wheel.stop>
       <div class="nkd-obj">
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Gizmo</span>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'translate' }" @click="setGizmoMode(gizmoMode === 'translate' ? 'off' : 'translate')">Move</button>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'rotate' }" @click="setGizmoMode(gizmoMode === 'rotate' ? 'off' : 'rotate')">Rotate</button>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'scale' }" @click="setGizmoMode(gizmoMode === 'scale' ? 'off' : 'scale')">Scale</button>
+        </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Pivot</span>
           <select :value="pivotMode" @change="setPivotMode(($event.target as HTMLSelectElement).value as any)">
@@ -1140,23 +1922,22 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
             <option value="center">Center</option>
             <option value="origin">Origin</option>
           </select>
-          <button class="nkd-obj-reset" @click="resetObjectTransform">Reset</button>
         </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Pos</span>
-          <DragNumber :model-value="objPos.x" :step="0.01" @update:model-value="(v: number) => { objPos.x = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objPos.y" :step="0.01" @update:model-value="(v: number) => { objPos.y = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objPos.z" :step="0.01" @update:model-value="(v: number) => { objPos.z = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objPos.x" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.x = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objPos.y" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.y = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objPos.z" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.z = v; applyObjectTransform() }" />
         </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Rot</span>
-          <DragNumber :model-value="objRot.x" :step="0.5" :decimals="1" @update:model-value="(v: number) => { objRot.x = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objRot.y" :step="0.5" :decimals="1" @update:model-value="(v: number) => { objRot.y = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objRot.z" :step="0.5" :decimals="1" @update:model-value="(v: number) => { objRot.z = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objRot.x" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.x = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objRot.y" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.y = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objRot.z" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.z = v; applyObjectTransform() }" />
         </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Scale</span>
-          <DragNumber :model-value="objScale" :step="0.005" :min="0.001" :decimals="3" @update:model-value="(v: number) => { objScale = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objScale" :step="0.005" :min="0.001" :decimals="3" :reset-to="1" @update:model-value="(v: number) => { objScale = v; applyObjectTransform() }" />
         </div>
       </div>
     </div>
@@ -1165,7 +1946,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
       class="nkd-view"
       :style="{ aspectRatio: `${aspect.w} / ${aspect.h}` }"
       @contextmenu.prevent
-    />
+    >
+      <div class="nkd-overlay" @pointerdown.stop>
+        <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid">▦</button>
+        <button @click="frameModel" title="Frame model">⛶</button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1183,12 +1969,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 .nkd-bar button {
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
   color: #c8d0e0; font-size: 11px; padding: 3px 9px; cursor: pointer;
+  white-space: nowrap; flex: 0 0 auto;
 }
 .nkd-bar button:hover { border-color: #4ab4ff; }
 .nkd-bar button.on { border-color: #4ab4ff; color: #4ab4ff; }
-.nkd-name { color: rgba(255, 255, 255, 0.45); font-size: 10px; margin-left: auto;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 45%; }
-.nkd-status { color: #ffd166; font-size: 10px; }
+.nkd-status { color: #ffd166; font-size: 10px; margin-left: auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nkd-panel {
   display: flex; align-items: center; gap: 10px;
   padding: 6px; background: #1a1c22; border-bottom: 1px solid #3a3d46; flex: 0 0 auto;
@@ -1218,11 +2004,18 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 }
 .nkd-obj-row select:focus { outline: none; border-color: #4ab4ff; }
 .nkd-obj-row :deep(.nkd-drag) {
+  position: relative;
   flex: 1 1 0; min-width: 0; width: 0;
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
   color: #c8d0e0; font-size: 11px; padding: 2px 6px; text-align: center;
   cursor: ew-resize; user-select: none; touch-action: none;
 }
+.nkd-obj-row :deep(.nkd-drag-reset) {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  font-size: 10px; line-height: 1; color: rgba(255, 255, 255, 0.35);
+  cursor: pointer; padding: 0 1px;
+}
+.nkd-obj-row :deep(.nkd-drag-reset:hover) { color: #4ab4ff; }
 .nkd-obj-row :deep(.nkd-drag:hover) { border-color: #4ab4ff; }
 .nkd-obj-row :deep(.nkd-drag-edit) { cursor: text; user-select: text; text-align: left; }
 .nkd-obj-row :deep(.nkd-drag-edit:focus) { outline: none; border-color: #4ab4ff; }
@@ -1231,10 +2024,36 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
   color: #c8d0e0; font-size: 10px; padding: 2px 8px; cursor: pointer;
 }
 .nkd-obj-reset:hover { border-color: #4ab4ff; }
+.nkd-gizmo {
+  flex: 1 1 0; min-width: 0; background: #252830; border: 1px solid #3a3d46;
+  border-radius: 4px; color: #c8d0e0; font-size: 10px; padding: 2px 4px; cursor: pointer;
+}
+.nkd-gizmo:hover { border-color: #4ab4ff; }
+.nkd-gizmo.on { border-color: #4ab4ff; color: #4ab4ff; }
+.nkd-gizmo-icon { flex: 0 0 auto; width: 26px; }
+/* Light rig: the panel goes column so the extra-lights list sits under the key controls. */
+.nkd-panel-col { flex-direction: column; align-items: stretch; }
+.nkd-light-main { display: flex; align-items: center; gap: 10px; width: 100%; }
+.nkd-lights { display: grid; gap: 4px; width: 100%;
+  border-top: 1px solid #3a3d46; padding-top: 6px; margin-top: 2px; }
+.nkd-light-item { display: grid; gap: 3px; border: 1px solid #2a2d36; border-radius: 4px; padding: 4px; }
+.nkd-light-item .nkd-obj-tag { text-transform: capitalize; }
+.nkd-color { width: 28px; height: 20px; padding: 0; flex: 0 0 auto;
+  border: 1px solid #3a3d46; border-radius: 4px; background: #252830; cursor: pointer; }
 /* aspect-ratio (bound inline, from the width/height widgets) gives the box a real height
    from CSS alone — width in, height out, same formula the node reserves with. Deriving it
    from the canvas instead (height:auto) feeds the canvas's own attributes back into
    layout: a first frame sized 1x1 before the element has a width renders a giant square. */
-.nkd-view { width: 100%; flex: 0 0 auto; overflow: hidden; background: #111318; font-size: 0; }
+.nkd-view { position: relative; width: 100%; flex: 0 0 auto; overflow: hidden; background: #111318; font-size: 0; }
 .nkd-view :deep(canvas) { width: 100%; height: 100%; display: block; }
+/* In-viewer controls: grid toggle + frame, kept out of the tab bar so it stays panel-only. */
+.nkd-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 4px; z-index: 5; }
+.nkd-overlay button {
+  width: 24px; height: 24px; padding: 0; font-size: 13px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(26, 28, 34, 0.72); border: 1px solid rgba(90, 100, 120, 0.5);
+  border-radius: 4px; color: #c8d0e0; cursor: pointer;
+}
+.nkd-overlay button:hover { border-color: #4ab4ff; color: #4ab4ff; }
+.nkd-overlay button.on { border-color: #4ab4ff; color: #4ab4ff; }
 </style>
