@@ -15,7 +15,16 @@ import cssInjectedByJs from "vite-plugin-css-injected-by-js";
  * Using rollupOptions.input directly instead of lib to support multiple entries.
  */
 export default defineConfig({
-  plugins: [vue(), cssInjectedByJs({ topExecutionPriority: false })],
+  plugins: [
+    vue(),
+    // relativeCSSInjection puts each chunk's CSS INSIDE that chunk. Without it
+    // the plugin picks one entry to host the whole pack's CSS, so a component
+    // and the stylesheet that scopes it can come from different builds — and a
+    // Vue scope id changes with the component's source, so every scoped rule
+    // then silently stops matching. That is what rendered Preview 3D completely
+    // unstyled. Needs build.cssCodeSplit: true to have per-chunk CSS to place.
+    cssInjectedByJs({ topExecutionPriority: false, relativeCSSInjection: true }),
+  ],
 
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
@@ -59,7 +68,16 @@ export default defineConfig({
     },
     sourcemap: false,
     minify: true,
-    cssCodeSplit: false,
+    // TRUE, not false. With false the whole pack's CSS is bundled once and
+    // vite-plugin-css-injected-by-js drops it into ONE entry of its choosing —
+    // and which entry it picks can change between builds. Vue scope ids change
+    // whenever a component's source does, so the moment the stylesheet and the
+    // component chunk come from different builds (a browser cache miss on one
+    // of them, an orphaned chunk left behind by emptyOutDir:false) every scoped
+    // rule stops matching and the widget renders completely unstyled — measured:
+    // CSS targeting [data-v-430487f1] against a DOM built by [data-v-178b1930].
+    // Split makes each chunk carry its own CSS, so they cannot desync.
+    cssCodeSplit: true,
   },
 
   define: {
