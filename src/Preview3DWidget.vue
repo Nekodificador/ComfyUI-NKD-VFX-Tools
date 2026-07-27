@@ -114,6 +114,15 @@ const emit = defineEmits<{ calibrated: [near: number, far: number] }>()
 const host = ref<HTMLDivElement | null>(null)
 const showGrid = ref(true)
 const status = ref('')
+// Camera lock. A solved camera (fSpy) is a match to the plate — one stray orbit
+// throws the match away and there is no undo, so an injected camera locks by
+// default. Without one there is nothing to protect, so the camera stays free.
+const camLocked = ref(false)
+const hasCamera = ref(false)      // camera_info is wired and arriving
+// Once the user has had an opinion, stop re-locking on every graph run —
+// otherwise unlocking would only last until the next execute.
+let lockChosenByUser = false
+let gizmoDragging = false
 // One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
 // only counts the first .nkd-panel it finds.
 const activePanel = ref<'' | 'light' | 'object' | 'occlude'>('')
@@ -1638,6 +1647,19 @@ async function loadScene(payload: any) {
     bgDepthMaterial.uniforms.dFar.value = payload.scene_depth_far
   }
   syncDepthUI()
+  // React only to the CONNECTED/DISCONNECTED edge, not to every run: re-locking
+  // on each execute would make unlocking useless.
+  const injected = !!payload.camera_info
+  if (injected !== hasCamera.value) {
+    hasCamera.value = injected
+    if (injected) {
+      if (!lockChosenByUser) camLocked.value = true
+    } else {
+      camLocked.value = false      // nothing to protect -> free camera
+      lockChosenByUser = false     // a future solve locks by default again
+    }
+    applyControlsEnabled()
+  }
   if (payload.camera_info) applyCameraInfo(payload.camera_info)
   if (payload.model_3d_info) applyModelInfo(payload.model_3d_info)
 }
@@ -1647,7 +1669,22 @@ function toggleGrid() {
   if (grid) grid.visible = showGrid.value
 }
 
+/** Single owner of controls.enabled: the lock AND the gizmo drag both suppress
+ *  orbiting, so neither may write the flag directly or they undo each other. */
+function applyControlsEnabled() {
+  if (controls) controls.enabled = !camLocked.value && !gizmoDragging
+}
+
+function toggleCamLock() {
+  camLocked.value = !camLocked.value
+  lockChosenByUser = true
+  applyControlsEnabled()
+  status.value = camLocked.value ? 'Camera locked' : 'Camera free'
+}
+
 function frameModel() {
+  // Framing moves the camera, which is exactly what the lock exists to prevent.
+  if (camLocked.value) { status.value = 'Camera is locked — unlock to reframe'; return }
   if (!model) return
   const box = new THREE.Box3().setFromObject(model)
   const size = box.getSize(new THREE.Vector3()).length()
@@ -1669,6 +1706,7 @@ function forceResize(): boolean {
 function serialise(): string {
   return JSON.stringify({
     showGrid: showGrid.value,
+    camLocked: camLocked.value,
     camera: cameraInfo(),
     env: env.value,
     lightAz: lightAz.value,
@@ -1699,6 +1737,13 @@ function serialise(): string {
 function deserialise(json: string) {
   try {
     const s = JSON.parse(json)
+    if (typeof s.camLocked === 'boolean') {
+      // A saved lock state IS the user's opinion — keep it across reloads and
+      // don't let the next camera injection override it.
+      camLocked.value = s.camLocked
+      lockChosenByUser = true
+      applyControlsEnabled()
+    }
     if (typeof s.showGrid === 'boolean') {
       showGrid.value = s.showGrid
       if (grid) grid.visible = s.showGrid
@@ -1799,12 +1844,15 @@ onMounted(() => {
   controls.dampingFactor = 0.12
   // The key light's world position depends on the camera yaw — track it while orbiting.
   controls.addEventListener('change', applyLighting)
+  // deserialise() may have restored a locked state before controls existed.
+  applyControlsEnabled()
 
   // Transform gizmo: drag the object in the viewport. r0.18x's TransformControls is a Controls
   // (not an Object3D) — add its getHelper() to the scene, not the control itself.
   transformControls = new TransformControls(camera, r.domElement)
   transformControls.addEventListener('dragging-changed', (e: any) => {
-    if (controls) controls.enabled = !e.value // don't orbit while dragging a handle
+    gizmoDragging = !!e.value        // don't orbit while dragging a handle
+    applyControlsEnabled()           // …without clobbering the camera lock
   })
   transformControls.addEventListener('objectChange', readbackGizmo)
   gizmoHelper = (transformControls as any).getHelper?.() ?? (transformControls as unknown as THREE.Object3D)
@@ -1948,8 +1996,23 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
       @contextmenu.prevent
     >
       <div class="nkd-overlay" @pointerdown.stop>
-        <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid">▦</button>
-        <button @click="frameModel" title="Frame model">⛶</button>
+        <!-- PrimeIcons, not emoji: ComfyUI already ships the font, so these are
+             monochrome, inherit the button colour and match the host UI. A colour
+             emoji ignores `color` and reads as a sticker next to the others. -->
+        <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid">
+          <i class="pi pi-th-large" />
+        </button>
+        <button :disabled="camLocked" @click="frameModel"
+                :title="camLocked ? 'Camera locked — unlock to reframe' : 'Frame model'">
+          <i class="pi pi-expand" />
+        </button>
+        <button :class="{ on: camLocked }" @click="toggleCamLock"
+                :title="camLocked
+                  ? (hasCamera ? 'Camera locked to the solved camera — click to orbit freely'
+                               : 'Camera locked — click to orbit freely')
+                  : 'Camera free — click to lock it'">
+          <i :class="camLocked ? 'pi pi-lock' : 'pi pi-lock-open'" />
+        </button>
       </div>
     </div>
   </div>
@@ -2056,4 +2119,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 }
 .nkd-overlay button:hover { border-color: #4ab4ff; color: #4ab4ff; }
 .nkd-overlay button.on { border-color: #4ab4ff; color: #4ab4ff; }
+.nkd-overlay button:disabled { opacity: 0.3; cursor: not-allowed; }
+.nkd-overlay button:disabled:hover { border-color: #3a3d46; color: inherit; }
+/* PrimeIcons glyphs: size them here so the button box stays 24px whatever the
+   host's base font is, and let them inherit the button's colour on hover/on. */
+.nkd-overlay button .pi { font-size: 12px; line-height: 1; color: inherit; }
 </style>
