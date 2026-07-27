@@ -21,11 +21,17 @@ approach) makes the distortion elliptical on non-square frames.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+# Relative import inside the pack; absolute fallback for the standalone check.
+try:
+    from .nkd_vfx_helpers import _alpha_hardness, _mask_grow
+except ImportError:  # pragma: no cover - standalone (pack dir on sys.path)
+    from nkd_vfx_helpers import _alpha_hardness, _mask_grow
 
 # comfy_api only exists inside ComfyUI. Everything above the _HAS_COMFY guard
 # must import standalone so demo() runs with no PYTHONPATH tricks.
@@ -60,6 +66,13 @@ class NKDLensData:
     zoom: float
     ref_width: int
     ref_height: int
+    # The untouched plate, captured when undistorting (kept on CPU, as
+    # NKDWarpData does). Straightening a frame throws its outer ring outside the
+    # output — for a fisheye at k1=-0.33 that is a quarter of the diagonal — so
+    # reconstructing the plate FROM the straightened image can never give it
+    # back. Carrying the original instead means the return trip composites only
+    # what changed and leaves every other pixel bit-identical.
+    background: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +263,80 @@ def _vignette(image: torch.Tensor, lens: NKDLensData, amount: float,
     return out
 
 
+def _warp_like(src: torch.Tensor, lens: NKDLensData, mode: str, out_h: int, out_w: int,
+               padding_mode: str = "zeros") -> torch.Tensor:
+    """Resample `src` [B,H,W,C] into an out_h x out_w frame through the lens map.
+
+    The grid is built at the OUTPUT dims but normalised to [-1,1], and
+    grid_sample normalises against the sampled tensor's own size — so `src` may
+    arrive at any resolution. That matters: the edit coming back from a sampler
+    has been snapped to /8, or upscaled, or rebuilt by Inpaint Stitch, and
+    resizing it down first would throw away the very detail it was made for.
+    """
+    grid = _sample_grid(out_h, out_w, lens, mode, 1.0, src.device)
+    x = src.float().permute(0, 3, 1, 2)
+    out = F.grid_sample(x, grid.expand(x.shape[0], -1, -1, -1), mode="bicubic",
+                        padding_mode=padding_mode, align_corners=False)
+    return out.permute(0, 2, 3, 1).clamp(0.0, 1.0)
+
+
+def _composite_back(edit: torch.Tensor, lens: NKDLensData, mask: Optional[torch.Tensor],
+                    feather: int, edge_hardness: float,
+                    diff_threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Warp `edit` back into the plate's frame and composite it over the plate.
+
+    Returns (image, mask) both in plate space. Where the mask is 0 the plate
+    survives untouched — including the whole outer ring the straightened frame
+    never contained, because nothing could have been painted there.
+    """
+    plate = lens.background
+    if plate is None:
+        raise ValueError("lens_data carries no plate; run the undistort pass first")
+    plate = plate.to(edit.device)
+    if plate.shape[0] == 1 and edit.shape[0] > 1:      # one plate, batched edit
+        plate = plate.repeat(edit.shape[0], 1, 1, 1)
+    ph, pw = int(plate.shape[1]), int(plate.shape[2])
+
+    if mask is None:
+        # No mask given: derive one from what actually changed. Compare the edit
+        # against the plate straightened to the EDIT's own size, so a sampler's
+        # /8 snap or an upscale does not read as a difference everywhere.
+        eh, ew = int(edit.shape[1]), int(edit.shape[2])
+        ref = _warp_like(plate, lens, "undistort", eh, ew, padding_mode="zeros")
+        diff = (edit[..., :3] - ref[..., :3]).abs().amax(dim=-1)
+        m_edit = (diff > diff_threshold).float()
+    else:
+        m_edit = mask.to(edit.device).float()
+        if m_edit.dim() == 2:
+            m_edit = m_edit.unsqueeze(0)
+        if m_edit.shape[0] == 1 and edit.shape[0] > 1:
+            m_edit = m_edit.repeat(edit.shape[0], 1, 1)
+        if m_edit.shape[1] != edit.shape[1] or m_edit.shape[2] != edit.shape[2]:
+            m_edit = F.interpolate(m_edit.unsqueeze(1), size=(edit.shape[1], edit.shape[2]),
+                                   mode="bilinear", align_corners=False).squeeze(1)
+
+    # Both the picture and its mask travel through the same map, so they cannot
+    # drift apart. Zero padding on the mask is what protects the outer ring:
+    # outside the straightened frame the mask reads 0, so the plate wins.
+    warped = _warp_like(edit, lens, "distort", ph, pw, padding_mode="border")
+    m_plate = _warp_like(m_edit.unsqueeze(-1), lens, "distort", ph, pw,
+                         padding_mode="zeros")[..., 0]
+    if feather > 0:
+        # Feather INWARDS, the idiom _rewarp_pipeline uses: erode by the feather,
+        # blur, then clip back to the original mask. A plain outward blur would
+        # spread the seam onto plate pixels that were never inpainted, losing the
+        # exact-preservation guarantee this whole path exists for.
+        receded = 1.0 - _mask_grow(1.0 - m_plate, feather, 0)
+        m_plate = _mask_grow(receded, 0, feather) * m_plate
+    m_plate = _alpha_hardness(m_plate, float(edge_hardness)).clamp(0.0, 1.0)
+
+    a = m_plate.unsqueeze(-1)
+    c = min(plate.shape[-1], warped.shape[-1])
+    out = plate.clone().float()
+    out[..., :c] = plate[..., :c].float() * (1.0 - a) + warped[..., :c] * a
+    return out.to(plate.dtype), m_plate
+
+
 def _apply_lens(image: torch.Tensor, lens: NKDLensData, mode: str,
                 ca_red: float, ca_blue: float, edge_mode: str,
                 vignette_amount: float, vignette_falloff: float,
@@ -387,6 +474,31 @@ if _HAS_COMFY:
                                    default="black", display_name="Edges",
                                    tooltip="What to sample where the warp reaches outside "
                                            "the frame."),
+                    io.Mask.Input("mask", optional=True,
+                                  tooltip="Undistort: the mask is straightened with the "
+                                          "image, ready for the sampler. Distort with "
+                                          "composite on: the region to paste back onto the "
+                                          "plate — normally the same inpaint mask, in the "
+                                          "straightened frame. Leave unconnected to derive "
+                                          "it from what actually changed."),
+                    io.Boolean.Input("composite", default=True,
+                                     display_name="Composite Over Plate",
+                                     tooltip="Distort mode only, and only once lens_data "
+                                             "carries a plate. Instead of rebuilding the "
+                                             "photo from the straightened image — which "
+                                             "cannot return the outer ring straightening "
+                                             "threw away — paste just the masked region back "
+                                             "onto the untouched original."),
+                    io.Int.Input("feather", default=8, min=0, max=256,
+                                 display_name="Composite Feather",
+                                 tooltip="Soften the edge of the pasted region, in pixels."),
+                    io.Float.Input("edge_hardness", default=0.0, min=0.0, max=1.0, step=0.05,
+                                   display_name="Composite Edge Hardness",
+                                   tooltip="Push the feathered edge back towards hard."),
+                    io.Float.Input("diff_threshold", default=0.02, min=0.0, max=1.0, step=0.005,
+                                   display_name="Auto-mask Threshold",
+                                   tooltip="Only used when no mask is connected: how much a "
+                                           "channel must move to count as edited."),
                     NKDLensDataType.Input(
                         "lens_data", optional=True,
                         tooltip="Connect the lens_data of the node that did the outbound "
@@ -397,7 +509,12 @@ if _HAS_COMFY:
                     io.Image.Output(display_name="image"),
                     NKDLensDataType.Output(
                         "lens_data",
-                        tooltip="Wire into the node that reverses this warp."),
+                        tooltip="Wire into the node that reverses this warp. Carries the "
+                                "plate, so the return trip can composite instead of rebuild."),
+                    io.Mask.Output(display_name="mask",
+                                   tooltip="The mask carried through the same warp — "
+                                           "straightened alongside the image, or (after a "
+                                           "composite) the region that was pasted back."),
                 ],
                 hidden=[io.Hidden.unique_id],   # to target this node's editor
             )
@@ -406,6 +523,8 @@ if _HAS_COMFY:
         def execute(cls, image, mode, k1, k2, k3, p1, p2, center_x, center_y,
                     squeeze, zoom, ca_red, ca_blue, vignette_amount,
                     vignette_falloff, edge_mode, lens_state="{}", ca_falloff=1.0,
+                    composite=True, feather=8, edge_hardness=0.0, diff_threshold=0.02,
+                    mask=None,
                     lens_data: Optional[NKDLensData] = None) -> io.NodeOutput:
             h, w = int(image.shape[1]), int(image.shape[2])
             _send_source_to_widget(
@@ -429,9 +548,30 @@ if _HAS_COMFY:
                                    squeeze=squeeze, zoom=zoom,
                                    ref_width=w, ref_height=h)
 
+            # Coming back with a plate in hand: paste the edit onto the original
+            # instead of rebuilding it. Everything outside the mask — including
+            # the ring straightening pushed out of frame — stays untouched.
+            if (mode == "distort" and composite and lens_data is not None
+                    and lens.background is not None):
+                out, out_mask = _composite_back(image, lens, mask, feather,
+                                                edge_hardness, diff_threshold)
+                return io.NodeOutput(out, lens, out_mask)
+
             out = _apply_lens(image, lens, mode, ca_red, ca_blue, edge_mode,
                               vignette_amount, vignette_falloff, ca_falloff)
-            return io.NodeOutput(out, lens)
+            # Carry the plate only when straightening: that is the pass you come
+            # back from, and copying it on every look-dev run would be waste.
+            if mode == "undistort" and lens_data is None:
+                lens = replace(lens, background=image.detach().cpu())
+            # The mask rides the same map as the picture, so they cannot drift.
+            if mask is not None:
+                m = mask if mask.dim() == 3 else mask.unsqueeze(0)
+                out_mask = _warp_like(m.unsqueeze(-1).to(image.device), lens, mode,
+                                      int(out.shape[1]), int(out.shape[2]))[..., 0]
+            else:
+                out_mask = torch.zeros(out.shape[0], out.shape[1], out.shape[2],
+                                       device=out.device)
+            return io.NodeOutput(out, lens, out_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +685,62 @@ def demo() -> None:
     b = _apply_lens(a, Lz, "distort", 1.0, 1.0, "edge", 0.0, 2.5)
     zrt = (b[core] - img[core]).abs().mean().item()
     assert zrt < 0.06, f"zoom did not round trip: mean abs {zrt}"
+
+    # 9. The inpaint round trip. Straightening a fisheye throws its outer ring
+    #    out of frame, so rebuilding the plate from the straightened image loses
+    #    it for good. Compositing must instead leave every unmasked pixel of the
+    #    plate EXACTLY as it was — that is the whole point, so assert equality,
+    #    not similarity.
+    plate = torch.rand(1, 96, 128, 3)
+    L9 = lens(k1=-0.33, k2=0.05, ref_width=128, ref_height=96)
+    L9 = NKDLensData(**{**L9.__dict__, "background": plate.clone()})
+    flat = _apply_lens(plate, L9, "undistort", 1.0, 1.0, "black", 0.0, 2.5)
+
+    edit = flat.clone()
+    # 40x40, not a token 16x16: a feather cannot fit inside a region
+    # narrower than twice itself, and the default feather is 8.
+    edit[:, 28:68, 44:84, :] = 1.0                       # the "inpaint"
+    m = torch.zeros(1, 96, 128)
+    m[:, 28:68, 44:84] = 1.0
+
+    out, out_m = _composite_back(edit, L9, m, feather=0, edge_hardness=0.0,
+                                 diff_threshold=0.02)
+    assert out.shape == plate.shape, f"composite changed the frame: {out.shape}"
+    untouched = out_m < 1e-6
+    assert untouched.any(), "the mask covered the whole plate — test is meaningless"
+    delta = (out - plate).abs().amax(dim=-1)[untouched].max().item()
+    assert delta == 0.0, f"unmasked plate pixels were altered by {delta}"
+    assert (out - plate).abs().max().item() > 0.1, "the edit never made it back"
+
+    # The outer ring is the case that motivated all this: it is not in `flat` at
+    # all, so it must arrive untouched no matter what the mask says.
+    ring = torch.ones(1, 96, 128, dtype=torch.bool)
+    ring[:, 8:88, 12:116] = False
+    assert (out - plate).abs().amax(dim=-1)[ring].max().item() == 0.0, \
+        "the frame edge was disturbed"
+
+    # 9b. The DEFAULT feather path. The exactness test above runs at feather=0,
+    #     which skips the feathering branch entirely — that gap shipped a call to
+    #     _mask_grow with the wrong keyword and it only surfaced in ComfyUI. Run
+    #     the default here, and check the feather stays INSIDE the mask: eroding
+    #     before blurring is what keeps unpainted plate pixels untouched.
+    out_f, m_f = _composite_back(edit, L9, m, feather=8, edge_hardness=0.35,
+                                 diff_threshold=0.02)
+    assert m_f.max().item() > 0.5, "feathering wiped the mask out"
+    assert (m_f <= out_m + 1e-6).all(), "the feather grew the mask outwards"
+    df = (out_f - plate).abs().amax(dim=-1)[m_f < 1e-6].max().item()
+    assert df == 0.0, f"feathered composite altered untouched plate pixels by {df}"
+
+    # 10. The edit comes back at whatever size the sampler chose. Compositing an
+    #     upscaled edit must still land, and still not touch the rest.
+    big = F.interpolate(edit.permute(0, 3, 1, 2), scale_factor=1.5,
+                        mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+    out2, m2 = _composite_back(big, L9, None, feather=0, edge_hardness=0.0,
+                               diff_threshold=0.02)
+    assert out2.shape == plate.shape, "resized edit changed the output frame"
+    assert m2.max().item() > 0.5, "auto-mask found nothing on a resized edit"
+    q = (out2 - plate).abs().amax(dim=-1)
+    assert q[m2 < 1e-6].max().item() == 0.0, "resized composite bled outside its mask"
 
     print("nkd_lens_distort self-check OK")
 
