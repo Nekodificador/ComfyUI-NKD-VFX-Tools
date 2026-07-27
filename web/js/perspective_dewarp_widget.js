@@ -279,8 +279,10 @@ function openModal(node, cornersWidget) {
       ctx.fillStyle = "#fff"; ctx.font = "11px system-ui"; ctx.fillText(ORDER[i], x + 11, y - 9);
     });
 
-    // Magnifier while dragging a handle.
-    if (drag) {
+    // Magnifier while dragging a HANDLE — never while panning. Panning has no
+    // point to magnify, and drag.lastRel is undefined there, so it used to park
+    // a loupe in the middle of the image every time you moved the view.
+    if (drag && (drag.kind === "corner" || drag.kind === "edge")) {
       const rel = drag.kind === "corner" ? state.corners[drag.i] : (drag.lastRel || [0.5, 0.5]);
       const [hx, hy] = toScreen(rel);
       drawMagnifier(rel, hx, hy);
@@ -354,10 +356,19 @@ function openModal(node, cornersWidget) {
   const end = (e) => {
     if (!drag) return;
     drag = null;
-    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+    try { if (e && e.pointerId != null) canvas.releasePointerCapture(e.pointerId); } catch {}
     draw();
   };
-  canvas.onpointerup = end; canvas.onpointerleave = end;
+  // Every way a drag can stop, not just the happy one. Releasing the button
+  // outside the browser window never delivers pointerup, so `drag` stayed set
+  // for good and the magnifier was repainted by every later redraw — it looked
+  // frozen on screen and hid whatever you were trying to click next.
+  canvas.onpointerup = end;
+  canvas.onpointerleave = end;
+  canvas.onpointercancel = end;
+  canvas.onlostpointercapture = end;
+  const onBlur = () => end(null);
+  window.addEventListener("blur", onBlur);
 
   // Scroll to zoom toward the cursor.
   canvas.onwheel = (e) => {
@@ -378,6 +389,7 @@ function openModal(node, cornersWidget) {
     cornersWidget.value = JSON.stringify(state);
     node.setDirtyCanvas(true, true);
     ro.disconnect();
+    window.removeEventListener("blur", onBlur);
   }
 
   const ro = new ResizeObserver(resize); ro.observe(wrap);
