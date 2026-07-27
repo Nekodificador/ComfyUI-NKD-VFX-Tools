@@ -13,6 +13,10 @@ export interface FSpyState {
   vp2Axis: string;
   origin: [number, number]; // where the world origin projects, Relative coords (scene anchor height)
   distance: number;
+  // Reference box size in world units, sitting on the ground plane. Optional so
+  // states saved before it existed still parse; the solver ignores it entirely
+  // (it is a visual gauge for judging the solve, not an input to it).
+  box?: { w: number; h: number; d: number };
 }
 
 export interface SolveResult {

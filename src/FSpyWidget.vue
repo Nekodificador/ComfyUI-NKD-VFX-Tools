@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, nextTick, reactive, ref } from "vue";
 import { solve2vp, makeProjector, type FSpyState } from "./solver";
-import { attachFineRange } from "./fine_drag";
+import { attachFineRange, isFine, FINE_GAIN } from "./fine_drag";
 
 const props = defineProps<{
   initialUrl?: string;
@@ -24,8 +24,11 @@ const DEFAULT: FSpyState = {
   vp2Axis: "z+",
   origin: [0.5, 0.5],
   distance: 5.0,
+  box: { w: 1, h: 1, d: 1 },
 };
 const state = reactive<FSpyState>(JSON.parse(JSON.stringify(DEFAULT)));
+/** States saved before the box existed have no `box` key — never assume it. */
+function boxDims() { return state.box ?? (state.box = { w: 1, h: 1, d: 1 }); }
 const hud = reactive({ ok: false, fovV: 0, fovH: 0, focal: 0, pitch: 0, yaw: 0 });
 const showGrid = ref(true);
 const showAxes = ref(true);
@@ -41,7 +44,15 @@ const imgDim = reactive({ w: 16, h: 9 });
 let ro: ResizeObserver | null = null;
 let detachFine: (() => void) | null = null;
 
-const VP_COLORS = { vp1: "#ff8c42", vp2: "#4ab4ff" };
+// Vanishing points wear their axis' colour — the same red/green/blue the axis
+// overlay draws — so which line is doing what is readable at a glance instead of
+// requiring a look at the VP1→/VP2→ dropdowns.
+const AXIS_COLORS: Record<string, string> = { x: "#ff5555", y: "#55ff77", z: "#5599ff" };
+const AXIS_FALLBACK = "#ffd166";
+function vpColor(key: "vp1" | "vp2"): string {
+  const ax = (key === "vp1" ? state.vp1Axis : state.vp2Axis) || "";
+  return AXIS_COLORS[ax[0]?.toLowerCase()] ?? AXIS_FALLBACK;
+}
 const HANDLE_R = 8;
 const DPR = () => Math.max(window.devicePixelRatio || 1, 2);
 
@@ -89,6 +100,9 @@ function redraw() {
   const seg = (a: [number, number], b: [number, number]) => { const pa = toPx(a), pb = toPx(b); ctx!.beginPath(); ctx!.moveTo(pa[0], pa[1]); ctx!.lineTo(pb[0], pb[1]); ctx!.stroke(); };
 
   // ── 3D reference overlay (grid / axes / box) projected with the solved camera ──
+  // Clear the hit-test list first: a degenerate solve draws nothing, and stale
+  // entries would leave phantom handles grabbable where nothing is visible.
+  boxHandles = [];
   if (res.ok) {
     const aspect = imgDim.w / imgDim.h;
     const proj = makeProjector(res, aspect, state.distance, state.origin);
@@ -109,8 +123,41 @@ function redraw() {
     }
     if (showBox.value) {
       ctx.strokeStyle = "#ffd166"; ctx.lineWidth = 2;
-      const c = [[-.5, 0, -.5], [.5, 0, -.5], [.5, 0, .5], [-.5, 0, .5], [-.5, 1, -.5], [.5, 1, -.5], [.5, 1, .5], [-.5, 1, .5]];
+      // Sized in world units and standing ON the ground (y from 0), so it reads
+      // as an object in the scene you can match against something real.
+      const b = boxDims(), hw = b.w / 2, hd = b.d / 2, hh = b.h;
+      const c = [[-hw, 0, -hd], [hw, 0, -hd], [hw, 0, hd], [-hw, 0, hd],
+                 [-hw, hh, -hd], [hw, hh, -hd], [hw, hh, hd], [-hw, hh, hd]];
       for (const [a, b] of [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]) worldSeg(c[a], c[b], 4);
+
+      // Drag handles on the +X, top and +Z faces. Turning a 2D drag into a 3D
+      // size needs to know how the projected handle responds to that dimension,
+      // so measure it instead of deriving it: project the face centre at the
+      // current size and at size+EPS. The difference gives both the screen
+      // direction it grows along and the pixels-per-world-unit scale, for any
+      // camera the solve produces.
+      const EPS = 0.01;
+      const FACE = [
+        { k: "w" as const, at: (v: number) => [v / 2, b.h / 2, 0] },
+        { k: "h" as const, at: (v: number) => [0, v, 0] },
+        { k: "d" as const, at: (v: number) => [0, b.h / 2, v / 2] },
+      ];
+      boxHandles = [];
+      for (const f of FACE) {
+        const cur = b[f.k];
+        const p0 = proj(f.at(cur)), p1 = proj(f.at(cur + EPS));
+        if (!p0 || !p1) continue;                       // behind the camera
+        const vx = p1[0] - p0[0], vy = p1[1] - p0[1];
+        const len = Math.hypot(vx, vy);
+        if (len < 1e-9) continue;                       // grows straight at the viewer
+        boxHandles.push({ k: f.k, at: p0, dir: [vx / len, vy / len], per: len / EPS });
+        const [hx, hy] = toPx(p0);
+        ctx!.beginPath(); ctx!.rect(hx - 5, hy - 5, 10, 10);
+        ctx!.fillStyle = "#ffd166"; ctx!.fill();
+        ctx!.lineWidth = 2; ctx!.strokeStyle = "rgba(0,0,0,0.7)"; ctx!.stroke();
+      }
+    } else {
+      boxHandles = [];
     }
     if (showAxes.value) {
       ctx.lineWidth = 2.5;
@@ -122,11 +169,11 @@ function redraw() {
 
   for (const key of ["vp1", "vp2"] as const) {
     const pts = state[key];
-    ctx.strokeStyle = VP_COLORS[key]; ctx.lineWidth = 2;
+    ctx.strokeStyle = vpColor(key); ctx.lineWidth = 2;
     seg(pts[0], pts[1]); seg(pts[2], pts[3]);
     const vp = key === "vp1" ? res.Fu : res.Fv;
     if (vp) { ctx.globalAlpha = 0.3; seg([(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2], vp); seg([(pts[2][0] + pts[3][0]) / 2, (pts[2][1] + pts[3][1]) / 2], vp); ctx.globalAlpha = 1; }
-    for (const p of pts) { const [x, y] = toPx(p); ctx.beginPath(); ctx.arc(x, y, HANDLE_R, 0, Math.PI * 2); ctx.fillStyle = VP_COLORS[key]; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke(); }
+    for (const p of pts) { const [x, y] = toPx(p); ctx.beginPath(); ctx.arc(x, y, HANDLE_R, 0, Math.PI * 2); ctx.fillStyle = vpColor(key); ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke(); }
   }
   // ── Horizon: the line through both vanishing points. Drag it up/down to raise/lower the
   // camera pitch — it translates the 8 handles in Y, moving both VPs and re-aiming everything.
@@ -152,7 +199,10 @@ function redraw() {
   ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 1;
   const c = toPx([0.5, 0.5]); ctx.beginPath(); ctx.moveTo(c[0] - 7, c[1]); ctx.lineTo(c[0] + 7, c[1]); ctx.moveTo(c[0], c[1] - 7); ctx.lineTo(c[0], c[1] + 7); ctx.stroke();
 
-  // Scene anchor (origin) — draggable up/down to set the ground height, like fSpy.
+  // Scene anchor (origin) — drag it anywhere: a 2D image position plus the solved
+  // camera IS a point on the ground plane, so free dragging already moves it
+  // along the ground. Axis-constrained arms were tried and removed: they felt
+  // wrong to use and the direct drag does the job.
   const [ox, oy] = toPx(state.origin);
   ctx.beginPath(); ctx.moveTo(ox, oy - 9); ctx.lineTo(ox + 9, oy); ctx.lineTo(ox, oy + 9); ctx.lineTo(ox - 9, oy); ctx.closePath();
   ctx.fillStyle = "#55ff99"; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke();
@@ -197,7 +247,13 @@ function solveNow() {
 function emit() { props.onChange?.(JSON.stringify(state)); }
 
 // ── Dragging ──────────────────────────────────────────────────────────────────
-let drag: { key: "vp1" | "vp2" | "origin" | "horizon"; idx: number } | null = null;
+let drag: { key: "vp1" | "vp2" | "origin" | "horizon" | "box"; idx: number } | null = null;
+const BOX_ORDER = ["w", "h", "d"] as const;
+/** Face-centre handles, rebuilt on every redraw: where each sits on screen, which
+ *  way it grows, and how far it travels per world unit. */
+let boxHandles: { k: "w" | "h" | "d"; at: [number, number]; dir: [number, number]; per: number }[] = [];
+let boxSnap: { k: "w" | "h" | "d"; val: number; lastN: [number, number];
+               dir: [number, number]; per: number } | null = null;
 // Horizon line (through the two VPs), in Relative coords — set each redraw, used for hit-testing.
 let horizonLine: { A: [number, number]; B: [number, number] } | null = null;
 // Snapshot taken when the horizon drag starts. Each of the 4 control lines pivots around its
@@ -220,6 +276,11 @@ function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin" | "horizo
   for (const key of ["vp1", "vp2"] as const)
     for (let i = 0; i < 4; i++) { const p = state[key][i]; if (Math.abs(p[0] - n[0]) < tolX && Math.abs(p[1] - n[1]) < tolY) return { key, idx: i }; }
   if (Math.abs(state.origin[0] - n[0]) < tolX && Math.abs(state.origin[1] - n[1]) < tolY) return { key: "origin", idx: 0 };
+  for (let i = 0; i < boxHandles.length; i++) {
+    const h = boxHandles[i];
+    if (Math.abs(h.at[0] - n[0]) < tolX && Math.abs(h.at[1] - n[1]) < tolY)
+      return { key: "box", idx: BOX_ORDER.indexOf(h.k) };
+  }
   // Horizon line last (handles win): perpendicular distance from the cursor to the line.
   if (horizonLine) {
     const { A, B } = horizonLine; const ab: [number, number] = [B[0] - A[0], B[1] - A[1]];
@@ -232,6 +293,12 @@ function onDown(e: PointerEvent) {
   const hit = hitTest(eventNorm(e));
   if (!hit) return;
   drag = hit;
+  if (hit.key === "box") {
+    const k = BOX_ORDER[hit.idx];
+    const h = boxHandles.find((x) => x.k === k);
+    if (!h) { drag = null; return; }
+    boxSnap = { k, val: boxDims()[k], lastN: eventNorm(e), dir: h.dir, per: h.per };
+  }
   if (hit.key === "horizon") {
     const res = solveNow();
     if (!res.Fu || !res.Fv) { drag = null; return; }
@@ -252,6 +319,18 @@ function onDown(e: PointerEvent) {
 function onMove(e: PointerEvent) {
   if (!drag) return;
   const raw = eventNorm(e);
+  if (drag.key === "box") {
+    if (!boxSnap) return;
+    // Incremental, like every other NKD drag, so Shift can be toggled mid-drag.
+    const g = isFine() ? FINE_GAIN : 1;
+    const along = (raw[0] - boxSnap.lastN[0]) * boxSnap.dir[0]
+                + (raw[1] - boxSnap.lastN[1]) * boxSnap.dir[1];
+    boxSnap.lastN = raw;
+    boxSnap.val = Math.max(0.05, boxSnap.val + (along / boxSnap.per) * g);
+    boxDims()[boxSnap.k] = +boxSnap.val.toFixed(3);
+    redraw(); emit();
+    return;
+  }
   if (drag.key === "horizon") {
     if (!horizonSnap) return;
     const dy = raw[1] - horizonSnap.startY;                 // how far the horizon was dragged in Y
@@ -274,9 +353,32 @@ function onMove(e: PointerEvent) {
   else state[drag.key][drag.idx] = n;
   redraw(); emit();
 }
-function onUp(e: PointerEvent) { if (drag) { drag = null; horizonSnap = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
+function onUp(e: PointerEvent) { if (drag) { drag = null; horizonSnap = null; boxSnap = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
 
 function onAxis() { redraw(); emit(); }
+
+/** Put every draggable back where it started. The 8 vanishing-line handles have
+ *  no undo, so dragging one off the image used to be unrecoverable. */
+function resetPoints() {
+  const d: FSpyState = JSON.parse(JSON.stringify(DEFAULT));
+  state.vp1 = d.vp1;
+  state.vp2 = d.vp2;
+  state.origin = d.origin;
+  state.box = d.box;
+  redraw();
+  emit();
+}
+
+const BOX_AXES = [
+  { k: "w" as const, label: "W", tip: "Reference box width (world X)" },
+  { k: "h" as const, label: "H", tip: "Reference box height (world Y, up from the ground)" },
+  { k: "d" as const, label: "D", tip: "Reference box depth (world Z)" },
+];
+function setBox(k: "w" | "h" | "d", v: number) {
+  boxDims()[k] = v;
+  redraw();
+  emit();          // rides in fspy_state, so the gauge survives a reload
+}
 
 onMounted(() => {
   if (props.initialState) { try { const s = JSON.parse(props.initialState); if (s?.vp1 && s?.vp2) Object.assign(state, DEFAULT, s); } catch {} }
@@ -312,15 +414,25 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
     <button class="nkd-modal-btn" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
     <button class="nkd-modal-btn" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
     <button class="nkd-modal-btn" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch">Horizon</button>
+    <template v-if="showBox">
+      <label class="nkd-modal-lbl" v-for="ax in BOX_AXES" :key="ax.k" :title="ax.tip">{{ ax.label }}
+        <input type="range" class="nkd-modal-rng nkd-fspy-box" min="0.1" max="20" step="0.05"
+               :value="boxDims()[ax.k]"
+               @input="setBox(ax.k, parseFloat(($event.target as HTMLInputElement).value))" />
+        <span class="nkd-fspy-num">{{ boxDims()[ax.k].toFixed(2) }}</span>
+      </label>
+    </template>
     <label class="nkd-modal-lbl" title="Darken the image beneath the overlay">Darken
       <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
     </label>
-    <label class="nkd-modal-lbl" :style="{ color: VP_COLORS.vp1 }" title="World axis the orange vanishing point (VP1) maps to">VP1→
+    <label class="nkd-modal-lbl" :style="{ color: vpColor('vp1') }" title="World axis VP1 maps to — its handles take that axis' colour">VP1→
       <select v-model="state.vp1Axis" class="nkd-modal-sel" @change="onAxis">
         <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
       </select>
     </label>
-    <label class="nkd-modal-lbl" :style="{ color: VP_COLORS.vp2 }" title="World axis the blue vanishing point (VP2) maps to">VP2→
+    <button class="nkd-modal-btn" @click="resetPoints"
+            title="Put the vanishing-line handles, the origin and the reference box back to their starting positions">↺ Reset points</button>
+    <label class="nkd-modal-lbl" :style="{ color: vpColor('vp2') }" title="World axis VP2 maps to — its handles take that axis' colour">VP2→
       <select v-model="state.vp2Axis" class="nkd-modal-sel" @change="onAxis">
         <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
       </select>
@@ -333,4 +445,6 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
    shared stylesheet injected by src/nkd_modal.ts (.nkd-modal-*). */
 .nkd-fspy-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
 .nkd-fspy-wrap canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+.nkd-fspy-box { width: 64px; }
+.nkd-fspy-num { color: #4ab4ff; font-variant-numeric: tabular-nums; min-width: 30px; text-align: right; }
 </style>
