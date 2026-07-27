@@ -27,7 +27,17 @@ export default defineConfig({
     // which wipes that file on every build — that is how it was lost once already.
     emptyOutDir: false,
     rollupOptions: {
+      // nkd_modal.js is imported at RUNTIME by the hand-written
+      // perspective_dewarp_widget.js, which Rollup cannot see. Without this it
+      // tree-shakes every export no in-build entry happens to use and mangles
+      // the survivors (measured: the whole module collapsed to `export{w as o}`),
+      // so the vanilla editor dies on import.
+      preserveEntrySignatures: "strict",
       input: {
+        // Shared editor-modal chrome. Its own entry so the hand-written
+        // perspective_dewarp_widget.js can `import` it at runtime; the Vue
+        // entries import the TS source and inline their own copy.
+        nkd_modal:         "./src/nkd_modal.ts",
         relighting_widget: "./src/main.ts",
         lens_blur_widget:  "./src/lens_blur_main.ts",
         fspy_camera_widget: "./src/fspy_main.ts",

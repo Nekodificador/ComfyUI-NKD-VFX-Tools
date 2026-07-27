@@ -1,7 +1,8 @@
 /**
  * 😺NKD fSpy Camera — Vue 3 extension entry point.
- * The node stays compact: an "Open Viewer" button opens a full-screen editor modal (mounted on
- * document.body, so it escapes LiteGraph's node transform). The reference photo is whatever the
+ * The node stays compact: an "Open Viewer" button opens the shared NKD editor modal (see
+ * src/nkd_modal.ts — mounted on document.body, so it escapes LiteGraph's node transform; the
+ * component supplies only the canvas and its footer controls). The reference photo is whatever the
  * backend resolved, pushed to us on execute — reading a filename off the upstream node only ever
  * worked for a directly-connected Load Image. Built with Vite into web/js/fspy_camera_widget.js.
  */
@@ -10,6 +11,7 @@ import { createApp } from "vue";
 import { app as comfyApp } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import FSpyWidget from "@/FSpyWidget.vue";
+import { openNkdModal, type NkdModal } from "@/nkd_modal";
 
 const NODE_NAME = "NKDfSpyCamera";
 const EXT_NAME = "NKD.fSpyCamera.Vue";
@@ -105,29 +107,45 @@ comfyApp.registerExtension({
         self.setDirtyCanvas(true);
       };
 
-      let vueApp: any = null, host: HTMLElement | null = null;
-      function teardown() { try { vueApp?.unmount(); } catch {} if (host?.parentNode) host.remove(); vueApp = null; host = null; }
+      let vueApp: any = null, modal: NkdModal | null = null;
+      let summary = { ok: false, fovV: 0, focal: 0 };
+      function teardown() { try { vueApp?.unmount(); } catch {} vueApp = null; modal = null; }
       function openViewer() {
         if (vueApp) return;                        // already open
         const url = sentUrl || upstreamUrl();
         if (!url) comfyApp.extensionManager?.toast?.add?.({ severity: "warn", summary: "fSpy Camera", detail: "Connect an image to the input and run this node once (blue play) to load the photo.", life: 6000 });
-        host = document.createElement("div");
-        document.body.appendChild(host);
+
+        // Shared NKD editor chrome — panel, title bar, Esc/backdrop, footer.
+        // State is written live through onChange, so every exit path is a save.
+        modal = openNkdModal({
+          title: "😺 fSpy Camera",
+          hint: "drag the handles along two orthogonal directions",
+          onClose: () => { setStatus(summary); teardown(); },
+        });
         vueApp = createApp(FSpyWidget, {
           initialUrl: url,
           initialState: stateWidget?.value || "",
+          footerLeft: modal.footerLeft,
+          footerRight: modal.footerRight,
           onChange: (json: string) => { if (stateWidget) stateWidget.value = json; self.setDirtyCanvas(true); },
-          onClose: (summary: { ok: boolean; fovV: number; focal: number }) => { setStatus(summary); teardown(); },
+          onSummary: (s: { ok: boolean; fovV: number; focal: number }) => { summary = s; },
         });
-        vueApp.mount(host);
+        vueApp.mount(modal.body);
+        // After mount, not before: <Teleport> appends into the footer during the
+        // initial (synchronous) render, so adding the primary first would leave
+        // it to the LEFT of the editor's own controls. Primary stays last.
+        modal.addPrimary("Save & close");
       }
 
-      this.addWidget("button", "🎥 Open fSpy Viewer", null, openViewer);
+      // No emoji: LiteGraph draws node buttons as canvas text, so an icon font is
+      // not an option here — plain text beats a colour sticker.
+      this.addWidget("button", "Open fSpy Viewer", null, openViewer);
 
       const origRemoved = this.onRemoved;
       this.onRemoved = function (this: any) {
         api.removeEventListener("nkd-fspy-source", onSource);
-        teardown();
+        modal?.close();          // cascades into teardown(); no-op if already shut
+        teardown();              // …and covers the modal-never-opened case
         origRemoved?.apply(this, arguments as any);
       };
 

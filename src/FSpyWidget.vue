@@ -6,7 +6,12 @@ const props = defineProps<{
   initialUrl?: string;
   initialState?: string;
   onChange?: (json: string) => void;              // live-save the control points
-  onClose?: (summary: { ok: boolean; fovV: number; focal: number }) => void;
+  // The shared chrome (src/nkd_modal.ts) owns the panel, Esc and closing; this
+  // component renders only the canvas and teleports its controls into the
+  // footer slots. It reports the solve upward instead of closing itself.
+  footerLeft?: HTMLElement;
+  footerRight?: HTMLElement;
+  onSummary?: (summary: { ok: boolean; fovV: number; focal: number }) => void;
 }>();
 
 const DEFAULT: FSpyState = {
@@ -182,6 +187,9 @@ function solveNow() {
   const r = solve2vp(state, imgDim.w, imgDim.h);
   hud.ok = r.ok; hud.fovV = r.fovV * 180 / Math.PI; hud.fovH = r.fovH * 180 / Math.PI;
   hud.focal = r.focalMm; hud.pitch = r.pitchDeg; hud.yaw = r.yawDeg;
+  // Push it up on every solve: the chrome can be dismissed at any moment (Esc,
+  // backdrop) and the node status has to reflect the last state either way.
+  props.onSummary?.({ ok: hud.ok, fovV: hud.fovV, focal: hud.focal });
   return r;
 }
 function emit() { props.onChange?.(JSON.stringify(state)); }
@@ -267,8 +275,6 @@ function onMove(e: PointerEvent) {
 function onUp(e: PointerEvent) { if (drag) { drag = null; horizonSnap = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
 
 function onAxis() { redraw(); emit(); }
-function close() { props.onClose?.({ ok: hud.ok, fovV: hud.fovV, focal: hud.focal }); }
-function onKey(e: KeyboardEvent) { if (e.key === "Escape") { e.stopPropagation(); close(); } }
 
 onMounted(() => {
   if (props.initialState) { try { const s = JSON.parse(props.initialState); if (s?.vp1 && s?.vp2) Object.assign(state, DEFAULT, s); } catch {} }
@@ -277,68 +283,48 @@ onMounted(() => {
   redraw();
   ro = new ResizeObserver(() => { syncSize(); redraw(); });
   if (wrap.value) ro.observe(wrap.value);
-  window.addEventListener("keydown", onKey, true);
 });
-onBeforeUnmount(() => { ro?.disconnect(); window.removeEventListener("keydown", onKey, true); });
+onBeforeUnmount(() => { ro?.disconnect(); });
 </script>
 
 <template>
-  <div class="nkd-fspy-modal" @pointerdown.self="close">
-    <div class="nkd-fspy-panel">
-      <div class="nkd-head">
-        <span>😺 fSpy Camera — drag the handles along two orthogonal directions</span>
-        <button class="nkd-x" @click="close">✕</button>
-      </div>
-      <div class="nkd-canvas-wrap" ref="wrap">
-        <canvas ref="canvas" @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointerleave="onUp" @contextmenu.prevent />
-      </div>
-      <div class="nkd-bar">
-        <span class="nkd-hud" :class="{ bad: !hud.ok }">
-          <template v-if="hud.ok">FOV {{ hud.fovV.toFixed(1) }}°v · {{ hud.fovH.toFixed(1) }}°h &nbsp;|&nbsp; {{ hud.focal.toFixed(1) }}mm &nbsp;|&nbsp; pitch {{ hud.pitch.toFixed(1) }}° · yaw {{ hud.yaw.toFixed(1) }}°</template>
-          <template v-else>degenerate lines — adjust the handles</template>
-        </span>
-        <span class="nkd-spacer" />
-        <button class="nkd-tog" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
-        <button class="nkd-tog" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
-        <button class="nkd-tog" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
-        <button class="nkd-tog" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch">Horizon</button>
-        <label class="nkd-lbl" title="Darken the image beneath the overlay">Darken
-          <input type="range" class="nkd-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
-        </label>
-        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp1 }" title="World axis the orange vanishing point (VP1) maps to">VP1→
-          <select v-model="state.vp1Axis" class="nkd-sel" @change="onAxis">
-            <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
-          </select>
-        </label>
-        <label class="nkd-lbl" :style="{ color: VP_COLORS.vp2 }" title="World axis the blue vanishing point (VP2) maps to">VP2→
-          <select v-model="state.vp2Axis" class="nkd-sel" @change="onAxis">
-            <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
-          </select>
-        </label>
-        <button class="nkd-save" @click="close">Save & close</button>
-      </div>
-    </div>
+  <!-- Mounted into the shared chrome's body; the panel, title bar, Esc handling
+       and the Save & close button all belong to src/nkd_modal.ts. -->
+  <div class="nkd-fspy-wrap" ref="wrap">
+    <canvas ref="canvas" @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointerleave="onUp" @contextmenu.prevent />
   </div>
+
+  <Teleport v-if="footerLeft" :to="footerLeft">
+    <span class="nkd-modal-status" :class="{ bad: !hud.ok }">
+      <template v-if="hud.ok">FOV {{ hud.fovV.toFixed(1) }}°v · {{ hud.fovH.toFixed(1) }}°h &nbsp;|&nbsp; {{ hud.focal.toFixed(1) }}mm &nbsp;|&nbsp; pitch {{ hud.pitch.toFixed(1) }}° · yaw {{ hud.yaw.toFixed(1) }}°</template>
+      <template v-else>degenerate lines — adjust the handles</template>
+    </span>
+  </Teleport>
+
+  <Teleport v-if="footerRight" :to="footerRight">
+    <button class="nkd-modal-btn" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
+    <button class="nkd-modal-btn" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
+    <button class="nkd-modal-btn" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
+    <button class="nkd-modal-btn" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch">Horizon</button>
+    <label class="nkd-modal-lbl" title="Darken the image beneath the overlay">Darken
+      <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
+    </label>
+    <label class="nkd-modal-lbl" :style="{ color: VP_COLORS.vp1 }" title="World axis the orange vanishing point (VP1) maps to">VP1→
+      <select v-model="state.vp1Axis" class="nkd-modal-sel" @change="onAxis">
+        <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
+      </select>
+    </label>
+    <label class="nkd-modal-lbl" :style="{ color: VP_COLORS.vp2 }" title="World axis the blue vanishing point (VP2) maps to">VP2→
+      <select v-model="state.vp2Axis" class="nkd-modal-sel" @change="onAxis">
+        <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
+      </select>
+    </label>
+  </Teleport>
 </template>
 
 <style scoped>
-.nkd-fspy-modal { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.8); backdrop-filter: blur(3px); font: 12px system-ui, sans-serif; }
-.nkd-fspy-panel { display: flex; flex-direction: column; width: 92vw; height: 92vh; max-width: 1800px; background: #111318; color: #c8d0e0; border: 1px solid #3a3d46; border-radius: 10px; box-shadow: 0 12px 48px rgba(0,0,0,0.7); overflow: hidden; }
-.nkd-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #1a1c22; border-bottom: 1px solid rgba(255,255,255,0.07); font-weight: 500; }
-.nkd-x { background: transparent; border: none; color: #c8d0e0; font-size: 16px; cursor: pointer; padding: 2px 8px; border-radius: 4px; }
-.nkd-x:hover { background: rgba(255,77,77,0.25); color: #ff6b6b; }
-.nkd-canvas-wrap { position: relative; flex: 1 1 auto; min-height: 0; background: #0b0d12; }
-.nkd-canvas-wrap canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
-.nkd-bar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: #1a1c22; border-top: 1px solid rgba(255,255,255,0.07); }
-.nkd-hud { color: #4ab4ff; font-variant-numeric: tabular-nums; }
-.nkd-hud.bad { color: #ff6b6b; }
-.nkd-spacer { flex: 1 1 auto; }
-.nkd-tog { background: #252830; border: 1px solid #3a3d46; border-radius: 4px; color: #8a92a4; padding: 3px 10px; font-size: 12px; cursor: pointer; }
-.nkd-tog:hover { border-color: #4ab4ff; }
-.nkd-tog.on { border-color: #4ab4ff; color: #4ab4ff; background: rgba(74,180,255,0.12); }
-.nkd-lbl { color: rgba(255,255,255,0.55); display: flex; align-items: center; gap: 6px; }
-.nkd-rng { width: 80px; accent-color: #4ab4ff; cursor: pointer; }
-.nkd-sel { background: #252830; border: 1px solid #3a3d46; border-radius: 4px; color: #c8d0e0; padding: 3px 8px; font-size: 12px; cursor: pointer; }
-.nkd-save { background: #252830; border: 1px solid #4ab4ff; border-radius: 4px; color: #4ab4ff; padding: 5px 14px; font-size: 12px; font-weight: 500; cursor: pointer; }
-.nkd-save:hover { background: rgba(74,180,255,0.15); }
+/* Only what is specific to this editor — the chrome's own look lives in the
+   shared stylesheet injected by src/nkd_modal.ts (.nkd-modal-*). */
+.nkd-fspy-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+.nkd-fspy-wrap canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
 </style>

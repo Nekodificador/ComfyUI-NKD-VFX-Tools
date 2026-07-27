@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { openNkdModal, nkdButton, nkdSlider } from "./nkd_modal.js";
 
 const NODE = "NKDPerspectiveUnwarp";
 const EXT = "NKD.PerspectiveDewarp";
@@ -124,81 +125,36 @@ function openModal(node, cornersWidget) {
   let dim = 0.35;                         // darken the image beneath the overlay (0..0.8)
   let inited = false;                     // first-resize view framing done?
 
-  // Centered floating panel, matching the fSpy Camera editor's chrome.
-  const overlay = document.createElement("div");
-  overlay.style.cssText =
-    "position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;" +
-    "background:rgba(0,0,0,0.8);backdrop-filter:blur(3px);font:12px system-ui,sans-serif;color:#c8d0e0";
-  const panel = document.createElement("div");
-  panel.style.cssText =
-    "display:flex;flex-direction:column;width:92vw;height:92vh;max-width:1800px;background:#111318;" +
-    "color:#c8d0e0;border:1px solid #3a3d46;border-radius:10px;box-shadow:0 12px 48px rgba(0,0,0,0.7);overflow:hidden";
+  // Shared NKD editor chrome — see src/nkd_modal.ts. Every exit path saves here,
+  // so the modal's own dismiss (Esc / backdrop / ✕) is wired to commit() too.
+  const modal = openNkdModal({
+    title: "😺 Perspective Unwarp",
+    hint: "corners distort · sides stretch · scroll zoom · drag empty to pan",
+    onClose: () => commit(),
+  });
 
-  const head = document.createElement("div");
-  head.style.cssText =
-    "display:flex;align-items:center;gap:10px;padding:10px 14px;background:#1a1c22;" +
-    "border-bottom:1px solid rgba(255,255,255,0.07);font-weight:500";
-  const title = document.createElement("span");
-  title.textContent = "😺 Perspective Unwarp";
-  const hint = document.createElement("span");
-  hint.style.cssText = "color:#ffffff66;font-size:11px;font-weight:400";
-  hint.textContent = "corners distort · sides stretch · scroll zoom · drag empty to pan";
-  const headSpacer = document.createElement("span");
-  headSpacer.style.cssText = "flex:1 1 auto";
-  const xBtn = document.createElement("button");
-  xBtn.textContent = "✕";
-  xBtn.style.cssText = "background:transparent;border:none;color:#c8d0e0;font-size:16px;cursor:pointer;padding:2px 8px;border-radius:4px";
-  xBtn.onmouseenter = () => { xBtn.style.background = "rgba(255,77,77,0.25)"; xBtn.style.color = "#ff6b6b"; };
-  xBtn.onmouseleave = () => { xBtn.style.background = "transparent"; xBtn.style.color = "#c8d0e0"; };
-  xBtn.onclick = () => save();
-  head.append(title, hint, headSpacer, xBtn);
-
-  const mkBtn = (label, fn) => {
-    const b = document.createElement("button");
-    b.textContent = label;
-    b.style.cssText = "background:#252830;border:1px solid #3a3d46;color:#c8d0e0;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px";
-    b.onclick = fn; return b;
-  };
   const gridLbl = document.createElement("span");
   gridLbl.style.cssText = "color:#8a92a4;min-width:56px;text-align:center";
   const refreshGridLbl = () => { gridLbl.textContent = gridN > 0 ? `Grid ${gridN}` : "Grid off"; };
   refreshGridLbl();
-  const gridMinus = mkBtn("−", () => { gridN = Math.max(0, gridN - 1); refreshGridLbl(); draw(); });
-  const gridPlus = mkBtn("+", () => { gridN = Math.min(16, gridN + 1); refreshGridLbl(); draw(); });
-  const resetView_ = mkBtn("Reset view", () => { resetView(); draw(); });
-  const resetPts = mkBtn("↺ Reset points", () => {
+  const gridMinus = nkdButton("−", () => { gridN = Math.max(0, gridN - 1); refreshGridLbl(); draw(); });
+  const gridPlus = nkdButton("+", () => { gridN = Math.min(16, gridN + 1); refreshGridLbl(); draw(); });
+  const resetView_ = nkdButton("Reset view", () => { resetView(); draw(); });
+  const resetPts = nkdButton("↺ Reset points", () => {
     state.corners = JSON.parse(JSON.stringify(DEFAULT.corners));
     draw();
   });
   // Darken slider (like fSpy Camera): dims the photo so the quad and grid read clearly.
-  const dimWrap = document.createElement("label");
-  dimWrap.style.cssText = "display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.55)";
-  dimWrap.title = "Darken the image beneath the overlay";
-  const dimRng = document.createElement("input");
-  dimRng.type = "range"; dimRng.min = "0"; dimRng.max = "0.8"; dimRng.step = "0.05";
-  dimRng.value = String(dim); dimRng.style.cssText = "width:80px;accent-color:#4ab4ff;cursor:pointer";
-  dimRng.oninput = () => { dim = parseFloat(dimRng.value); draw(); };
-  dimWrap.append(document.createTextNode("Darken"), dimRng);
-  const closeBtn = mkBtn("Save & close", () => save());
-  closeBtn.style.borderColor = "#4ab4ff"; closeBtn.style.color = "#4ab4ff"; closeBtn.style.fontWeight = "500";
+  const dimWrap = nkdSlider("Darken", { min: 0, max: 0.8, step: 0.05, value: dim },
+                            (v) => { dim = v; draw(); },
+                            "Darken the image beneath the overlay");
+  modal.footerRight.append(gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_);
+  modal.addPrimary("Save & close");
 
-  const wrap = document.createElement("div");
-  wrap.style.cssText = "position:relative;flex:1 1 auto;min-height:0;background:#0b0d12;display:flex";
+  const wrap = modal.body;
   const canvas = document.createElement("canvas");
-  canvas.style.cssText = "width:100%;height:100%;touch-action:none;cursor:crosshair";
+  canvas.style.cursor = "crosshair";
   wrap.appendChild(canvas);
-
-  // Bottom control bar, matching the fSpy Camera editor.
-  const bar = document.createElement("div");
-  bar.style.cssText =
-    "display:flex;align-items:center;gap:12px;padding:8px 14px;background:#1a1c22;border-top:1px solid rgba(255,255,255,0.07)";
-  const barSpacer = document.createElement("span");
-  barSpacer.style.cssText = "flex:1 1 auto";
-  bar.append(barSpacer, gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_, closeBtn);
-
-  panel.append(head, wrap, bar);
-  overlay.append(panel);
-  document.body.appendChild(overlay);
 
   const ctx = canvas.getContext("2d");
   const dpr = Math.max(window.devicePixelRatio || 1, 1);
@@ -416,16 +372,13 @@ function openModal(node, cornersWidget) {
     draw();
   };
 
-  function save() {
+  // Called by the modal on every exit path (primary button, ✕, Esc, backdrop).
+  // The chrome owns removing the overlay and its key listener.
+  function commit() {
     cornersWidget.value = JSON.stringify(state);
     node.setDirtyCanvas(true, true);
     ro.disconnect();
-    window.removeEventListener("keydown", onKey, true);
-    overlay.remove();
   }
-  const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); save(); } };
-  window.addEventListener("keydown", onKey, true);
-  overlay.addEventListener("pointerdown", (e) => { if (e.target === overlay) save(); });
 
   const ro = new ResizeObserver(resize); ro.observe(wrap);
   resize();
