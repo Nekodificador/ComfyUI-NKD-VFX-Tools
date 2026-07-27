@@ -23,6 +23,7 @@
 import { onMounted, onBeforeUnmount, reactive, ref, computed } from "vue";
 import { solvePlumbLines, toNorm, foldRadius, undistortNorm, distortNorm,
          type PlumbLine } from "./plumbline";
+import { attachFineRange } from "./fine_drag";
 
 const props = defineProps<{
   initialUrl?: string;
@@ -80,6 +81,7 @@ let ro: ResizeObserver | null = null;
 let gl: WebGLRenderingContext | null = null;
 let prog: WebGLProgram | null = null;
 let tex: WebGLTexture | null = null;
+let detachFine: (() => void) | null = null;
 
 const DPR = () => Math.max(window.devicePixelRatio || 1, 1);
 const aspect = computed(() => img.w / img.h);
@@ -589,8 +591,10 @@ onMounted(() => {
   redraw();
   ro = new ResizeObserver(() => { syncSize(); redraw(); });
   if (wrap.value) ro.observe(wrap.value);
+  // Hold Shift for tenth-speed dragging on every slider in the panel.
+  detachFine = attachFineRange(wrap.value?.parentElement ?? document.body);
 });
-onBeforeUnmount(() => { ro?.disconnect(); });
+onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 </script>
 
 <template>

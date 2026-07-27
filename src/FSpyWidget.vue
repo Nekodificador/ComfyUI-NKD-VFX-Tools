@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, nextTick, reactive, ref } from "vue";
 import { solve2vp, makeProjector, type FSpyState } from "./solver";
+import { attachFineRange } from "./fine_drag";
 
 const props = defineProps<{
   initialUrl?: string;
@@ -38,6 +39,7 @@ let ctx: CanvasRenderingContext2D | null = null;
 let img: HTMLImageElement | null = null;
 const imgDim = reactive({ w: 16, h: 9 });
 let ro: ResizeObserver | null = null;
+let detachFine: (() => void) | null = null;
 
 const VP_COLORS = { vp1: "#ff8c42", vp2: "#4ab4ff" };
 const HANDLE_R = 8;
@@ -283,8 +285,12 @@ onMounted(() => {
   redraw();
   ro = new ResizeObserver(() => { syncSize(); redraw(); });
   if (wrap.value) ro.observe(wrap.value);
+  // Shift = tenth speed on the footer sliders, same as every other NKD panel.
+  // Attached to the whole modal because the controls live in its footer, not here.
+  detachFine = attachFineRange(
+    (props.footerRight?.closest('.nkd-modal-panel') as HTMLElement) ?? document.body);
 });
-onBeforeUnmount(() => { ro?.disconnect(); });
+onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 </script>
 
 <template>

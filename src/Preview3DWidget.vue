@@ -13,6 +13,7 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { attachFineRange, isFine, FINE_GAIN } from './fine_drag'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
@@ -123,6 +124,8 @@ const hasCamera = ref(false)      // camera_info is wired and arriving
 // otherwise unlocking would only last until the next execute.
 let lockChosenByUser = false
 let gizmoDragging = false
+let detachFine: (() => void) | null = null
+let detachGizmoFine: (() => void) | null = null
 // One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
 // only counts the first .nkd-panel it finds.
 const activePanel = ref<'' | 'light' | 'object' | 'occlude'>('')
@@ -1806,6 +1809,8 @@ function deserialise(json: string) {
 }
 
 function cleanup() {
+  detachFine?.()
+  detachGizmoFine?.()
   cancelAnimationFrame(raf)
   ro?.disconnect()
   controls?.dispose()
@@ -1838,6 +1843,9 @@ onMounted(() => {
   el.appendChild(r.domElement)
   renderer.value = r
 
+  // Hold Shift for tenth-speed dragging on every slider in every panel.
+  detachFine = attachFineRange(el.closest('.nkd-p3d') as HTMLElement ?? el)
+
   initScene()
   controls = new OrbitControls(camera, r.domElement)
   controls.enableDamping = true
@@ -1854,6 +1862,42 @@ onMounted(() => {
     gizmoDragging = !!e.value        // don't orbit while dragging a handle
     applyControlsEnabled()           // …without clobbering the camera lock
   })
+  // Fine-drag the gizmo by damping the POINTER, never the object.
+  //
+  // Damping the object's transform in objectChange is the obvious approach and
+  // it is WRONG: TransformControlsPlane.updateMatrixWorld does
+  // `this.position.copy(this.worldPosition)`, so the plane every offset is
+  // measured against follows the object; rotation speed is additionally
+  // `20 / distance(object, camera)`. Writing a damped transform therefore moves
+  // the ruler that produced it — positive feedback, and the object accelerates
+  // off to infinity (reported, then confirmed in the three.js source).
+  //
+  // Damping the input has no such loop: TransformControls stays completely
+  // self-consistent and simply believes the pointer travelled less. Capture
+  // phase on the same element it listens to (bubble), so we shadow clientX/Y
+  // before getPointer() reads them.
+  let realXY: { x: number; y: number } | null = null
+  let virtXY: { x: number; y: number } | null = null
+  const dampPointer = (e: PointerEvent) => {
+    if (!gizmoDragging) { realXY = null; virtXY = null; return }
+    if (!realXY || !virtXY) {
+      realXY = { x: e.clientX, y: e.clientY }
+      virtXY = { x: e.clientX, y: e.clientY }
+      return
+    }
+    const g = isFine() ? FINE_GAIN : 1
+    virtXY.x += (e.clientX - realXY.x) * g
+    virtXY.y += (e.clientY - realXY.y) * g
+    realXY.x = e.clientX
+    realXY.y = e.clientY
+    if (virtXY.x === e.clientX && virtXY.y === e.clientY) return   // never damped
+    const vx = virtXY.x, vy = virtXY.y
+    Object.defineProperty(e, 'clientX', { get: () => vx, configurable: true })
+    Object.defineProperty(e, 'clientY', { get: () => vy, configurable: true })
+  }
+  r.domElement.addEventListener('pointermove', dampPointer, true)
+  detachGizmoFine = () => r.domElement.removeEventListener('pointermove', dampPointer, true)
+
   transformControls.addEventListener('objectChange', readbackGizmo)
   gizmoHelper = (transformControls as any).getHelper?.() ?? (transformControls as unknown as THREE.Object3D)
   // NOT added to the scene until a gizmo mode is active: the helper's updateMatrixWorld runs
