@@ -10,6 +10,7 @@ from .mask_scheduler_node import NKDMaskScheduler
 from .nkd_fspy_camera    import NKDfSpyCamera
 from .nkd_preview_3d     import NKDPreview3D
 from .nkd_perspective_dewarp import NKDPerspectiveUnwarp, NKDPerspectiveRewarp
+from .nkd_lens_distort    import NKDLensDistort
 
 NODE_CLASS_MAPPINGS = {
     "RelightingNode":         RelightingNode,
@@ -19,6 +20,7 @@ NODE_CLASS_MAPPINGS = {
     "NKDPreview3D":           NKDPreview3D,
     "NKDPerspectiveUnwarp":   NKDPerspectiveUnwarp,
     "NKDPerspectiveRewarp":   NKDPerspectiveRewarp,
+    "NKDLensDistort":         NKDLensDistort,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -29,6 +31,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NKDPreview3D":           "😺NKD Preview 3D",
     "NKDPerspectiveUnwarp":   "😺NKD Perspective Unwarp",
     "NKDPerspectiveRewarp":   "😺NKD Perspective Rewarp",
+    "NKDLensDistort":         "😺NKD Lens Distort",
 }
 
 WEB_DIRECTORY = "./web/js"

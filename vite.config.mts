@@ -38,9 +38,12 @@ export default defineConfig({
         // perspective_dewarp_widget.js can `import` it at runtime; the Vue
         // entries import the TS source and inline their own copy.
         nkd_modal:         "./src/nkd_modal.ts",
+        // Own entry so `node test_plumbline.mjs` can import and assert on it.
+        nkd_plumbline:     "./src/plumbline.ts",
         relighting_widget: "./src/main.ts",
         lens_blur_widget:  "./src/lens_blur_main.ts",
         fspy_camera_widget: "./src/fspy_main.ts",
+        lens_distort_widget: "./src/lens_distort_main.ts",
         preview3d_widget:  "./src/preview3d_main.ts",
       },
       external: [
