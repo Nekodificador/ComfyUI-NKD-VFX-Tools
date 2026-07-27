@@ -82,8 +82,9 @@ Inputs: `rgb` + `depth`.
 ### 😺NKD Preview 3D
 
 A 3D viewport inside a node. Load a **GLB/GLTF model or a gaussian splat**
-(`.ply`, `.spz`, `.splat`, `.ksplat`), drop a photo behind it as a backdrop, orbit until
-the placement looks right. The node exports what you framed:
+(`.ply`, `.spz`, `.splat`, `.ksplat`) — or wire a **MESH** straight from a mesh builder like
+*Convert MoGe Point Map to Mesh* or *Convert DA3 Geometry to Mesh* — drop a photo behind it as
+a backdrop, orbit until the placement looks right. The node exports what you framed:
 
 | Output | What it's for |
 | --- | --- |
@@ -100,7 +101,9 @@ already made, before the model sees anything.
 
 Lighting comes off the backdrop itself, plus a key light you aim with a joystick, with
 soft shadows. The Object panel handles position, rotation, scale and pivot with
-scrub-drag fields.
+scrub-drag fields. The bar carries the lens: **FOV**, **Roll** for a dutch angle, and the
+**backdrop colour** — which is what shows through the holes of a mesh with alpha, since it
+lands in the exported `image`.
 
 Feed it a solved camera from **fSpy Camera** and the model sits in the photo's real
 perspective. Feed it the backdrop's depth map and the exported depth lines up with the

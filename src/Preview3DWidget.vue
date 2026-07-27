@@ -189,7 +189,17 @@ const smooth = ref(0)
 
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null)
 const scene = new THREE.Scene()
-const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 10000)
+const DEFAULT_FOV = 35
+const camera = new THREE.PerspectiveCamera(DEFAULT_FOV, 1, 0.01, 10000)
+// Mirror of camera.fov, which Vue cannot observe. The camera stays the single source of
+// truth (it is what cameraInfo() reports and what the export renders through); this ref
+// only exists so the field can show it.
+const fov = ref(DEFAULT_FOV)
+// Dutch angle, in degrees. Unlike fov this one has no home on the camera: OrbitControls
+// re-runs lookAt(target) every frame, which rebuilds the orientation from camera.up — so
+// a roll written into camera.rotation.z would be wiped before it was ever drawn. Rolling
+// UP is the version lookAt cannot undo, and it survives orbiting for free.
+const roll = ref(0)
 let controls: OrbitControls | null = null
 let transformControls: TransformControls | null = null
 let gizmoHelper: THREE.Object3D | null = null // what actually gets added to the scene in r0.18x
@@ -347,7 +357,11 @@ let loadGeneration = 0
 let raf = 0
 let ro: ResizeObserver | null = null
 
-const C = { bg: 0x111318 }
+// Backdrop colour when no bg_image is wired. It is a real quad, not the clear colour, so it
+// lands in the exported composite — which is the point: a mesh with holes (MoGe, DA3) exports
+// this behind them. The isolated `object` pass skips the backdrop entirely, so its alpha and
+// the mask are untouched whatever this is set to. Default = the old hardcoded grey.
+const bgColor = ref('#111318')
 
 function initScene() {
   scene.background = null
@@ -386,7 +400,7 @@ function initScene() {
 
   bgMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(2, 2),
-    new THREE.MeshBasicMaterial({ color: C.bg, depthWrite: false, depthTest: false })
+    new THREE.MeshBasicMaterial({ color: bgColor.value, depthWrite: false, depthTest: false })
   )
   bgScene.add(bgMesh)
 
@@ -809,7 +823,7 @@ async function setBackground(ref: { filename: string; type: string; subfolder: s
     if (bgMesh) {
       const m = bgMesh.material as THREE.MeshBasicMaterial
       m.map = null
-      m.color.set(C.bg)
+      m.color.set(bgColor.value)
       m.needsUpdate = true
       bgMesh.scale.set(1, 1, 1)
     }
@@ -1076,13 +1090,38 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
   }
 }
 
+/** A photo backdrop wins: with bg_image wired the quad carries the texture and tinting it
+ *  would tint the photo. The colour is still stored, ready for when the image is unwired. */
+function setBgColor(v: string) {
+  bgColor.value = v
+  if (bgMesh && !bgTexture) (bgMesh.material as THREE.MeshBasicMaterial).color.set(v)
+}
+
+/** Vertical field of view, in degrees — the lens. Wide flattens nothing and exaggerates
+ *  perspective; long compresses it. Matching the plate's lens is what makes a composite sit. */
+function setFov(v: number) {
+  fov.value = v
+  camera.fov = v
+  camera.updateProjectionMatrix()
+}
+
+/** Tilt the horizon. The view axis is the roll axis, so the direction is read from the
+ *  camera itself and stays valid wherever the orbit has taken it. */
+function applyRoll(v = roll.value) {
+  roll.value = v
+  const dir = camera.getWorldDirection(new THREE.Vector3())
+  camera.up.set(0, 1, 0).applyAxisAngle(dir, THREE.MathUtils.degToRad(v))
+  if (controls) controls.update()
+  else camera.lookAt(0, 0, 0)
+}
+
 function applyCameraInfo(info: any) {
   if (!info?.position) return
   camera.position.set(info.position.x, info.position.y, info.position.z)
   if (info.quaternion) {
     camera.quaternion.set(info.quaternion.x, info.quaternion.y, info.quaternion.z, info.quaternion.w)
   }
-  if (typeof info.fov === 'number') camera.fov = info.fov
+  if (typeof info.fov === 'number') { camera.fov = info.fov; fov.value = info.fov }
   if (typeof info.zoom === 'number') camera.zoom = info.zoom
   camera.updateProjectionMatrix()
   if (controls && info.target) {
@@ -1711,6 +1750,8 @@ function serialise(): string {
     showGrid: showGrid.value,
     camLocked: camLocked.value,
     camera: cameraInfo(),
+    roll: roll.value,
+    bgColor: bgColor.value,
     env: env.value,
     lightAz: lightAz.value,
     lightEl: lightEl.value,
@@ -1747,6 +1788,7 @@ function deserialise(json: string) {
       lockChosenByUser = true
       applyControlsEnabled()
     }
+    if (typeof s.bgColor === 'string') setBgColor(s.bgColor)
     if (typeof s.showGrid === 'boolean') {
       showGrid.value = s.showGrid
       if (grid) grid.visible = s.showGrid
@@ -1803,6 +1845,8 @@ function deserialise(json: string) {
     }
     applyLighting()
     if (s.camera) applyCameraInfo(s.camera)
+    // After the camera: the roll axis is the view direction, which the line above just set.
+    if (typeof s.roll === 'number') applyRoll(s.roll)
   } catch {
     /* a malformed blob must not take the viewport down */
   }
@@ -1925,6 +1969,19 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
       <button v-if="hasSceneDepth" @click="autoCalibrateDepth"
         title="Fit the exported depth's object tone against the fSpy ground plane">Auto Z</button>
+      <label class="nkd-barfield" :title="hasCamera
+        ? 'Vertical field of view. A solved camera drives this — the next run puts its lens back.'
+        : 'Vertical field of view, in degrees. Drag to scrub, click to type.'">FOV
+        <DragNumber :model-value="fov" :step="0.25" :min="1" :max="170" :decimals="1"
+                    :reset-to="DEFAULT_FOV" @update:model-value="setFov" />
+      </label>
+      <label class="nkd-barfield" title="Camera roll (dutch angle), in degrees. Tilts the horizon; orbiting keeps it.">Roll
+        <DragNumber :model-value="roll" :step="0.25" :min="-180" :max="180" :decimals="1"
+                    :reset-to="0" @update:model-value="applyRoll" />
+      </label>
+      <input type="color" class="nkd-color" :value="bgColor"
+             @input="setBgColor(($event.target as HTMLInputElement).value)"
+             title="Backdrop colour, exported in the image output — it is what shows through the holes of a mesh with alpha (MoGe, DA3). A wired bg_image covers it.">
       <span v-if="status" class="nkd-status">{{ status }}</span>
     </div>
     <div v-if="activePanel === 'light'" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
@@ -2110,22 +2167,26 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
   color: #c8d0e0; font-size: 11px; padding: 2px 5px;
 }
 .nkd-obj-row select:focus { outline: none; border-color: #4ab4ff; }
-.nkd-obj-row :deep(.nkd-drag) {
+.nkd-obj-row :deep(.nkd-drag), .nkd-barfield :deep(.nkd-drag) {
   position: relative;
   flex: 1 1 0; min-width: 0; width: 0;
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
   color: #c8d0e0; font-size: 11px; padding: 2px 6px; text-align: center;
   cursor: ew-resize; user-select: none; touch-action: none;
 }
-.nkd-obj-row :deep(.nkd-drag-reset) {
+.nkd-obj-row :deep(.nkd-drag-reset), .nkd-barfield :deep(.nkd-drag-reset) {
   position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
   font-size: 10px; line-height: 1; color: rgba(255, 255, 255, 0.35);
   cursor: pointer; padding: 0 1px;
 }
-.nkd-obj-row :deep(.nkd-drag-reset:hover) { color: #4ab4ff; }
-.nkd-obj-row :deep(.nkd-drag:hover) { border-color: #4ab4ff; }
-.nkd-obj-row :deep(.nkd-drag-edit) { cursor: text; user-select: text; text-align: left; }
-.nkd-obj-row :deep(.nkd-drag-edit:focus) { outline: none; border-color: #4ab4ff; }
+.nkd-obj-row :deep(.nkd-drag-reset:hover), .nkd-barfield :deep(.nkd-drag-reset:hover) { color: #4ab4ff; }
+.nkd-obj-row :deep(.nkd-drag:hover), .nkd-barfield :deep(.nkd-drag:hover) { border-color: #4ab4ff; }
+.nkd-obj-row :deep(.nkd-drag-edit), .nkd-barfield :deep(.nkd-drag-edit) { cursor: text; user-select: text; text-align: left; }
+.nkd-obj-row :deep(.nkd-drag-edit:focus), .nkd-barfield :deep(.nkd-drag-edit:focus) { outline: none; border-color: #4ab4ff; }
+/* In the bar there is no column to fill: a fixed, narrow field instead of the panel's 1 1 0. */
+.nkd-barfield { display: flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.45); font-size: 10px; }
+.nkd-barfield :deep(.nkd-drag) { flex: 0 0 46px; width: 46px; padding-right: 12px; }
 .nkd-obj-reset {
   flex: 0 0 auto; background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
   color: #c8d0e0; font-size: 10px; padding: 2px 8px; cursor: pointer;

@@ -28,6 +28,7 @@ from typing_extensions import override
 import folder_paths
 import nodes
 from comfy_api.latest import ComfyExtension, Types, io
+from comfy_extras.nodes_save_3d import get_mesh_batch_item, save_glb
 from server import PromptServer
 
 # Pushed to the widget on execute; the JS listens for this event.
@@ -41,6 +42,33 @@ def _tensor_to_temp_png(image, prefix: str) -> str:
     os.makedirs(temp_dir, exist_ok=True)  # may not exist yet, or have been cleaned
     filename = f"{prefix}_{uuid.uuid4().hex}.png"
     PILImage.fromarray(array).save(os.path.join(temp_dir, filename), compress_level=1)
+    return filename
+
+
+def _mesh_to_temp_glb(mesh) -> str:
+    """Write a MESH to a temp .glb so the viewport can fetch it. Returns the filename.
+
+    The mesh-producing nodes (Convert MoGe Point Map to Mesh, Convert DA3 Geometry to
+    Mesh) hand over geometry in memory, not a file, and they only ever emit a
+    single-item batch — per-image vertex counts differ, so they can't stack. Core's
+    own GLB writer does the packing; there is no reason for a second one here.
+    """
+    vertices, faces, colors, uvs = get_mesh_batch_item(mesh, 0)
+    if vertices.shape[0] == 0 or faces.shape[0] == 0:
+        raise ValueError("😺NKD Preview 3D was handed an empty mesh.")
+
+    texture = getattr(mesh, "texture", None)
+    tex_img = None
+    if texture is not None:
+        array = (texture[0, ..., :3].clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+        tex_img = PILImage.fromarray(array)
+
+    temp_dir = folder_paths.get_temp_directory()
+    os.makedirs(temp_dir, exist_ok=True)
+    filename = f"nkd_preview3d_{uuid.uuid4().hex}.glb"
+    save_glb(vertices, faces, os.path.join(temp_dir, filename),
+             uvs=uvs, vertex_colors=colors, texture_image=tex_img,
+             unlit=getattr(mesh, "unlit", False))
     return filename
 
 
@@ -76,9 +104,10 @@ class NKDPreview3D(io.ComfyNode):
             inputs=[
                 io.MultiType.Input(
                     io.String.Input("model_file", default="", multiline=False),
-                    types=[io.File3DGLB, io.File3DGLTF, io.File3DAny, io.File3DSplatAny,
+                    types=[io.Mesh, io.File3DGLB, io.File3DGLTF, io.File3DAny, io.File3DSplatAny,
                            io.File3DPLY, io.File3DSPLAT, io.File3DSPZ, io.File3DKSPLAT],
-                    tooltip="A 3D model (GLB/GLTF) or gaussian splat (.ply/.spz/.splat/.ksplat) "
+                    tooltip="A 3D model (GLB/GLTF), a MESH straight from a mesh-building node "
+                            "(MoGe, DA3...), or a gaussian splat (.ply/.spz/.splat/.ksplat) "
                             "from an upstream node, or a path under the input folder.",
                 ),
                 io.Load3DCamera.Input("camera_info", optional=True,
@@ -145,8 +174,10 @@ class NKDPreview3D(io.ComfyNode):
         bg_image = kwargs.get("bg_image", None)
         model_3d_info = kwargs.get("model_3d_info", None)
 
-        # An upstream node hands over a File3D; save it where the browser can fetch it.
-        if isinstance(model_file, Types.File3D):
+        # An upstream node hands over geometry in memory; save it where the browser can fetch it.
+        if isinstance(model_file, Types.MESH):
+            model_ref = {"filename": _mesh_to_temp_glb(model_file), "type": "temp", "subfolder": ""}
+        elif isinstance(model_file, Types.File3D):
             filename = f"nkd_preview3d_{uuid.uuid4().hex}.{model_file.format}"
             model_file.save_to(os.path.join(folder_paths.get_temp_directory(), filename))
             model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
@@ -248,6 +279,18 @@ def demo():
     assert _outputs_are_consumed(None, "3") is False
     assert _outputs_are_consumed({}, None) is False
     assert _outputs_are_consumed({"1": {"inputs": {"seed": 3}}}, "3") is False, "3 is a value, not a link"
+
+    # A MESH arrives in memory; it only reaches the viewport if it becomes a real .glb.
+    mesh = Types.MESH(
+        vertices=torch.tensor([[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]]),
+        faces=torch.tensor([[[0, 1, 2]]]),
+        uvs=torch.tensor([[[0., 0.], [1., 0.], [0., 1.]]]),
+        texture=torch.rand(1, 4, 4, 3),
+    )
+    path = os.path.join(folder_paths.get_temp_directory(), _mesh_to_temp_glb(mesh))
+    with open(path, "rb") as f:
+        assert f.read(4) == b"glTF", "the viewport loads it as a glTF binary"
+    os.remove(path)
     print("nkd_preview_3d demo OK")
 
 
