@@ -28,11 +28,22 @@ from typing_extensions import override
 import folder_paths
 import nodes
 from comfy_api.latest import ComfyExtension, Types, io
+from comfy_api.latest._io import ComfyTypeIO, comfytype
 from comfy_extras.nodes_save_3d import get_mesh_batch_item, save_glb
 from server import PromptServer
 
 # Pushed to the widget on execute; the JS listens for this event.
 _EVENT_SCENE = "nkd-preview3d-scene"
+
+
+@comfytype(io_type="TRIMESH")
+class TrimeshIO(ComfyTypeIO):
+    """Hunyuan3DWrapper & co. hand over a live trimesh.Trimesh under this io_type.
+
+    Declared here only so the cable plugs into model_file; no trimesh import needed —
+    the object arrives already built and exports itself.
+    """
+    Type = object
 
 
 def _tensor_to_temp_png(image, prefix: str) -> str:
@@ -72,6 +83,22 @@ def _mesh_to_temp_glb(mesh) -> str:
     return filename
 
 
+def _string_to_model_ref(path: str) -> dict:
+    """Resolve a bare path string to an /api/view ref.
+
+    Widget-typed paths live under input, but Hy3DExportMesh and friends return paths
+    relative to the OUTPUT dir — serve whichever actually exists. Defaulting to input
+    keeps the historical behaviour.
+    """
+    path = path.replace("\\", "/")
+    subfolder, _, name = path.rpartition("/")
+    ftype = "input"
+    if (not os.path.isfile(os.path.join(folder_paths.get_input_directory(), subfolder, name))
+            and os.path.isfile(os.path.join(folder_paths.get_output_directory(), subfolder, name))):
+        ftype = "output"
+    return {"filename": name, "type": ftype, "subfolder": subfolder}
+
+
 def _outputs_are_consumed(prompt, unique_id) -> bool:
     """Whether any node in the prompt reads an output of node `unique_id`.
 
@@ -104,11 +131,13 @@ class NKDPreview3D(io.ComfyNode):
             inputs=[
                 io.MultiType.Input(
                     io.String.Input("model_file", default="", multiline=False),
-                    types=[io.Mesh, io.File3DGLB, io.File3DGLTF, io.File3DAny, io.File3DSplatAny,
-                           io.File3DPLY, io.File3DSPLAT, io.File3DSPZ, io.File3DKSPLAT],
+                    types=[io.Mesh, TrimeshIO, io.File3DGLB, io.File3DGLTF, io.File3DAny,
+                           io.File3DSplatAny, io.File3DPLY, io.File3DSPLAT, io.File3DSPZ,
+                           io.File3DKSPLAT],
                     tooltip="A 3D model (GLB/GLTF), a MESH straight from a mesh-building node "
-                            "(MoGe, DA3...), or a gaussian splat (.ply/.spz/.splat/.ksplat) "
-                            "from an upstream node, or a path under the input folder.",
+                            "(MoGe, DA3...), a TRIMESH (Hunyuan3D wrapper), a gaussian splat "
+                            "(.ply/.spz/.splat/.ksplat) from an upstream node, or a path under "
+                            "the input or output folder.",
                 ),
                 io.Load3DCamera.Input("camera_info", optional=True,
                                       tooltip="Solved camera, e.g. from 😺NKD fSpy Camera."),
@@ -181,10 +210,16 @@ class NKDPreview3D(io.ComfyNode):
             filename = f"nkd_preview3d_{uuid.uuid4().hex}.{model_file.format}"
             model_file.save_to(os.path.join(folder_paths.get_temp_directory(), filename))
             model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
+        elif not isinstance(model_file, str) and hasattr(model_file, "export"):
+            # TRIMESH (Hunyuan3D wrapper): a live trimesh.Trimesh. Its own exporter
+            # writes the same .glb Hy3DExportMesh would, textures included.
+            temp_dir = folder_paths.get_temp_directory()
+            os.makedirs(temp_dir, exist_ok=True)
+            filename = f"nkd_preview3d_{uuid.uuid4().hex}.glb"
+            model_file.export(os.path.join(temp_dir, filename), file_type="glb")
+            model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
         elif model_file:
-            path = str(model_file).replace("\\", "/")
-            subfolder, _, name = path.rpartition("/")
-            model_ref = {"filename": name, "type": "input", "subfolder": subfolder}
+            model_ref = _string_to_model_ref(str(model_file))
         else:
             model_ref = None
 
@@ -291,6 +326,27 @@ def demo():
     with open(path, "rb") as f:
         assert f.read(4) == b"glTF", "the viewport loads it as a glTF binary"
     os.remove(path)
+
+    # A bare string resolves against input first, then output (Hy3DExportMesh returns
+    # output-relative paths like "3D/Hy3D_00005_.glb" — serving those as input 404s).
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inp, outp = os.path.join(td, "in"), os.path.join(td, "out")
+        os.makedirs(os.path.join(outp, "3D"))
+        open(os.path.join(outp, "3D", "x.glb"), "wb").close()
+        orig = folder_paths.get_input_directory, folder_paths.get_output_directory
+        folder_paths.get_input_directory = lambda: inp
+        folder_paths.get_output_directory = lambda: outp
+        try:
+            ref = _string_to_model_ref("3D\\x.glb")
+            assert ref == {"filename": "x.glb", "type": "output", "subfolder": "3D"}
+            os.makedirs(os.path.join(inp, "3D"))
+            open(os.path.join(inp, "3D", "x.glb"), "wb").close()
+            assert _string_to_model_ref("3D/x.glb")["type"] == "input", "input wins when both exist"
+            assert _string_to_model_ref("nope.glb")["type"] == "input", "missing file keeps the old default"
+        finally:
+            folder_paths.get_input_directory, folder_paths.get_output_directory = orig
+
     print("nkd_preview_3d demo OK")
 
 
