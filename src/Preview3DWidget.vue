@@ -14,6 +14,7 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { attachFineRange, isFine, FINE_GAIN } from './fine_drag'
+import { groundHit, viewZSpan } from './depth_range'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
@@ -128,8 +129,8 @@ let detachFine: (() => void) | null = null
 let detachGizmoFine: (() => void) | null = null
 // One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
 // only counts the first .nkd-panel it finds.
-const activePanel = ref<'' | 'light' | 'object' | 'occlude'>('')
-const togglePanel = (p: 'light' | 'object' | 'occlude') => { activePanel.value = activePanel.value === p ? '' : p }
+const activePanel = ref<'' | 'light' | 'object' | 'occlude' | 'depth'>('')
+const togglePanel = (p: 'light' | 'object' | 'occlude' | 'depth') => { activePanel.value = activePanel.value === p ? '' : p }
 
 // Look-dev state. It lives here rather than in node widgets on purpose: the render — and
 // the capture taken from it — happens in this browser, so a light change needs no round
@@ -154,6 +155,30 @@ const occlude = ref(false)
 const depthInvertUI = ref(false)
 const occFrom = ref(0.5)
 const occTo = ref(1.0)
+
+// Depth range. The values themselves belong to the node's scene_depth_near/far widgets, but
+// tuning them THERE costs a graph run per nudge — so the Depth tab drives them here (live
+// preview + ground gizmo) and folds each change back into the widgets, the same channel
+// Auto Z always used. Mirrors of the uniforms, which Vue cannot observe.
+const dNearUI = ref(1)
+const dFarUI = ref(30)
+const depthView = ref(true)    // paint the depth pass in the viewport while the tab is open
+const showRange = ref(true)    // draw where the near/far planes cut the ground
+// Auto Z as a MODE, not a one-shot: the fit depends on where the camera is (the object's
+// distance with no map; the floor rays with one), so orbiting invalidates it the moment it
+// is applied. On = re-fit on every render. Off = the last fit stays put, which is what the
+// old one-shot button did, so the toggle covers both.
+const autoZ = ref(false)
+const autoErr = ref('')        // why the last fit was skipped, shown in the panel
+const rangeHint = ref('')      // why the ground lines are not being drawn
+// While Auto is on, Near/Far edit these instead: the fit is the base and these pad it.
+const nearOff = ref(0)
+const farOff = ref(0)
+// With no scene map the depth export historically auto-fitted to the model's own bounds:
+// stable-looking, but the range moves with every orbit and cannot be dialled. Manual swaps
+// that for the same dNear/dFar the scene-map path uses. Off = the old behaviour, untouched.
+const depthManual = ref(false)
+const objZ = ref('')           // the object's view-z span — what near/far have to bracket
 
 // Fill lights on TOP of the directional key: soft area (RectAreaLight, LTC) lights the user
 // grows. Point/spot were dropped — three can't blur a point's shadow and the area gives the
@@ -221,6 +246,10 @@ let bgTexture: THREE.Texture | null = null
 const bgDepthScene = new THREE.Scene()
 let bgDepthMesh: THREE.Mesh | null = null
 let sceneDepthTexture: THREE.Texture | null = null
+// The map's greys, read once per map. The floor fit used to re-draw and re-read the image
+// on every call; with Auto re-fitting each frame that would be a 256×256 drawImage +
+// getImageData per frame, for pixels that cannot change until the map itself does.
+let depthPixels: { data: Uint8ClampedArray; w: number; h: number } | null = null
 let sceneDepthInverseSpace = true // monocular maps are disparity unless the node says otherwise
 const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (plain let, not reactive)
 
@@ -307,6 +336,18 @@ const linearDepthMaterial = new THREE.ShaderMaterial({
     }
   `,
 })
+
+// Window-depth fallback for the no-scene-map, no-manual-range case. A singleton: the depth
+// pass now runs every frame in preview, and a per-frame new/dispose is pure churn.
+const meshDepthMaterial = new THREE.MeshDepthMaterial()
+
+// ── Depth range gizmo ─ a camera-facing plane projects to the SAME rectangle at any
+// distance, so drawing the near/far planes themselves would stack two identical rectangles
+// on screen and show nothing. Their intersection with the ground (y=0, where fSpy puts the
+// origin) is a line that does move with distance — that is what reads from the camera.
+let rangeGizmo: THREE.Group | null = null
+let nearLine: THREE.Line | null = null
+let farLine: THREE.Line | null = null
 
 let grid: THREE.GridHelper | null = null
 let pivotGroup: THREE.Group | null = null // wraps the model; carries the user transform
@@ -397,6 +438,7 @@ function initScene() {
   applyLighting()
   initContactShadow()
   initExtraLights()
+  initRangeGizmo()
 
   bgMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(2, 2),
@@ -714,6 +756,83 @@ function renderContactShadow() {
   contactGroup.visible = contact.value
 }
 
+const _fwd = new THREE.Vector3()
+const _dir = new THREE.Vector3()
+const X_AXIS = new THREE.Vector3(1, 0, 0)
+
+function initRangeGizmo() {
+  const geo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(-0.5, 0, 0),
+    new THREE.Vector3(0.5, 0, 0),
+  ])
+  const line = (color: number) => {
+    // depthTest ON. It was off at first so the lines would show over the depth map, and that
+    // made them LIE: a line lying on the floor behind the object was painted over it — worst
+    // from a top-down view, where the whole floor is behind everything. The depth preview
+    // does not need the exception anyway: it clears the buffer after the scene map (unless
+    // Occlude is on, where being masked by the foreground is right).
+    const l = new THREE.Line(geo, new THREE.LineBasicMaterial({ color }))
+    l.renderOrder = 999 // still last, so it wins ties against the grid rather than dropping out
+    return l
+  }
+  nearLine = line(0x4ab4ff)
+  farLine = line(0xff5555)
+  rangeGizmo = new THREE.Group()
+  rangeGizmo.add(nearLine, farLine)
+  rangeGizmo.visible = false
+  scene.add(rangeGizmo)
+}
+
+/** Place one range line where the plane at view distance `d` cuts y=0.
+ *  Returns false when there is no line to draw, so the panel can say why. */
+function placeRangeLine(l: THREE.Line | null, d: number) {
+  if (!l) return false
+  const hit = groundHit([camera.position.x, camera.position.y, camera.position.z],
+                        [_fwd.x, _fwd.y, _fwd.z], d)
+  if (!hit) { l.visible = false; return false }
+  l.visible = true
+  // A hair above the ground: the grid sits at exactly y=0 too, and two coplanar lines
+  // z-fight where they cross. 0.2% of the distance is invisible and settles it.
+  l.position.set(hit.point[0], hit.point[1] + d * 0.002, hit.point[2])
+  l.quaternion.setFromUnitVectors(X_AXIS, _dir.set(hit.dir[0], hit.dir[1], hit.dir[2]))
+  // Long enough to cross the frame at that distance however oblique the ground is.
+  l.scale.setScalar(6 * d * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect)
+  return true
+}
+
+/** The object's own view-z span — the interval near/far have to bracket. */
+function objectZSpan(): { lo: number; hi: number } | null {
+  if (!model) return null
+  const box = new THREE.Box3().setFromObject(model)
+  if (box.isEmpty()) return null
+  camera.getWorldDirection(_fwd)
+  const span = viewZSpan(
+    [box.min.x, box.min.y, box.min.z], [box.max.x, box.max.y, box.max.z],
+    [camera.position.x, camera.position.y, camera.position.z], [_fwd.x, _fwd.y, _fwd.z],
+  )
+  return isFinite(span.lo) && isFinite(span.hi) ? span : null
+}
+
+/** Per-frame while the Depth tab is open. Nothing else pays for it. */
+function updateDepthGizmo() {
+  // So the gizmo and the readout follow the camera even when the preview is off (the
+  // beauty view renders through renderFrame, which never touches the range).
+  refreshAutoRange()
+  const span = objectZSpan() // also refreshes _fwd, which placeRangeLine reads
+  objZ.value = span ? `${span.lo.toFixed(2)} – ${span.hi.toFixed(2)}` : ''
+  if (!rangeGizmo) return
+  rangeGizmo.visible = showRange.value
+  if (!showRange.value) { rangeHint.value = ''; return }
+  camera.getWorldDirection(_fwd)
+  // Both, always — `a || b` would short-circuit and leave the far line unplaced.
+  const a = placeRangeLine(nearLine, dNearUI.value)
+  const b = placeRangeLine(farLine, dFarUI.value)
+  const drawn = a || b
+  // Looking (nearly) straight down there is no such line to draw: every point of the floor
+  // is at the same view distance. Say it, rather than leave the user hunting for a line.
+  rangeHint.value = drawn ? '' : 'ground lines need a less vertical camera'
+}
+
 /** Lay the matte into the depth buffer (colour off): occluder-band pixels get depth 0 so the
  *  object is rejected there. Only called in the composite pass when Occlude is on. */
 function layBackdropDepth() {
@@ -744,6 +863,109 @@ function renderFrame(drawBackdrop = true) {
   r.autoClear = true
 }
 
+/**
+ * The depth render — ONE implementation for the export and for the live preview, so what
+ * the Depth tab shows is literally what the depth output will be.
+ *
+ * With a scene map connected it is the BASE LAYER, drawn verbatim (it arrives already
+ * calculated and is the reference), and the object's depth is remapped into ITS
+ * dNear/dFar curve and composited on top — the buffer cleared in between so the object
+ * wins where it has pixels, mirroring the colour composite. With no map: the same manual
+ * range when Manual is on, else MeshDepthMaterial fitted tight around the model (near
+ * white / far black), which is the historic behaviour.
+ *
+ * `forExport` hides the range gizmo; the preview wants it drawn over the map.
+ */
+function renderDepthPass(forExport: boolean) {
+  const r = renderer.value
+  if (!r) return
+  // Fit HERE, not on a timer: capture() has just switched the camera to the export aspect,
+  // so the range is fitted to the camera the depth is actually taken from.
+  refreshAutoRange()
+  const prevNear = camera.near
+  const prevFar = camera.far
+  const prevClear = r.getClearColor(new THREE.Color())
+  const prevAlpha = r.getClearAlpha()
+  const gridWasVisible = !!grid?.visible
+  const gizmoWasVisible = !!gizmoHelper?.visible
+  // The catcher would read as a huge surface the scene never had (the real ground is
+  // already in the photo's own depth), and the grounding shadow is not a depth surface.
+  const catcherWasVisible = !!shadowCatcher?.visible
+  const contactWasVisible = !!contactGroup?.visible
+  const rangeWasVisible = !!rangeGizmo?.visible
+  if (grid) grid.visible = false
+  if (gizmoHelper) gizmoHelper.visible = false
+  if (shadowCatcher) shadowCatcher.visible = false
+  if (contactGroup) contactGroup.visible = false
+  if (forExport && rangeGizmo) rangeGizmo.visible = false
+  setHelpersVisible(false)
+
+  const originals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
+  let overrideMat: THREE.Material = meshDepthMaterial
+  // Auto implies the range: there is no point fitting a range the pass would ignore.
+  if (sceneDepthTexture || depthManual.value || autoZ.value) {
+    linearDepthMaterial.uniforms.dNear.value = bgDepthMaterial.uniforms.dNear.value
+    linearDepthMaterial.uniforms.dFar.value = bgDepthMaterial.uniforms.dFar.value
+    linearDepthMaterial.uniforms.inv.value = sceneDepthInverseSpace ? 1 : 0
+    overrideMat = linearDepthMaterial
+  } else if (model) {
+    // Tight near/far only matter for MeshDepthMaterial's window-depth output.
+    const box = new THREE.Box3().setFromObject(model)
+    if (!box.isEmpty()) {
+      const sphere = box.getBoundingSphere(new THREE.Sphere())
+      const dist = camera.position.distanceTo(sphere.center)
+      camera.near = Math.max(1e-4, dist - sphere.radius)
+      camera.far = Math.max(camera.near + 1e-4, dist + sphere.radius)
+      camera.updateProjectionMatrix()
+    }
+  }
+  // Splats stay OUT of the depth pass: SparkRenderer extends THREE.Mesh, so the material
+  // override would either corrupt its draw or paint coloured splats into the depth PNG.
+  // A splat model contributes no depth in v1 — the scene layer still exports.
+  const sparkWasVisible = sparkRenderer?.visible ?? false
+  if (sparkRenderer) sparkRenderer.visible = false
+  const modelWasVisible = model?.visible ?? false
+  if (modelIsSplat && model) model.visible = false
+  // Override ONLY the model's meshes, not the whole scene: light helpers (RectAreaLightHelper
+  // et al.) and the gizmo run their own updateMatrixWorld that reads material.color, which
+  // MeshDepthMaterial lacks — swapping their material there throws. Everything non-model is
+  // hidden in this pass anyway, so it never needed the depth material.
+  if (model && !modelIsSplat) {
+    model.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        originals.set(child, child.material)
+        child.material = overrideMat
+      }
+    })
+  }
+  r.setClearColor(0x000000, 1)
+  r.autoClear = false
+  r.clear()
+  if (sceneDepthTexture) {
+    r.render(bgDepthScene, bgCamera)
+    // Occlude on: keep the scene depth so the object is depth-tested against it (masked by
+    // nearer scene geometry) — the depth output occludes just like the colour composite.
+    // Off: clear it so the object always wins (composite-over, the original behaviour).
+    if (!occlude.value) r.clearDepth()
+  }
+  r.render(scene, camera)
+  r.autoClear = true
+
+  originals.forEach((mat, mesh) => { mesh.material = mat })
+  if (sparkRenderer) sparkRenderer.visible = sparkWasVisible
+  if (modelIsSplat && model) model.visible = modelWasVisible
+  camera.near = prevNear
+  camera.far = prevFar
+  camera.updateProjectionMatrix()
+  if (grid) grid.visible = gridWasVisible
+  if (gizmoHelper) gizmoHelper.visible = gizmoWasVisible
+  if (shadowCatcher) shadowCatcher.visible = catcherWasVisible
+  if (contactGroup) contactGroup.visible = contactWasVisible
+  if (rangeGizmo) rangeGizmo.visible = rangeWasVisible
+  setHelpersVisible(true)
+  r.setClearColor(prevClear, prevAlpha)
+}
+
 // The active LiteGraph canvas zoom. The widget renders at this scale so it stays crisp when
 // the graph is zoomed in (the zoom is a CSS transform the renderer can't otherwise see).
 function lgScale(): number {
@@ -760,7 +982,16 @@ function loop() {
   const s = lgScale()
   if (Math.abs(s - lastScale) > 0.001) { lastScale = s; resize() }
   if (contact.value && contactDirty) { renderContactShadow(); contactDirty = false }
-  renderFrame()
+  // The Depth tab shows the depth pass itself rather than a second little canvas: same
+  // code as the export, full size, and the range gizmo drawn over it.
+  if (activePanel.value === 'depth') {
+    updateDepthGizmo()
+    if (depthView.value) renderDepthPass(false)
+    else renderFrame()
+  } else {
+    if (rangeGizmo) rangeGizmo.visible = false
+    renderFrame()
+  }
   raf = requestAnimationFrame(loop)
 }
 
@@ -1438,6 +1669,10 @@ async function capture(width: number, height: number) {
   if (grid) grid.visible = false // never bake the grid into an export
   if (gizmoHelper) gizmoHelper.visible = false // nor the transform gizmo
   setHelpersVisible(false) // nor the light helpers
+  // Nor the depth-range lines: they live in `scene`, so the colour composite would bake
+  // them in. renderDepthPass hides them for the depth pass on its own.
+  const rangeWasVisible = !!rangeGizmo?.visible
+  if (rangeGizmo) rangeGizmo.visible = false
   // The viewport renders at devicePixelRatio, but the export must be EXACTLY width×height
   // pixels — at ratio 2 the PNG would come out doubled.
   r.setPixelRatio(1)
@@ -1467,96 +1702,15 @@ async function capture(width: number, height: number) {
   renderFrame(false)
   const object = r.domElement.toDataURL('image/png')
 
-  // 3. Depth. With a scene map connected: the map is the BASE LAYER, exported verbatim —
-  //    it arrives already calculated and is the reference — and the object's depth is
-  //    remapped into ITS dNear/dFar space (linear view-z) and composited ON TOP, depth
-  //    buffer cleared in between so the object always wins where it has pixels, mirroring
-  //    the colour composite. Without a scene map: MeshDepthMaterial fitted tight around
-  //    the model, as always (near white / far black, no inversion anywhere).
-  const prevNear = camera.near
-  const prevFar = camera.far
-  // The catcher stays hidden here too: as depth it would read as a huge surface the scene
-  // never had (the real ground is already in the photo's own depth).
-  const originals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
-  const depthMaterial = new THREE.MeshDepthMaterial()
-  let overrideMat: THREE.Material = depthMaterial
-  if (sceneDepthTexture) {
-    const dNear = bgDepthMaterial.uniforms.dNear.value
-    const dFar = bgDepthMaterial.uniforms.dFar.value
-    linearDepthMaterial.uniforms.dNear.value = dNear
-    linearDepthMaterial.uniforms.dFar.value = dFar
-    linearDepthMaterial.uniforms.inv.value = sceneDepthInverseSpace ? 1 : 0
-    overrideMat = linearDepthMaterial
-    // The tuning aid for scene_depth_near/far: anything nearer than dNear clamps to
-    // pure white (an fSpy scene lives in small units, so the defaults often saturate).
-    if (model) {
-      const box = new THREE.Box3().setFromObject(model)
-      if (!box.isEmpty()) {
-        const sphere = box.getBoundingSphere(new THREE.Sphere())
-        const dist = camera.position.distanceTo(sphere.center)
-        const zMin = Math.max(0, dist - sphere.radius)
-        const zMax = dist + sphere.radius
-        console.log(
-          `[NKD Preview 3D] depth export: object spans view-z ${zMin.toFixed(2)}..${zMax.toFixed(2)}; ` +
-          `scene_depth_near/far = ${dNear}/${dFar}` +
-          (zMax < dNear ? ' — ALL nearer than near: object clamps to pure white, lower scene_depth_near' : '')
-        )
-      }
-    }
-  } else if (model) {
-    // Tight near/far only matter for MeshDepthMaterial's window-depth output.
-    const box = new THREE.Box3().setFromObject(model)
-    if (!box.isEmpty()) {
-      const sphere = box.getBoundingSphere(new THREE.Sphere())
-      const dist = camera.position.distanceTo(sphere.center)
-      camera.near = Math.max(1e-4, dist - sphere.radius)
-      camera.far = Math.max(camera.near + 1e-4, dist + sphere.radius)
-      camera.updateProjectionMatrix()
-    }
-  }
-  // Splats stay OUT of the depth pass: SparkRenderer extends THREE.Mesh, so the material
-  // override would either corrupt its draw or paint coloured splats into the depth PNG.
-  // A splat model contributes no depth in v1 — the scene layer still exports.
-  const sparkWasVisible = sparkRenderer?.visible ?? false
-  if (sparkRenderer) sparkRenderer.visible = false
-  const modelWasVisible = model?.visible ?? false
-  if (modelIsSplat && model) model.visible = false
-  // Override ONLY the model's meshes, not the whole scene: light helpers (RectAreaLightHelper
-  // et al.) and the gizmo run their own updateMatrixWorld that reads material.color, which
-  // MeshDepthMaterial lacks — swapping their material there throws. Everything non-model is
-  // hidden in this pass anyway, so it never needed the depth material.
-  if (model && !modelIsSplat) {
-    model.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        originals.set(child, child.material)
-        child.material = overrideMat
-      }
-    })
-  }
-  r.setClearColor(0x000000, 1)
-  r.autoClear = false
-  r.clear()
-  if (sceneDepthTexture) {
-    r.render(bgDepthScene, bgCamera)
-    // Occlude on: keep the scene depth so the object is depth-tested against it (masked by
-    // nearer scene geometry) — the depth output occludes just like the colour composite.
-    // Off: clear it so the object always wins (composite-over, the original behaviour).
-    if (!occlude.value) r.clearDepth()
-  }
-  r.render(scene, camera)
-  r.autoClear = true
+  // 3. Depth — the exact pass the Depth tab previews, gizmo excluded.
+  renderDepthPass(true)
   const depth = r.domElement.toDataURL('image/png')
-  originals.forEach((mat, mesh) => { mesh.material = mat })
-  depthMaterial.dispose()
-  if (sparkRenderer) sparkRenderer.visible = sparkWasVisible
-  if (modelIsSplat && model) model.visible = modelWasVisible
 
-  camera.near = prevNear
-  camera.far = prevFar
   if (shadowCatcher) shadowCatcher.visible = catcherWasVisible
   if (contactGroup) contactGroup.visible = contactWasVisible
   if (grid) grid.visible = gridWasVisible
   if (gizmoHelper) gizmoHelper.visible = gizmoWasVisible
+  if (rangeGizmo) rangeGizmo.visible = rangeWasVisible
   setHelpersVisible(true)
   r.setClearColor(0x000000, 0)
   r.setPixelRatio(prevRatio)
@@ -1572,6 +1726,7 @@ async function setSceneDepth(ref: { filename: string; type: string; subfolder: s
   if (!ref) {
     sceneDepthTexture?.dispose()
     sceneDepthTexture = null
+    depthPixels = null
     bgDepthMaterial.uniforms.depthMap.value = null
     hasSceneDepth.value = false
     return
@@ -1583,10 +1738,29 @@ async function setSceneDepth(ref: { filename: string; type: string; subfolder: s
   texture.magFilter = THREE.LinearFilter
   sceneDepthTexture?.dispose()
   sceneDepthTexture = texture
+  depthPixels = readDepthPixels(texture.image as CanvasImageSource)
   bgDepthMaterial.uniforms.depthMap.value = texture
   hasSceneDepth.value = true
   fitBackground()
 }
+
+/** One 256×256 read of the map, cached for the floor fit. */
+function readDepthPixels(img: CanvasImageSource | undefined) {
+  if (!img) return null
+  const w = 256
+  const h = 256
+  const cv = document.createElement('canvas')
+  cv.width = w
+  cv.height = h
+  const ctx = cv.getContext('2d', { willReadFrequently: false })
+  if (!ctx) return null
+  ctx.drawImage(img, 0, 0, w, h)
+  return { data: ctx.getImageData(0, 0, w, h).data, w, h }
+}
+
+// Columns in the floor-sampling grid. Also the pair stride of the Theil–Sen fit: one column
+// apart is the same row (same distance, no information), one stride apart is the next row.
+const SAMPLE_COLS = 19
 
 function median(arr: number[]) {
   const s = [...arr].sort((x, y) => x - y)
@@ -1594,24 +1768,19 @@ function median(arr: number[]) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
 }
 
+type AutoFit = { near: number; far: number } | { error: string }
+
 /** Auto-fit scene_depth_near/far against the fSpy ground plane. For pixels in the lower
  *  band of the frame we know BOTH the map's grey and the true view distance (ray to y=0
  *  with the calibrated camera). In inverse space 1/z is LINEAR in the grey (1/z = a + b·d),
  *  so a robust Theil–Sen line through the samples yields dFar = 1/a, dNear = 1/(a+b).
- *  Furniture in the band contaminates single samples; the median fit shrugs them off. */
-function autoCalibrateDepth() {
-  const img = sceneDepthTexture?.image as CanvasImageSource | undefined
-  if (!img) return
-  const fail = (why: string) => { status.value = `Auto Z failed: ${why}` }
-  const cw = 256
-  const ch = 256
-  const cv = document.createElement('canvas')
-  cv.width = cw
-  cv.height = ch
-  const ctx = cv.getContext('2d')
-  if (!ctx) return
-  ctx.drawImage(img, 0, 0, cw, ch)
-  const px = ctx.getImageData(0, 0, cw, ch).data
+ *  Furniture in the band contaminates single samples; the median fit shrugs them off.
+ *  Silent and side-effect free: with Auto on this runs every frame. */
+function fitRangeToSceneDepth(): AutoFit {
+  const px = depthPixels
+  if (!px) return { error: 'no depth map' }
+  const cw = px.w
+  const ch = px.h
   const invert = bgDepthMaterial.uniforms.invert.value > 0.5
   // The map is cover-fitted on screen; undo that fit to read the right texel per pixel.
   const sx = bgDepthMesh?.scale.x ?? 1
@@ -1620,7 +1789,7 @@ function autoCalibrateDepth() {
   const ds: number[] = []
   const ys: number[] = []
   for (let gy = 0; gy < 15; gy++) {
-    for (let gx = 0; gx < 19; gx++) {
+    for (let gx = 0; gx < SAMPLE_COLS; gx++) {
       const nx = -0.9 + gx * 0.1
       const ny = -0.95 + gy * 0.05 // lower band: where the floor lives
       const lx = nx / sx
@@ -1633,39 +1802,116 @@ function autoCalibrateDepth() {
       if (!(z > 1e-3)) continue
       const u = (lx + 1) / 2
       const v = (ly + 1) / 2
-      let d = px[(Math.round((1 - v) * (ch - 1)) * cw + Math.round(u * (cw - 1))) * 4] / 255
+      let d = px.data[(Math.round((1 - v) * (ch - 1)) * cw + Math.round(u * (cw - 1))) * 4] / 255
       if (invert) d = 1 - d
       ds.push(d)
       ys.push(1 / z)
     }
   }
-  if (ds.length < 30) return fail('not enough floor in view')
-  if (Math.max(...ds) - Math.min(...ds) < 0.08) return fail('floor greys are flat')
+  if (ds.length < 30) return { error: 'not enough floor in view' }
+  if (Math.max(...ds) - Math.min(...ds) < 0.08) return { error: 'floor greys are flat' }
+  // Theil–Sen, but over a DETERMINISTIC set of pairs. Random pairs (the first version)
+  // give a slightly different fit each call, which is invisible for a one-shot button and
+  // intolerable once Auto re-fits every frame: the range would jitter, and with it the
+  // gizmo and the widget write-back, on a camera that is not even moving. Striding by the
+  // grid's row width pairs samples from different rows, which is where the depth spread is.
   const slopes: number[] = []
-  for (let k = 0; k < 1200 && slopes.length < 400; k++) {
-    const i = (Math.random() * ds.length) | 0
-    const j = (Math.random() * ds.length) | 0
-    if (Math.abs(ds[i] - ds[j]) < 0.05) continue
-    slopes.push((ys[i] - ys[j]) / (ds[i] - ds[j]))
+  for (let s = SAMPLE_COLS; s < ds.length; s += SAMPLE_COLS) {
+    for (let i = 0; i + s < ds.length; i++) {
+      if (Math.abs(ds[i] - ds[i + s]) < 0.05) continue
+      slopes.push((ys[i] - ys[i + s]) / (ds[i] - ds[i + s]))
+    }
   }
-  if (!slopes.length) return fail('degenerate samples')
+  if (!slopes.length) return { error: 'degenerate samples' }
   const b = median(slopes)
   const a = median(ds.map((d, i) => ys[i] - b * d))
   const near = 1 / (a + b)
   const far = a > 1e-6 ? 1 / a : 10000 // a≈0: the darkest grey sits at infinity
-  if (!(b > 0) || !isFinite(near) || near <= 0 || !(far > near)) return fail('no clean floor fit')
-  // Apply locally NOW: capture runs before the backend folds the widgets back.
-  bgDepthMaterial.uniforms.dNear.value = +near.toFixed(3)
-  bgDepthMaterial.uniforms.dFar.value = +far.toFixed(2)
-  syncDepthUI()
-  emit('calibrated', +near.toFixed(3), +far.toFixed(2))
-  status.value = `Auto Z: near ${near.toFixed(2)} / far ${far.toFixed(1)}`
-  window.setTimeout(() => { if (status.value.startsWith('Auto Z:')) status.value = '' }, 4000)
+  if (!(b > 0) || !isFinite(near) || near <= 0 || !(far > near)) return { error: 'no clean floor fit' }
+  return { near, far }
 }
 
-// Mirror the invert uniform into the panel (loadScene sets it from the node's widget).
+/** No scene map to fit against: bracket the object's own view-z span instead, which is the
+ *  range that spends the full 0..1 on the object — and which moves with the camera, so it
+ *  is the fit that actually wants re-running continuously. */
+function fitRangeToObject(): AutoFit {
+  const span = objectZSpan()
+  if (!span) return { error: 'no model' }
+  return { near: span.lo, far: span.hi }
+}
+
+const computeAutoRange = (): AutoFit =>
+  (sceneDepthTexture ? fitRangeToSceneDepth() : fitRangeToObject())
+
+/** With Auto on, the fit is the BASE and Near/Far are offsets on top of it — pad the front,
+ *  give the back some headroom, without losing the tracking. Called from the render paths,
+ *  so the export is fitted to the camera it is actually being taken from. */
+function refreshAutoRange() {
+  if (!autoZ.value) return
+  const fit = computeAutoRange()
+  if ('error' in fit) { autoErr.value = fit.error; return }
+  autoErr.value = ''
+  applyDepthRange(fit.near + nearOff.value, fit.far + farOff.value, true)
+}
+
+function toggleAutoZ() {
+  autoZ.value = !autoZ.value
+  if (autoZ.value) refreshAutoRange()
+  // Turning it OFF freezes: dNear/dFar keep the last fitted value and the fields go back to
+  // editing them as absolutes. Nothing jumps, so the toggle doubles as a one-shot fit —
+  // which is why Manual is forced on here: without it the no-map path would fall back to
+  // the historic auto-fit curve and the picture WOULD jump. The checkbox reappears ticked,
+  // so it is one click to go back to the old behaviour.
+  else {
+    autoErr.value = ''
+    depthManual.value = true
+    flushWriteback()
+  }
+}
+
+// The node's widgets are persistence and display only — the uniform is what renders. So the
+// continuous path writes the uniform every frame and the widgets at most every 300 ms;
+// emitting per frame would repaint the canvas 60×/s for a value nothing reads that fast.
+let writebackTimer = 0
+function queueWriteback() {
+  if (writebackTimer) return
+  writebackTimer = window.setTimeout(flushWriteback, 300)
+}
+function flushWriteback() {
+  if (writebackTimer) { clearTimeout(writebackTimer); writebackTimer = 0 }
+  emit('calibrated', dNearUI.value, dFarUI.value)
+}
+
+/** The one write point for the range: uniform (what renders NOW — capture runs before the
+ *  backend folds anything back) + mirror + the node's own widgets, via the same event Auto Z
+ *  has always used. `deferred` batches the widget write for the per-frame callers. */
+function applyDepthRange(near: number, far: number, deferred = false) {
+  const n = Math.max(0.01, near)
+  const f = Math.max(n + 0.02, far)
+  bgDepthMaterial.uniforms.dNear.value = n
+  bgDepthMaterial.uniforms.dFar.value = f
+  // Guarded so a still camera does not re-render the panel every frame.
+  if (Math.abs(dNearUI.value - n) > 1e-4) dNearUI.value = n
+  if (Math.abs(dFarUI.value - f) > 1e-4) dFarUI.value = f
+  if (deferred) queueWriteback()
+  else flushWriteback()
+}
+// With Auto on the fields edit the OFFSET, not the value: same two controls, and the
+// refresh on the next frame turns them back into an absolute range.
+function setDepthNear(v: number) {
+  if (autoZ.value) { nearOff.value = v; refreshAutoRange() }
+  else applyDepthRange(v, dFarUI.value)
+}
+function setDepthFar(v: number) {
+  if (autoZ.value) { farOff.value = v; refreshAutoRange() }
+  else applyDepthRange(dNearUI.value, v)
+}
+
+// Mirror the uniforms into the panel (loadScene sets them from the node's widgets).
 function syncDepthUI() {
   depthInvertUI.value = bgDepthMaterial.uniforms.invert.value > 0.5
+  dNearUI.value = bgDepthMaterial.uniforms.dNear.value
+  dFarUI.value = bgDepthMaterial.uniforms.dFar.value
 }
 function setDepthInvertUI(b: boolean) {
   depthInvertUI.value = b
@@ -1766,6 +2012,16 @@ function serialise(): string {
     occlude: occlude.value,
     occFrom: occFrom.value,
     occTo: occTo.value,
+    depthView: depthView.value,
+    showRange: showRange.value,
+    depthManual: depthManual.value,
+    autoZ: autoZ.value,
+    nearOff: nearOff.value,
+    farOff: farOff.value,
+    // The node's widgets own these; kept here so the tab reads true after a reload, before
+    // the first run pushes them back.
+    dNear: dNearUI.value,
+    dFar: dFarUI.value,
     unbake: unbake.value,
     smooth: smooth.value,
     lights: lights.map((c) => ({ ...c })),
@@ -1812,6 +2068,17 @@ function deserialise(json: string) {
     if (typeof s.smooth === 'number') { smooth.value = s.smooth; applySmoothNormals() }
     if (typeof s.occFrom === 'number') setOccFrom(s.occFrom)
     if (typeof s.occTo === 'number') setOccTo(s.occTo)
+    if (typeof s.depthView === 'boolean') depthView.value = s.depthView
+    if (typeof s.showRange === 'boolean') showRange.value = s.showRange
+    if (typeof s.depthManual === 'boolean') depthManual.value = s.depthManual
+    if (typeof s.autoZ === 'boolean') autoZ.value = s.autoZ
+    if (typeof s.nearOff === 'number') nearOff.value = s.nearOff
+    if (typeof s.farOff === 'number') farOff.value = s.farOff
+    // Restore the display only — no emit: the node restores its own widgets, and the next
+    // run pushes them back through loadScene anyway.
+    if (typeof s.dNear === 'number') bgDepthMaterial.uniforms.dNear.value = s.dNear
+    if (typeof s.dFar === 'number') bgDepthMaterial.uniforms.dFar.value = s.dFar
+    syncDepthUI()
     if (Array.isArray(s.lights)) {
       for (const id of [...lightObjs.keys()]) removeLight(id) // clear any current rig
       lights.length = 0
@@ -1856,6 +2123,8 @@ function cleanup() {
   detachFine?.()
   detachGizmoFine?.()
   cancelAnimationFrame(raf)
+  // A pending write-back would emit into a node that is being torn down.
+  if (writebackTimer) { clearTimeout(writebackTimer); writebackTimer = 0 }
   ro?.disconnect()
   controls?.dispose()
   transformControls?.dispose()
@@ -1965,10 +2234,10 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
     <div class="nkd-bar">
       <button :class="{ on: activePanel === 'object' }" @click="togglePanel('object')">Object</button>
       <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
+      <button :class="{ on: activePanel === 'depth' }" @click="togglePanel('depth')"
+        title="Depth output: near/far range, live preview and Auto Z">Depth</button>
       <button v-if="hasSceneDepth" :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
         title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
-      <button v-if="hasSceneDepth" @click="autoCalibrateDepth"
-        title="Fit the exported depth's object tone against the fSpy ground plane">Auto Z</button>
       <label class="nkd-barfield" :title="hasCamera
         ? 'Vertical field of view. A solved camera drives this — the next run puts its lens back.'
         : 'Vertical field of view, in degrees. Drag to scrub, click to type.'">FOV
@@ -2046,6 +2315,44 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
             </div>
           </template>
         </div>
+      </div>
+    </div>
+    <div v-if="activePanel === 'depth'" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+      <div class="nkd-obj-row">
+        <span class="nkd-obj-tag">{{ autoZ ? 'Offset' : 'Range' }}</span>
+        <label class="nkd-barfield" :title="autoZ
+          ? 'Padding on the fitted near plane, in scene units. Negative pulls it towards the camera (headroom in front of the object).'
+          : 'Scene distance the depth map\'s WHITE stands for. Anything nearer clamps to pure white.'">Near
+          <DragNumber :model-value="autoZ ? nearOff : dNearUI" :step="0.02" :min="autoZ ? -1e6 : 0.01"
+                      :reset-to="autoZ ? 0 : null" @update:model-value="setDepthNear" />
+        </label>
+        <label class="nkd-barfield" :title="autoZ
+          ? 'Padding on the fitted far plane, in scene units. Positive pushes it away (headroom behind the object).'
+          : 'Scene distance the depth map\'s BLACK stands for. Anything farther clamps to pure black.'">Far
+          <DragNumber :model-value="autoZ ? farOff : dFarUI" :step="0.1" :min="autoZ ? -1e6 : 0.03"
+                      :reset-to="autoZ ? 0 : null" @update:model-value="setDepthFar" />
+        </label>
+        <button class="nkd-gizmo" :class="{ on: autoZ }" @click="toggleAutoZ" :title="hasSceneDepth
+          ? 'Keep the range fitted to the injected map against the fSpy ground plane, re-fitting as the camera moves. Off freezes the last fit.'
+          : 'Keep the range fitted to the object\'s own distance span, re-fitting as the camera moves. Off freezes the last fit.'">Auto Z</button>
+      </div>
+      <div class="nkd-obj-row">
+        <label class="nkd-check" title="Show the depth pass itself in the viewport — the exact render the depth output gets">
+          <input type="checkbox" v-model="depthView"> Preview
+        </label>
+        <label class="nkd-check" title="Draw where the near (blue) and far (red) planes cut the ground. The planes themselves would project to the same rectangle at any distance, so the ground line is what actually moves.">
+          <input type="checkbox" v-model="showRange"> Range on ground
+        </label>
+        <label v-if="!hasSceneDepth && !autoZ" class="nkd-check" title="Off: the depth output auto-fits to the model, so its range drifts with every orbit. On: it uses Near/Far above, like the scene-map path.">
+          <input type="checkbox" v-model="depthManual"> Manual range
+        </label>
+      </div>
+      <div class="nkd-obj-row nkd-depth-info">
+        <span>Object at z {{ objZ || '—' }}</span>
+        <span v-if="autoZ">Range {{ dNearUI.toFixed(2) }} – {{ dFarUI.toFixed(2) }}</span>
+        <span v-if="autoZ && autoErr" class="nkd-depth-warn">Auto Z: {{ autoErr }}</span>
+        <span v-if="rangeHint" class="nkd-depth-warn">{{ rangeHint }}</span>
+        <span v-else-if="!hasSceneDepth && !depthManual && !autoZ">auto-fit to model — Near/Far unused</span>
       </div>
     </div>
     <div v-if="activePanel === 'occlude'" class="nkd-panel" @pointerdown.stop @wheel.stop>
@@ -2199,6 +2506,8 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 .nkd-gizmo:hover { border-color: #4ab4ff; }
 .nkd-gizmo.on { border-color: #4ab4ff; color: #4ab4ff; }
 .nkd-gizmo-icon { flex: 0 0 auto; width: 26px; }
+.nkd-depth-info { color: rgba(255, 255, 255, 0.45); font-size: 10px; gap: 10px; }
+.nkd-depth-warn { color: #ffd166; }
 /* Light rig: the panel goes column so the extra-lights list sits under the key controls. */
 .nkd-panel-col { flex-direction: column; align-items: stretch; }
 .nkd-light-main { display: flex; align-items: center; gap: 10px; width: 100%; }

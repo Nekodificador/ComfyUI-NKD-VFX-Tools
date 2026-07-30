@@ -49,6 +49,9 @@ export default defineConfig({
         nkd_modal:         "./src/nkd_modal.ts",
         // Own entry so `node test_plumbline.mjs` can import and assert on it.
         nkd_plumbline:     "./src/plumbline.ts",
+        // Likewise: the Preview 3D depth-range geometry, importable on its own so it can be
+        // asserted against outside a browser.
+        nkd_depth_range:   "./src/depth_range.ts",
         relighting_widget: "./src/main.ts",
         lens_blur_widget:  "./src/lens_blur_main.ts",
         fspy_camera_widget: "./src/fspy_main.ts",

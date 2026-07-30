@@ -107,8 +107,18 @@ lands in the exported `image`.
 
 Feed it a solved camera from **fSpy Camera** and the model sits in the photo's real
 perspective. Feed it the backdrop's depth map and the exported depth lines up with the
-scene, so the object composites at the right distance. There's an **Auto Z** button that
-works out the near/far calibration for you.
+scene, so the object composites at the right distance.
+
+The **Depth** tab is where you dial that in. It shows the depth output live in the
+viewport — the same render the node exports, not an approximation — so you set the near and
+far distances while watching what they do, instead of queueing the graph to find out.
+**Auto Z** works the range out for you and keeps re-fitting it as you move the camera;
+switch it off to freeze the fit. While it's on, Near and Far become offsets on top of it,
+for headroom in front of or behind the object. A pair of lines on the ground marks where
+the two distances land.
+
+With no depth map connected it fits to the object itself, so the depth output stays usable
+even when the model is all there is.
 
 <!-- video: preview 3d -->
 
