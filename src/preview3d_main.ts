@@ -127,20 +127,45 @@ comfyApp.registerExtension({
 
       // Auto Z writes the fitted anchors into the node's own widgets, the same fold-back
       // path width/height use — what you see in the node is what the next run executes.
+      const setWidget = (name: string, value: unknown) => {
+        const w = node.widgets?.find((x: any) => x.name === name)
+        if (w) w.value = value
+      }
       const onCalibrated = (near: number, far: number) => {
-        const set = (name: string, value: number) => {
-          const w = node.widgets?.find((x: any) => x.name === name)
-          if (w) w.value = value
-        }
-        set('scene_depth_near', near)
-        set('scene_depth_far', far)
+        setWidget('scene_depth_near', near)
+        setWidget('scene_depth_far', far)
+        node.setDirtyCanvas(true, true)
+      }
+      // Same fold-back for the depth controls that moved into the viewport: the widget stays
+      // the persisted value and what the next run executes, it just has no row on the node.
+      const onWidget = (name: string, value: unknown) => {
+        setWidget(name, value)
         node.setDirtyCanvas(true, true)
       }
       const vueApp = createApp({
-        render: () => h(Preview3DWidget, { ref: 'vp', apiBase: api.apiURL(''), aspect, onCalibrated }),
+        render: () => h(Preview3DWidget, { ref: 'vp', apiBase: api.apiURL(''), aspect, onCalibrated, onWidget }),
       })
       const mounted: any = vueApp.mount(container)
       const vp = () => mounted.$refs.vp
+
+      // The depth range, the invert flag and the map's space are edited in the viewport's Depth
+      // tab — live, against the preview. Nothing in the graph produces those numbers, so the
+      // rows on the node were duplicate controls with no upstream: hide them and leave the node
+      // to what you actually wire, width and height. The widgets still hold and serialise the
+      // value; the viewport writes them through onWidget/onCalibrated.
+      for (const name of ['scene_depth_invert', 'scene_depth_near', 'scene_depth_far',
+                          'scene_depth_space']) {
+        const w = node.widgets?.find((x: any) => x.name === name)
+        if (!w) continue
+        w.type = 'hidden'
+        w.hidden = true // the Vue renderer keys off .hidden, not .type
+        w.computedHeight = 0
+        w.computeSize = () => [0, -4]
+        // Drop the phantom socket too, but never one that is already wired — an existing
+        // graph driving these from a math node would lose the link on load.
+        const i = node.inputs?.findIndex((inp: any) => inp.name === name)
+        if (i !== undefined && i >= 0 && !node.inputs[i].link) node.removeInput(i)
+      }
 
       // The viewport channel is internal plumbing — never show it as a text box.
       const viewportWidget = node.widgets?.find((w: any) => w.name === 'viewport')

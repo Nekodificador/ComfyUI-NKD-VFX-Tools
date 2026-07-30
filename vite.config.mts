@@ -52,6 +52,9 @@ export default defineConfig({
         // Likewise: the Preview 3D depth-range geometry, importable on its own so it can be
         // asserted against outside a browser.
         nkd_depth_range:   "./src/depth_range.ts",
+        // Likewise: the position-weld normal smoothing, so `node test_autosmooth.mjs` asserts on
+        // the SHIPPED function instead of a re-implementation of it.
+        nkd_smooth_normals: "./src/smooth_normals.ts",
         relighting_widget: "./src/main.ts",
         lens_blur_widget:  "./src/lens_blur_main.ts",
         fspy_camera_widget: "./src/fspy_main.ts",

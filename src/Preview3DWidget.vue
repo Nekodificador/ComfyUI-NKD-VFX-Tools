@@ -15,6 +15,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { attachFineRange, isFine, FINE_GAIN } from './fine_drag'
 import { groundHit, viewZSpan } from './depth_range'
+import { smoothNormalsByPosition } from './smooth_normals'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
@@ -111,7 +112,12 @@ const DragNumber = defineComponent({
  * framed here is what capture() exports.
  */
 const props = defineProps<{ apiBase: string; aspect: { w: number; h: number } }>()
-const emit = defineEmits<{ calibrated: [near: number, far: number] }>()
+// `widget` is the generic fold-back channel: the viewport owns these controls now, and the
+// node's widget is where the value persists and what the next run executes.
+const emit = defineEmits<{
+  calibrated: [near: number, far: number]
+  widget: [name: string, value: unknown]
+}>()
 
 const host = ref<HTMLDivElement | null>(null)
 const showGrid = ref(true)
@@ -211,6 +217,11 @@ const unbake = ref(false)
 // Splat meshes are a faceted triangle soup → harsh per-face shading. Smooth averages face normals
 // per spatial-grid cell (fast, O(n)); 0 = original, higher = coarser cells = softer shading.
 const smooth = ref(0)
+// glTF mandates FLAT normals when a mesh ships no NORMAL attribute, and GLTFLoader obeys by
+// setting flatShading (three 0.180, GLTFLoader.js:3581) — which is exactly how a Hunyuan3D mesh
+// (POSITION + TEXCOORD_0, no normals) arrives: hard facets. Auto-smooth averages them per shared
+// vertex, the same thing a DCC's auto-smooth does. Meshes WITH authored normals are left alone.
+const autoSmooth = ref(true)
 
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null)
 const scene = new THREE.Scene()
@@ -250,7 +261,9 @@ let sceneDepthTexture: THREE.Texture | null = null
 // on every call; with Auto re-fitting each frame that would be a 256×256 drawImage +
 // getImageData per frame, for pixels that cannot change until the map itself does.
 let depthPixels: { data: Uint8ClampedArray; w: number; h: number } | null = null
-let sceneDepthInverseSpace = true // monocular maps are disparity unless the node says otherwise
+// Monocular maps are disparity unless the node says otherwise. A ref, not a plain let, so the
+// Depth panel can show it — renderDepthPass reads it into the uniform on every pass anyway.
+const sceneDepthInverseSpace = ref(true)
 const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (plain let, not reactive)
 
 const DEPTH_FRAG = `
@@ -906,7 +919,7 @@ function renderDepthPass(forExport: boolean) {
   if (sceneDepthTexture || depthManual.value || autoZ.value) {
     linearDepthMaterial.uniforms.dNear.value = bgDepthMaterial.uniforms.dNear.value
     linearDepthMaterial.uniforms.dFar.value = bgDepthMaterial.uniforms.dFar.value
-    linearDepthMaterial.uniforms.inv.value = sceneDepthInverseSpace ? 1 : 0
+    linearDepthMaterial.uniforms.inv.value = sceneDepthInverseSpace.value ? 1 : 0
     overrideMat = linearDepthMaterial
   } else if (model) {
     // Tight near/far only matter for MeshDepthMaterial's window-depth output.
@@ -1157,44 +1170,27 @@ watch(unbake, applyUnbake)
  *  look), averaging the area-weighted face normals sharing each position into a true smooth
  *  vertex normal. Then blends the original (faceted) normal toward that smooth one by `blend`
  *  (0..1), so the slider softens facets gradually. One accumulate pass + one write pass. */
-function gridSmoothNormals(geo: THREE.BufferGeometry, cell: number, blend: number) {
+function gridSmoothNormals(geo: THREE.BufferGeometry, cell: number, blend: number,
+                           alignToOriginal = true) {
   const pos = geo.attributes.position
-  const idx = geo.index
-  const vcount = pos.count
-  const triCount = (idx ? idx.count : vcount) / 3
   if (!geo.attributes.normal) geo.computeVertexNormals() // baseline to blend from
-  const orig = geo.attributes.normal
-  const inv = 1 / cell
-  const acc = new Map<string, [number, number, number]>()
-  const key = (i: number) =>
-    Math.round(pos.getX(i) * inv) + ',' + Math.round(pos.getY(i) * inv) + ',' + Math.round(pos.getZ(i) * inv)
-  const bump = (i: number, nx: number, ny: number, nz: number) => {
-    const k = key(i), e = acc.get(k)
-    if (e) { e[0] += nx; e[1] += ny; e[2] += nz } else acc.set(k, [nx, ny, nz])
+  const na = geo.attributes.normal
+  // Read through the accessors rather than .array: GLTFLoader hands back an
+  // InterleavedBufferAttribute whenever the glTF packs attributes into one bufferView.
+  const P = new Float32Array(pos.count * 3), O = new Float32Array(pos.count * 3)
+  for (let i = 0; i < pos.count; i++) {
+    P[i * 3] = pos.getX(i); P[i * 3 + 1] = pos.getY(i); P[i * 3 + 2] = pos.getZ(i)
+    O[i * 3] = na.getX(i); O[i * 3 + 1] = na.getY(i); O[i * 3 + 2] = na.getZ(i)
   }
-  for (let t = 0; t < triCount; t++) {
-    const ia = idx ? idx.getX(t * 3) : t * 3, ib = idx ? idx.getX(t * 3 + 1) : t * 3 + 1, ic = idx ? idx.getX(t * 3 + 2) : t * 3 + 2
-    const ax = pos.getX(ia), ay = pos.getY(ia), az = pos.getZ(ia)
-    const ux = pos.getX(ib) - ax, uy = pos.getY(ib) - ay, uz = pos.getZ(ib) - az
-    const vx = pos.getX(ic) - ax, vy = pos.getY(ic) - ay, vz = pos.getZ(ic) - az
-    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx // area-weighted
-    bump(ia, nx, ny, nz); bump(ib, nx, ny, nz); bump(ic, nx, ny, nz)
-  }
-  const out = new Float32Array(vcount * 3)
-  for (let i = 0; i < vcount; i++) {
-    const ox = orig.getX(i), oy = orig.getY(i), oz = orig.getZ(i)
-    const e = acc.get(key(i))
-    let sx = ox, sy = oy, sz = oz
-    if (e) {
-      const l = Math.hypot(e[0], e[1], e[2]) || 1
-      sx = e[0] / l; sy = e[1] / l; sz = e[2] / l
-      if (sx * ox + sy * oy + sz * oz < 0) { sx = -sx; sy = -sy; sz = -sz } // align to the original hemisphere
-    }
-    let bx = ox + (sx - ox) * blend, by = oy + (sy - oy) * blend, bz = oz + (sz - oz) * blend
-    const bl = Math.hypot(bx, by, bz) || 1
-    out[i * 3] = bx / bl; out[i * 3 + 1] = by / bl; out[i * 3 + 2] = bz / bl
-  }
+  const out = smoothNormalsByPosition(P, geo.index ? geo.index.array : null, O, cell, blend, alignToOriginal)
   geo.setAttribute('normal', new THREE.BufferAttribute(out, 3))
+}
+
+/** Weld tolerance for a mesh: small enough to merge only genuinely coincident vertices. */
+function weldCell(geo: THREE.BufferGeometry) {
+  if (!geo.boundingBox) geo.computeBoundingBox()
+  const s = geo.boundingBox!.getSize(new THREE.Vector3())
+  return Math.max((Math.max(s.x, s.y, s.z) || 1) * 1e-4, 1e-7)
 }
 
 /** Laplacian diffusion of the normal field over an INDEXED mesh: each iteration replaces every
@@ -1228,6 +1224,42 @@ function laplacianSmoothNormals(geo: THREE.BufferGeometry, iterations: number) {
   }
   geo.setAttribute('normal', new THREE.BufferAttribute(N, 3))
 }
+
+/** Give a mesh that shipped NO normals the smooth shading a DCC's auto-smooth would.
+ *
+ *  TWO separate defects land here, and only the weld fixes both:
+ *
+ *  1. No NORMAL attribute. The glTF spec says a client MUST calculate FLAT normals in that case
+ *     and GLTFLoader obeys (flatShading, three 0.180 GLTFLoader.js:3581). Hunyuan3D exports
+ *     POSITION + TEXCOORD_0 only, so it lands as hard facets.
+ *  2. UV seams. The unwrap duplicates every vertex on a seam, and `computeVertexNormals` averages
+ *     per INDEX — it cannot cross one. Measured on a Hunyuan head: 64% of the mesh is seam-split
+ *     and 12798 co-located pairs ended up with normals more than 10° apart, the worst by 180°.
+ *     Those are the patch outlines that survive after (1) is fixed.
+ *
+ *  So the weld is by POSITION, always — `computeVertexNormals` is not a valid fast path here even
+ *  when the index looks shared. `alignToOriginal` is off for the same reason: the pre-weld normal
+ *  is the wrong side of the discontinuity being erased. No crease threshold either — measured on
+ *  the same mesh, 25% of positions span more than 60°, so three's `toCreasedNormals` default would
+ *  leave a quarter of the mesh split (and its hash cell is 51× coarser than the weld used here).
+ *
+ *  An authored normal set is never second-guessed; only meshes that ship none are touched. */
+function applyAutoSmooth() {
+  if (!model || modelIsSplat) return
+  model.traverse((c) => {
+    if (!(c instanceof THREE.Mesh)) return
+    const mesh = c as THREE.Mesh
+    // Write into the pristine geometry — Smooth may have swapped a clone into mesh.geometry.
+    const geo = (mesh.userData.nkdOrigGeom as THREE.BufferGeometry) ?? mesh.geometry
+    if (mesh.userData.nkdNoNormals === undefined) mesh.userData.nkdNoNormals = !geo.attributes.normal
+    if (!mesh.userData.nkdNoNormals) return
+    if (autoSmooth.value) gridSmoothNormals(geo, weldCell(geo), 1, false)
+    else geo.deleteAttribute('normal') // back to how it loaded: no normals, flat by spec
+    const mat: any = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
+    if (mat) { mat.flatShading = !autoSmooth.value; mat.needsUpdate = true }
+  })
+}
+watch(autoSmooth, () => { applyAutoSmooth(); applySmoothNormals() })
 
 /** Smooth the faceted shading of a splat-derived mesh. Reversible (pristine geometry stashed,
  *  restored at 0). Runs on a clone so the original normals survive. Always uses the grid average:
@@ -1309,6 +1341,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
         }
       })
       logModelMaterials()
+      applyAutoSmooth() // before Unbake/Smooth: both read the normals this may have just written
       applyUnbake() // re-apply if Unbake was left on for the previous model
       applySmoothNormals()
     }
@@ -1913,9 +1946,18 @@ function syncDepthUI() {
   dNearUI.value = bgDepthMaterial.uniforms.dNear.value
   dFarUI.value = bgDepthMaterial.uniforms.dFar.value
 }
+/** Both entry points (the Depth tab and the Occlude tab, where the post-invert grey is what
+ *  the band keys off) route through here, so there is one state and one fold-back. */
 function setDepthInvertUI(b: boolean) {
   depthInvertUI.value = b
   bgDepthMaterial.uniforms.invert.value = b ? 1 : 0
+  emit('widget', 'scene_depth_invert', b)
+}
+/** Which curve the map's grey follows, so the object can be remapped onto it. The node's combo
+ *  is the persisted form, hence the string rather than the boolean used everywhere else here. */
+function setDepthSpace(inverse: boolean) {
+  sceneDepthInverseSpace.value = inverse
+  emit('widget', 'scene_depth_space', inverse ? 'inverse (disparity)' : 'linear (metric)')
 }
 function setOccFrom(v: number) { occFrom.value = v; bgDepthMaterial.uniforms.occFrom.value = v }
 function setOccTo(v: number) { occTo.value = v; bgDepthMaterial.uniforms.occTo.value = v }
@@ -1927,7 +1969,7 @@ async function loadScene(payload: any) {
   await setSceneDepth(payload.scene_depth ?? null)
   bgDepthMaterial.uniforms.invert.value = payload.scene_depth_invert ? 1 : 0
   // Still tracked for the depth EXPORT's object-tone remap (linearDepthMaterial), not occlusion.
-  sceneDepthInverseSpace = payload.scene_depth_inverse_space !== false
+  sceneDepthInverseSpace.value = payload.scene_depth_inverse_space !== false
   if (typeof payload.scene_depth_near === 'number') {
     bgDepthMaterial.uniforms.dNear.value = payload.scene_depth_near
   }
@@ -2022,8 +2064,11 @@ function serialise(): string {
     // the first run pushes them back.
     dNear: dNearUI.value,
     dFar: dFarUI.value,
+    depthInvert: depthInvertUI.value,
+    depthInverseSpace: sceneDepthInverseSpace.value,
     unbake: unbake.value,
     smooth: smooth.value,
+    autoSmooth: autoSmooth.value,
     lights: lights.map((c) => ({ ...c })),
     object: {
       pos: { ...objPos },
@@ -2066,6 +2111,11 @@ function deserialise(json: string) {
     if (typeof s.occlude === 'boolean') occlude.value = s.occlude
     if (typeof s.unbake === 'boolean') unbake.value = s.unbake
     if (typeof s.smooth === 'number') { smooth.value = s.smooth; applySmoothNormals() }
+    // Absent in workflows saved before auto-smooth existed: those keep the default (on), so a
+    // normal-less mesh that used to render faceted now renders smooth. The watcher re-applies.
+    if (typeof s.autoSmooth === 'boolean') autoSmooth.value = s.autoSmooth
+    if (typeof s.depthInvert === 'boolean') setDepthInvertUI(s.depthInvert)
+    if (typeof s.depthInverseSpace === 'boolean') setDepthSpace(s.depthInverseSpace)
     if (typeof s.occFrom === 'number') setOccFrom(s.occFrom)
     if (typeof s.occTo === 'number') setOccTo(s.occTo)
     if (typeof s.depthView === 'boolean') depthView.value = s.depthView
@@ -2276,6 +2326,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         <label class="nkd-check" title="For baked/unlit models (Tripo, splat→mesh): move the texture to albedo so the object takes lights and shadows">
           <input type="checkbox" v-model="unbake"> Unbake → relight
         </label>
+        <label class="nkd-check" title="Meshes that ship no normals (Hunyuan3D and most mesh exporters) are flat-shaded by the glTF spec — hard facets. This averages them into smooth vertex normals, like a DCC's auto-smooth. Meshes with authored normals are left untouched. Off = the faceted low-poly look.">
+          <input type="checkbox" v-model="autoSmooth"> Auto-smooth normals
+        </label>
         <label title="Diffuse the surface normals to soften bumpy splat-mesh shading. 0 = original; higher = smoother (and slower — it's a full mesh pass per step). Applied on release. Needs Unbake (lit material) to show.">Smooth<input type="range" min="0" max="200" step="5" v-model.number="smooth" @change="applySmoothNormals()"><span>{{ smooth }}</span></label>
       </div>
       </div>
@@ -2336,7 +2389,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
           ? 'Keep the range fitted to the injected map against the fSpy ground plane, re-fitting as the camera moves. Off freezes the last fit.'
           : 'Keep the range fitted to the object\'s own distance span, re-fitting as the camera moves. Off freezes the last fit.'">Auto Z</button>
       </div>
-      <div class="nkd-obj-row">
+      <div class="nkd-obj-row nkd-obj-wrap">
         <label class="nkd-check" title="Show the depth pass itself in the viewport — the exact render the depth output gets">
           <input type="checkbox" v-model="depthView"> Preview
         </label>
@@ -2345,6 +2398,17 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         </label>
         <label v-if="!hasSceneDepth && !autoZ" class="nkd-check" title="Off: the depth output auto-fits to the model, so its range drifts with every orbit. On: it uses Near/Far above, like the scene-map path.">
           <input type="checkbox" v-model="depthManual"> Manual range
+        </label>
+        <label class="nkd-check" title="On if your depth map reads FAR as white. This node's own depth output, and most disparity maps, read near as white. Also drives the Occlude band, which keys off the post-invert grey.">
+          <input type="checkbox" :checked="depthInvertUI"
+                 @change="setDepthInvertUI(($event.target as HTMLInputElement).checked)"> Invert map
+        </label>
+        <label class="nkd-check nkd-spacesel" title="Which curve turns distance into grey for the OBJECT, so it composites onto your map instead of fighting it. Depth Anything, MiDaS and most monocular estimators emit disparity (grey follows 1/z); pick metric only for a map that is linear in distance. Get it wrong and the object sits at the wrong grey even when its 3D distance is right.">Space
+          <select :value="sceneDepthInverseSpace ? 'inv' : 'lin'"
+                  @change="setDepthSpace(($event.target as HTMLSelectElement).value === 'inv')">
+            <option value="inv">disparity</option>
+            <option value="lin">metric</option>
+          </select>
         </label>
       </div>
       <div class="nkd-obj-row nkd-depth-info">
@@ -2474,6 +2538,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
   color: #c8d0e0; font-size: 11px; padding: 2px 5px;
 }
 .nkd-obj-row select:focus { outline: none; border-color: #4ab4ff; }
+/* One row of controls, so it has to survive a narrow node instead of running off the edge. */
+.nkd-obj-wrap { flex-wrap: wrap; row-gap: 3px; }
+.nkd-spacesel { display: flex; align-items: center; gap: 4px; }
+/* The generic rule above makes a select fill its row (width:0; flex:1) — right for the pivot
+   picker that owns a row, wrong for one sharing a row with four checkboxes. */
+.nkd-obj-row .nkd-spacesel select { flex: 0 0 auto; width: auto; min-width: 74px; }
 .nkd-obj-row :deep(.nkd-drag), .nkd-barfield :deep(.nkd-drag) {
   position: relative;
   flex: 1 1 0; min-width: 0; width: 0;
