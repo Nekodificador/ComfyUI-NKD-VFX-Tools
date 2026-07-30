@@ -19,7 +19,7 @@ import { smoothNormalsByPosition } from './smooth_normals'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
-import { defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 
 // Scrub-drag number field, the only control that works on a LiteGraph canvas: HORIZONTAL
 // drag to change (vertical sliders fight the canvas), Shift while dragging = ×0.1 fine
@@ -117,9 +117,19 @@ const props = defineProps<{ apiBase: string; aspect: { w: number; h: number } }>
 const emit = defineEmits<{
   calibrated: [near: number, far: number]
   widget: [name: string, value: unknown]
+  popout: []
 }>()
 
 const host = ref<HTMLDivElement | null>(null)
+// Popped out into the shared NKD modal: same live instance, moved there by the node entry
+// (verified: re-parenting the mount container keeps the WebGL context, the loaded model and
+// the camera — no second renderer, no reload). Only the LAYOUT changes.
+const popped = ref(false)
+const viewWrap = ref<HTMLDivElement | null>(null)
+// Letterbox size in the popped layout. The export aspect stays the contract — filling a
+// viewport-shaped box would frame something other than what the node actually outputs.
+const fitW = ref(0)
+const fitH = ref(0)
 const showGrid = ref(true)
 const status = ref('')
 // Camera lock. A solved camera (fSpy) is a match to the plate — one stray orbit
@@ -168,7 +178,7 @@ const occTo = ref(1.0)
 // Auto Z always used. Mirrors of the uniforms, which Vue cannot observe.
 const dNearUI = ref(1)
 const dFarUI = ref(30)
-const depthView = ref(true)    // paint the depth pass in the viewport while the tab is open
+const depthView = ref(true)    // paint the depth pass in the viewport while the panel is open
 const showRange = ref(true)    // draw where the near/far planes cut the ground
 // Auto Z as a MODE, not a one-shot: the fit depends on where the camera is (the object's
 // distance with no map; the floor rays with one), so orbiting invalidates it the moment it
@@ -210,6 +220,10 @@ const objRot = reactive({ x: 0, y: 0, z: 0 }) // degrees
 const objScale = ref(1)
 const pivotMode = ref<'bottom' | 'center' | 'origin'>('bottom')
 const gizmoMode = ref<'off' | 'translate' | 'rotate' | 'scale'>('off')
+// Which axes the gizmo hands you: the world's, or the object's own. three's own default is
+// 'world'. NOTE it has no say over Scale — TransformControls hard-codes `space = 'local'` for
+// scale mode ("scale always oriented to local rotation"), so this only moves Move and Rotate.
+const gizmoSpace = ref<'world' | 'local'>('world')
 // Splat→mesh converters (Tripo & co.) often ship the texture baked into an UNLIT material or the
 // emissive channel, so the object self-lights and ignores shadows. Unbake rebuilds a lit
 // MeshStandard using that texture as albedo, so lights and shadows land on it.
@@ -265,6 +279,17 @@ let depthPixels: { data: Uint8ClampedArray; w: number; h: number } | null = null
 // Depth panel can show it — renderDepthPass reads it into the uniform on every pass anyway.
 const sceneDepthInverseSpace = ref(true)
 const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (plain let, not reactive)
+
+/** Is this panel ON SCREEN — one definition, used by the template AND by everything that has to
+ *  react to a panel appearing. They used to be separate: the template asked `popped || tab`, the
+ *  render loop and the light-joystick redraw asked `tab` alone. Identical while tabs were the only
+ *  way to show a panel, and silently wrong the moment the sidebar showed all four at once (the
+ *  depth preview never painted, and the light sphere stayed blank until you dragged it). */
+const objectPanelOpen = computed(() => popped.value || activePanel.value === 'object')
+const lightPanelOpen = computed(() => popped.value || activePanel.value === 'light')
+const depthPanelOpen = computed(() => popped.value || activePanel.value === 'depth')
+const occludePanelOpen = computed(() =>
+  (popped.value && hasSceneDepth.value) || activePanel.value === 'occlude')
 
 const DEPTH_FRAG = `
 uniform sampler2D depthMap;
@@ -620,7 +645,9 @@ function onSphereDown(e: PointerEvent) {
 }
 
 // The panel is v-if'd, so the canvas only exists while it is open.
-watch(activePanel, (p) => { if (p === 'light') void nextTick(drawSphere) })
+// The canvas only exists once the panel is in the DOM, so the redraw has to follow the panel
+// being SHOWN — not the tab being clicked, which never happens in the sidebar.
+watch(lightPanelOpen, (on) => { if (on) void nextTick(drawSphere) }, { immediate: true })
 
 /** The backdrop as an environment, so the model picks up the scene's colour.
  *  A flat photo is not a 360 capture — this is a colour cast, not true reflections. */
@@ -995,9 +1022,9 @@ function loop() {
   const s = lgScale()
   if (Math.abs(s - lastScale) > 0.001) { lastScale = s; resize() }
   if (contact.value && contactDirty) { renderContactShadow(); contactDirty = false }
-  // The Depth tab shows the depth pass itself rather than a second little canvas: same
+  // The Depth panel shows the depth pass itself rather than a second little canvas: same
   // code as the export, full size, and the range gizmo drawn over it.
-  if (activePanel.value === 'depth') {
+  if (depthPanelOpen.value) {
     updateDepthGizmo()
     if (depthView.value) renderDepthPass(false)
     else renderFrame()
@@ -1028,15 +1055,31 @@ function resize() {
   const r = renderer.value
   const el = host.value
   if (!r || !el) return
-  const w = el.clientWidth
-  const h = el.clientHeight || Math.round((w * props.aspect.h) / props.aspect.w)
+  // Popped out the box no longer derives its height from the node width, so fit the export
+  // aspect into whatever the modal gives us. Computed here rather than left to CSS because
+  // the renderer needs the number NOW — reading it back off the element would race Vue's
+  // style flush, and the fitted size is what we just decided anyway.
+  if (popped.value && viewWrap.value) {
+    const bw = viewWrap.value.clientWidth, bh = viewWrap.value.clientHeight
+    if (bw > 1 && bh > 1) {
+      const s = Math.min(bw / props.aspect.w, bh / props.aspect.h)
+      fitW.value = Math.floor(props.aspect.w * s)
+      fitH.value = Math.floor(props.aspect.h * s)
+    }
+  } else if (fitW.value) { fitW.value = 0; fitH.value = 0 }
+  const w = popped.value && fitW.value ? fitW.value : el.clientWidth
+  const h = popped.value && fitH.value ? fitH.value
+    : (el.clientHeight || Math.round((w * props.aspect.h) / props.aspect.w))
   if (w < 1 || h < 1) return
   // The displayed size is clientWidth × the LiteGraph canvas zoom (a CSS transform that
   // clientWidth doesn't see). Render at dpr × zoom × 2 so the buffer matches the on-screen
   // pixels with 2× supersampling — crisp at any zoom. Capped so a big zoom can't allocate a
   // giant target. updateStyle=false keeps the canvas CSS at 100%; only the backing buffer grows.
   const MAX_BUF = 4096
-  const target = Math.min(window.devicePixelRatio, 2) * lgScale() * 2
+  // In the modal the widget is out of the LiteGraph canvas, so its zoom transform no longer
+  // applies — feeding it here would size the buffer for a scale nothing is drawing at.
+  const MAX_BUF_SCALE = popped.value ? 1 : lgScale()
+  const target = Math.min(window.devicePixelRatio, 2) * MAX_BUF_SCALE * 2
   const ratio = Math.max(0.5, Math.min(target, MAX_BUF / Math.max(w, h)))
   r.setPixelRatio(ratio)
   r.setSize(w, h, false)
@@ -1514,6 +1557,19 @@ function readbackGizmo() {
   objPos.z = +(g.position.z - pivotP.z + off.z).toFixed(4)
   contactDirty = true
 }
+
+/** Re-selecting the active mode turns the gizmo OFF. That toggle is the only way to dismiss it
+ *  now that Q switches space, so it has to behave identically from a button and from a key —
+ *  which is why it lives here instead of being written out at each of the seven call sites. */
+function toggleGizmoMode(m: 'translate' | 'rotate' | 'scale') {
+  setGizmoMode(gizmoMode.value === m ? 'off' : m)
+}
+
+function setGizmoSpace(s: 'world' | 'local') {
+  gizmoSpace.value = s
+  transformControls?.setSpace(s)
+}
+function toggleGizmoSpace() { setGizmoSpace(gizmoSpace.value === 'world' ? 'local' : 'world') }
 
 function setGizmoMode(m: 'off' | 'translate' | 'rotate' | 'scale') {
   gizmoMode.value = m
@@ -2075,6 +2131,7 @@ function serialise(): string {
       rot: { ...objRot },
       scale: objScale.value,
       pivot: pivotMode.value,
+      gizmoSpace: gizmoSpace.value,
     },
   })
 }
@@ -2156,6 +2213,8 @@ function deserialise(json: string) {
       if (o.rot) Object.assign(objRot, o.rot)
       if (typeof o.scale === 'number') objScale.value = o.scale
       if (o.pivot === 'bottom' || o.pivot === 'center' || o.pivot === 'origin') pivotMode.value = o.pivot
+      // Absent in workflows saved before the toggle existed: those keep three's default, world.
+      if (o.gizmoSpace === 'world' || o.gizmoSpace === 'local') setGizmoSpace(o.gizmoSpace)
       // The model may not be loaded yet — setModel recomputes the pivot and re-applies.
       recomputePivot()
       applyObjectTransform()
@@ -2169,7 +2228,42 @@ function deserialise(json: string) {
   }
 }
 
+/** Maya's tool cluster: Q select, W move, E rotate, R scale.
+ *
+ *  Q and E are free, but **w and r are ComfyUI's** (`Workspace.ToggleSidebarTab.workflows` and
+ *  `Comfy.RefreshNodeDefinitions` — checked against the shipped keybinding table, not guessed).
+ *  Refresh in particular is the one that re-runs beforeRegisterNodeDef, so letting it through
+ *  would be actively harmful. The handler therefore has to CONSUME the key.
+ *
+ *  That is why it listens on `window` in CAPTURE: ComfyUI binds on `document` (one capture, one
+ *  bubble), and window precedes document on the way down, so this runs first whatever the
+ *  registration order. Scope keeps it polite — only while the pointer is over the viewport, or
+ *  while the modal is open — so the keys behave exactly as they do in a DCC and stay ComfyUI's
+ *  everywhere else. */
+const GIZMO_KEYS: Record<string, 'translate' | 'rotate' | 'scale'> = {
+  w: 'translate', e: 'rotate', r: 'scale',
+}
+let pointerInView = false
+function onViewEnter() { pointerInView = true }
+function onViewLeave() { pointerInView = false }
+function onGizmoKey(ev: KeyboardEvent) {
+  if (!popped.value && !pointerInView) return
+  if (ev.repeat || ev.ctrlKey || ev.altKey || ev.metaKey || ev.shiftKey) return
+  const key = (ev.key || '').toLowerCase()
+  const mode = GIZMO_KEYS[key]
+  if (!mode && key !== 'q') return
+  // Typing a value into a DragNumber must stay typing — 'w' is a character there, not a tool.
+  const el = document.activeElement as HTMLElement | null
+  if (el && (el.isContentEditable || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
+             el.tagName === 'SELECT')) return
+  ev.preventDefault()
+  ev.stopPropagation()
+  if (mode) toggleGizmoMode(mode)
+  else toggleGizmoSpace()
+}
+
 function cleanup() {
+  window.removeEventListener('keydown', onGizmoKey, true)
   detachFine?.()
   detachGizmoFine?.()
   cancelAnimationFrame(raf)
@@ -2221,6 +2315,9 @@ onMounted(() => {
   // Transform gizmo: drag the object in the viewport. r0.18x's TransformControls is a Controls
   // (not an Object3D) — add its getHelper() to the scene, not the control itself.
   transformControls = new TransformControls(camera, r.domElement)
+  // deserialise() can restore a space before this exists (same reason applyControlsEnabled is
+  // re-run after the OrbitControls are built), so push the current value in now.
+  transformControls.setSpace(gizmoSpace.value)
   transformControls.addEventListener('dragging-changed', (e: any) => {
     gizmoDragging = !!e.value        // don't orbit while dragging a handle
     applyControlsEnabled()           // …without clobbering the camera lock
@@ -2270,24 +2367,40 @@ onMounted(() => {
 
   ro = new ResizeObserver(() => resize())
   ro.observe(el)
+  // Popped out the view's size is DERIVED from the wrapper, so observing only the view would
+  // never see the modal being resized — the box that changes is the one above it.
+  if (viewWrap.value) ro.observe(viewWrap.value)
+  window.addEventListener('keydown', onGizmoKey, true)
   resize()
   loop()
 })
 
 onBeforeUnmount(cleanup)
 
-defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize })
+/** The node entry moves the container; this only switches the layout and re-fits the canvas.
+ *  Two frames of slack: the element has to land in its new parent and be laid out before the
+ *  fit can measure anything (a fit against a 0-wide box is the documented NaN/blank trap). */
+function setPopped(b: boolean) {
+  popped.value = b
+  requestAnimationFrame(() => requestAnimationFrame(() => resize()))
+}
+
+defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize, setPopped })
 </script>
 
 <template>
-  <div class="nkd-p3d">
+  <div class="nkd-p3d" :class="{ 'nkd-popped': popped }">
     <div class="nkd-bar">
-      <button :class="{ on: activePanel === 'object' }" @click="togglePanel('object')">Object</button>
-      <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
-      <button :class="{ on: activePanel === 'depth' }" @click="togglePanel('depth')"
-        title="Depth output: near/far range, live preview and Auto Z">Depth</button>
-      <button v-if="hasSceneDepth" :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
-        title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
+      <!-- The tabs only exist to ration a node's width. In the sidebar every panel is already
+           on screen, so they would just be four buttons that do nothing, eating viewport height. -->
+      <template v-if="!popped">
+        <button :class="{ on: activePanel === 'object' }" @click="togglePanel('object')">Object</button>
+        <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
+        <button :class="{ on: activePanel === 'depth' }" @click="togglePanel('depth')"
+          title="Depth output: near/far range, live preview and Auto Z">Depth</button>
+        <button v-if="hasSceneDepth" :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
+          title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
+      </template>
       <label class="nkd-barfield" :title="hasCamera
         ? 'Vertical field of view. A solved camera drives this — the next run puts its lens back.'
         : 'Vertical field of view, in degrees. Drag to scrub, click to type.'">FOV
@@ -2303,7 +2416,56 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
              title="Backdrop colour, exported in the image output — it is what shows through the holes of a mesh with alpha (MoGe, DA3). A wired bg_image covers it.">
       <span v-if="status" class="nkd-status">{{ status }}</span>
     </div>
-    <div v-if="activePanel === 'light'" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+    <!-- Panels stay BETWEEN the bar and the view in DOM order, so the stacked node layout is
+         byte-for-byte what it was. Popped out, this wrapper becomes the right-hand sidebar and
+         every panel shows at once — the tabs only exist because a node is too narrow for that. -->
+    <div class="nkd-side">
+    <!-- Order here IS the sidebar order, and it matches the tab order: transform, light, depth,
+         occlude. Done by moving the block rather than with CSS `order`, so what the DOM reads
+         is what the screen shows. Harmless for the node, where only one panel exists at a time. -->
+    <div v-if="objectPanelOpen" class="nkd-panel" @pointerdown.stop @wheel.stop>
+      <div class="nkd-obj">
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Gizmo</span>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'translate' }" @click="toggleGizmoMode('translate')">Move</button>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'rotate' }" @click="toggleGizmoMode('rotate')">Rotate</button>
+          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'scale' }" @click="toggleGizmoMode('scale')">Scale</button>
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Axes</span>
+          <button class="nkd-gizmo" :class="{ on: gizmoSpace === 'world' }" @click="setGizmoSpace('world')"
+                  title="Gizmo handles follow the WORLD axes. Toggle with Q over the viewport.">World</button>
+          <button class="nkd-gizmo" :class="{ on: gizmoSpace === 'local' }" @click="setGizmoSpace('local')"
+                  title="Gizmo handles follow the OBJECT's own axes — which is also how the Rot fields compose. Toggle with Q over the viewport.">Local</button>
+          <span class="nkd-obj-hint" v-if="gizmoMode === 'scale'">Scale is always local</span>
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Pivot</span>
+          <select :value="pivotMode" @change="setPivotMode(($event.target as HTMLSelectElement).value as any)">
+            <option value="bottom">Bottom</option>
+            <option value="center">Center</option>
+            <option value="origin">Origin</option>
+          </select>
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Pos</span>
+          <DragNumber :model-value="objPos.x" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.x = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objPos.y" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.y = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objPos.z" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.z = v; applyObjectTransform() }" />
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Rot</span>
+          <DragNumber :model-value="objRot.x" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.x = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objRot.y" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.y = v; applyObjectTransform() }" />
+          <DragNumber :model-value="objRot.z" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.z = v; applyObjectTransform() }" />
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Scale</span>
+          <DragNumber :model-value="objScale" :step="0.005" :min="0.001" :decimals="3" :reset-to="1" @update:model-value="(v: number) => { objScale = v; applyObjectTransform() }" />
+        </div>
+      </div>
+    </div>
+    <div v-if="lightPanelOpen" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
       <div class="nkd-light-main">
       <div class="nkd-sphere-box">
         <canvas ref="sphereCv" width="92" height="92" class="nkd-sphere" @pointerdown="onSphereDown" />
@@ -2370,7 +2532,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         </div>
       </div>
     </div>
-    <div v-if="activePanel === 'depth'" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+    <div v-if="depthPanelOpen" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
       <div class="nkd-obj-row">
         <span class="nkd-obj-tag">{{ autoZ ? 'Offset' : 'Range' }}</span>
         <label class="nkd-barfield" :title="autoZ
@@ -2419,7 +2581,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         <span v-else-if="!hasSceneDepth && !depthManual && !autoZ">auto-fit to model — Near/Far unused</span>
       </div>
     </div>
-    <div v-if="activePanel === 'occlude'" class="nkd-panel" @pointerdown.stop @wheel.stop>
+    <div v-if="occludePanelOpen" class="nkd-panel" @pointerdown.stop @wheel.stop>
       <div class="nkd-sliders">
         <label class="nkd-check"><input type="checkbox" v-model="occlude"> Occlusion (depth-key matte)</label>
         <label title="Front of the occluding grey band. Near reads as white, so a band ending at 1 keys out the foreground">From<input type="range" min="0" max="1" step="0.01" v-model.number="occFrom" :disabled="!occlude" @input="setOccFrom(occFrom)"><span>{{ occFrom.toFixed(2) }}</span></label>
@@ -2427,45 +2589,17 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
         <label class="nkd-check"><input type="checkbox" :checked="depthInvertUI" @change="setDepthInvertUI(($event.target as HTMLInputElement).checked)"> Invert depth map</label>
       </div>
     </div>
-    <div v-if="activePanel === 'object'" class="nkd-panel" @pointerdown.stop @wheel.stop>
-      <div class="nkd-obj">
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Gizmo</span>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'translate' }" @click="setGizmoMode(gizmoMode === 'translate' ? 'off' : 'translate')">Move</button>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'rotate' }" @click="setGizmoMode(gizmoMode === 'rotate' ? 'off' : 'rotate')">Rotate</button>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'scale' }" @click="setGizmoMode(gizmoMode === 'scale' ? 'off' : 'scale')">Scale</button>
-        </div>
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Pivot</span>
-          <select :value="pivotMode" @change="setPivotMode(($event.target as HTMLSelectElement).value as any)">
-            <option value="bottom">Bottom</option>
-            <option value="center">Center</option>
-            <option value="origin">Origin</option>
-          </select>
-        </div>
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Pos</span>
-          <DragNumber :model-value="objPos.x" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.x = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objPos.y" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.y = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objPos.z" :step="0.01" :reset-to="0" @update:model-value="(v: number) => { objPos.z = v; applyObjectTransform() }" />
-        </div>
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Rot</span>
-          <DragNumber :model-value="objRot.x" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.x = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objRot.y" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.y = v; applyObjectTransform() }" />
-          <DragNumber :model-value="objRot.z" :step="0.5" :decimals="1" :reset-to="0" @update:model-value="(v: number) => { objRot.z = v; applyObjectTransform() }" />
-        </div>
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Scale</span>
-          <DragNumber :model-value="objScale" :step="0.005" :min="0.001" :decimals="3" :reset-to="1" @update:model-value="(v: number) => { objScale = v; applyObjectTransform() }" />
-        </div>
-      </div>
     </div>
+    <div class="nkd-viewwrap" ref="viewWrap">
     <div
       ref="host"
       class="nkd-view"
-      :style="{ aspectRatio: `${aspect.w} / ${aspect.h}` }"
+      :style="popped && fitW
+        ? { aspectRatio: `${aspect.w} / ${aspect.h}`, width: fitW + 'px', height: fitH + 'px' }
+        : { aspectRatio: `${aspect.w} / ${aspect.h}` }"
       @contextmenu.prevent
+      @pointerenter="onViewEnter"
+      @pointerleave="onViewLeave"
     >
       <div class="nkd-overlay" @pointerdown.stop>
         <!-- PrimeIcons, not emoji: ComfyUI already ships the font, so these are
@@ -2485,7 +2619,37 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
                   : 'Camera free — click to lock it'">
           <i :class="camLocked ? 'pi pi-lock' : 'pi pi-lock-open'" />
         </button>
+        <!-- Gizmo controls, mirrored from the Object panel: same call, same toggle-off, one state.
+             Reaching them without opening a panel is the point — the panel covers the model.
+             Left to right they follow the KEYS: Q W E R. -->
+        <span class="nkd-ovsep" />
+        <button :class="{ on: gizmoSpace === 'local' }" @click="toggleGizmoSpace"
+                :title="(gizmoSpace === 'world'
+                  ? 'Gizmo axes: WORLD — click for the object\'s own axes'
+                  : 'Gizmo axes: LOCAL, the object\'s own — click for world axes')
+                  + ' — Q (hover the viewport). Does not affect Scale: three always orients scale to the object.'">
+          <i :class="gizmoSpace === 'world' ? 'pi pi-globe' : 'pi pi-box'" />
+        </button>
+        <button :class="{ on: gizmoMode === 'translate' }" title="Move gizmo — W (hover the viewport)"
+                @click="toggleGizmoMode('translate')">
+          <i class="pi pi-arrows-alt" />
+        </button>
+        <button :class="{ on: gizmoMode === 'rotate' }" title="Rotate gizmo — E (hover the viewport)"
+                @click="toggleGizmoMode('rotate')">
+          <i class="pi pi-refresh" />
+        </button>
+        <button :class="{ on: gizmoMode === 'scale' }" title="Scale gizmo — R (hover the viewport)"
+                @click="toggleGizmoMode('scale')">
+          <i class="pi pi-arrow-up-right-and-arrow-down-left-from-center" />
+        </button>
       </div>
+      <div class="nkd-overlay nkd-overlay-r" @pointerdown.stop>
+        <button v-if="!popped" @click="emit('popout')"
+                title="Open in a large viewer — same scene, nothing reloads">
+          <i class="pi pi-window-maximize" />
+        </button>
+      </div>
+    </div>
     </div>
   </div>
 </template>
@@ -2532,6 +2696,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
 .nkd-obj { flex: 1 1 auto; min-width: 0; display: grid; gap: 3px; }
 .nkd-obj-row { display: flex; align-items: center; gap: 5px; }
 .nkd-obj-tag { color: rgba(255, 255, 255, 0.45); font-size: 10px; flex: 0 0 34px; }
+.nkd-obj-hint { color: rgba(255, 255, 255, 0.35); font-size: 9px; white-space: nowrap; }
 .nkd-obj-row select {
   flex: 1 1 0; min-width: 0; width: 0;
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
@@ -2592,9 +2757,40 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize 
    from the canvas instead (height:auto) feeds the canvas's own attributes back into
    layout: a first frame sized 1x1 before the element has a width renders a giant square. */
 .nkd-view { position: relative; width: 100%; flex: 0 0 auto; overflow: hidden; background: #111318; font-size: 0; }
+
+/* ── Popped out: viewport left, every panel stacked in a sidebar on the right ──────────
+   A grid rather than a row, so the DOM order (bar → panels → view) that the node layout
+   depends on can stay exactly as it is while the pieces land in different cells. */
+.nkd-popped {
+  display: grid; height: 100%; min-height: 0;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+/* Everything that is not the picture lives in the right column: the bar on top of the panels,
+   and the viewport spanning both rows so it gets the modal's full height. */
+.nkd-popped .nkd-bar {
+  grid-column: 2; grid-row: 1; flex-wrap: wrap; row-gap: 4px;
+  border-left: 1px solid #3a3d46; border-bottom: 1px solid #3a3d46;
+}
+.nkd-popped .nkd-side {
+  grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto;
+  background: #1a1c22; border-left: 1px solid #3a3d46;
+}
+.nkd-popped .nkd-viewwrap {
+  grid-column: 1; grid-row: 1 / span 2; min-width: 0; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+/* The status has no room to push to the far edge in a 300px column. */
+.nkd-popped .nkd-status { margin-left: 0; flex: 1 1 100%; }
+/* The panels are dividers in a column now, not a strip above the canvas. */
+.nkd-popped .nkd-side .nkd-panel { border-bottom: 1px solid #2a2d36; }
+.nkd-popped .nkd-side .nkd-panel:last-child { border-bottom: none; }
 .nkd-view :deep(canvas) { width: 100%; height: 100%; display: block; }
 /* In-viewer controls: grid toggle + frame, kept out of the tab bar so it stays panel-only. */
 .nkd-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 4px; z-index: 5; }
+/* Pop-out sits opposite the view controls: it acts on the WINDOW, not on the scene. */
+.nkd-overlay-r { left: auto; right: 6px; }
+.nkd-ovsep { width: 1px; align-self: stretch; background: #3a3d46; margin: 0 2px; flex: 0 0 auto; }
 .nkd-overlay button {
   width: 24px; height: 24px; padding: 0; font-size: 13px; line-height: 1;
   display: flex; align-items: center; justify-content: center;

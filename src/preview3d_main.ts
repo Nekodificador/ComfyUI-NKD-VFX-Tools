@@ -12,13 +12,14 @@ import { api } from '../../scripts/api.js'
 import { createApp, h, reactive } from 'vue'
 
 import Preview3DWidget from './Preview3DWidget.vue'
+import { openNkdModal, type NkdModal } from './nkd_modal'
 
 const NODE_NAME = 'NKDPreview3D'
 const EXT_NAME = 'NKD.Preview3D.Vue'
 const EVENT_SCENE = 'nkd-preview3d-scene'
 
 // Version stamp: printed once at load so a cached stale bundle is immediately visible.
-const REV = 'rev 2026-07-24 (Smooth = Laplacian normal diffusion, range 0-200; debug log removed)'
+const REV = 'rev 2026-07-31 (pop-out viewer; auto-smooth normals; depth controls in the viewport)'
 console.log(`[NKD Preview 3D] ${REV}`)
 
 const VIEW_W = 360
@@ -142,8 +143,60 @@ comfyApp.registerExtension({
         setWidget(name, value)
         node.setDirtyCanvas(true, true)
       }
+      // ── Pop-out ────────────────────────────────────────────────────────────────────
+      // ONE live instance, moved. Verified with a probe before building on it: re-parenting
+      // the mount container with appendChild keeps the WebGL context (never lost), the loaded
+      // scene and the camera, and an orbit right after the move stays finite. A second
+      // renderer would mean reloading the model and two copies of every setting to keep in
+      // sync — the failure mode this pack keeps designing away from.
+      // NOTE this is NOT Vue's <Teleport>: teleporting the component's own root while the app
+      // stays mounted elsewhere is what broke fSpy's fullscreen. Moving the whole mount
+      // container is a different operation, and it holds.
+      let modal: NkdModal | null = null
+      let placeholder: HTMLDivElement | null = null
+      let nodeSlot: HTMLElement | null = null
+      const popOut = () => {
+        if (modal) return
+        modal = openNkdModal({
+          title: '😺 NKD Preview 3D',
+          hint: 'same scene as the node — orbit, light and frame it here',
+          onClose: () => {
+            // Put the viewport back before anything else: the node is left with a hole
+            // otherwise, and the widget's height is still reserved for it.
+            if (nodeSlot && container.parentElement !== nodeSlot) nodeSlot.appendChild(container)
+            container.style.height = ''  // back to the node's width×aspect formula
+            container.style.flex = ''
+            placeholder?.remove()
+            placeholder = null
+            modal = null   // cleared BEFORE the re-measure, which is a no-op while it is set
+            vp()?.setPopped(false)
+            requestAnimationFrame(() => { remeasureChrome(); node.setDirtyCanvas(true, true) })
+          },
+        })
+        // Leave something in the node's reserved row, or it reads as a broken empty box.
+        nodeSlot = container.parentElement as HTMLElement | null
+        if (nodeSlot) {
+          placeholder = document.createElement('div')
+          placeholder.textContent = 'Open in the viewer'
+          placeholder.style.cssText =
+            'display:flex;align-items:center;justify-content:center;width:100%;height:100%;' +
+            'box-sizing:border-box;color:rgba(255,255,255,0.35);font-size:11px;' +
+            'background:#111318;border:1px dashed #3a3d46;border-radius:4px;'
+          nodeSlot.appendChild(placeholder)
+        }
+        // In the node the height comes from width×aspect; in the modal it must fill the body,
+        // which is what lets the sidebar run full height and the viewport take the rest.
+        // .nkd-modal-body is a flex row, so claim the space as a flex child too.
+        container.style.height = '100%'
+        container.style.flex = '1 1 auto'
+        modal.body.appendChild(container)
+        vp()?.setPopped(true)
+      }
+
       const vueApp = createApp({
-        render: () => h(Preview3DWidget, { ref: 'vp', apiBase: api.apiURL(''), aspect, onCalibrated, onWidget }),
+        render: () => h(Preview3DWidget, {
+          ref: 'vp', apiBase: api.apiURL(''), aspect, onCalibrated, onWidget, onPopout: popOut,
+        }),
       })
       const mounted: any = vueApp.mount(container)
       const vp = () => mounted.$refs.vp
@@ -284,6 +337,10 @@ comfyApp.registerExtension({
       // when it changes — e.g. the Light panel opening/closing. offsetHeight, not
       // getBoundingClientRect: the latter includes the canvas zoom transform.
       const remeasureChrome = () => {
+        // Popped out, the panels are a full-height sidebar in the modal. Measuring THAT and
+        // feeding it to the node's height formula would inflate the node to the modal's size
+        // while its row is showing a placeholder. The node keeps the height it had.
+        if (modal) return
         const bar = container.querySelector('.nkd-bar') as HTMLElement | null
         const panel = container.querySelector('.nkd-panel') as HTMLElement | null
         const measured = (bar?.offsetHeight ?? 0) + (panel?.offsetHeight ?? 0) + 2
@@ -361,6 +418,9 @@ comfyApp.registerExtension({
       const origRemoved = node.onRemoved
       node.onRemoved = function () {
         api.removeEventListener(EVENT_SCENE, onScene)
+        // Deleting the node with the viewer open would otherwise leave an orphan overlay
+        // covering the screen with no way to shut it.
+        modal?.close()
         unclamp()
         chromeRO.disconnect()
         vp()?.cleanup()
