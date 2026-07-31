@@ -163,7 +163,11 @@ const shadowStr = ref(0.5)
 const contact = ref(false)
 const contactStr = ref(0.8)
 const contactBlur = ref(1.5)
-const contactSpread = ref(0.25) // fraction of object height that casts — low = tight AO contact
+// Height above the floor that casts, in SCENE UNITS. A contact is a physical distance — the
+// few centimetres where a sole, a blade tip or a cape hem is actually near the ground. It used
+// to be a fraction of the model's bounding box, which made it depend on the tallest thing in
+// the model: raising a sword thickened the slab and smeared its whole silhouette on the floor.
+const contactSlab = ref(0.05)
 // Occlusion is a MATTE (depth-key), not physical: the injected map is thresholded and the
 // chosen grey band hides the object — no 3D calibration. occFrom/occTo pick the band, invert
 // flips the map. Only meaningful with a scene_depth connected. Serialised with the widget.
@@ -680,13 +684,18 @@ function initContactShadow() {
   contactGroup.visible = false
   scene.add(contactGroup)
 
-  // 1×1 plane lying in XZ; scaled to the object footprint at render time.
+  // 1×1 plane lying in XZ; scaled to the object footprint at render time. This geometry maps
+  // u→+X and v→+Z, exactly how contactCam (looking up, up-vector +Z) records the footprint.
+  // Its winding faces DOWN, so it draws with BackSide — rotating it face-up instead would
+  // mirror Z and land the shadow front-to-back reversed (test_contact_shadow.mjs).
   const geo = new THREE.PlaneGeometry(1, 1).rotateX(Math.PI / 2)
   contactPlane = new THREE.Mesh(
     geo,
-    new THREE.MeshBasicMaterial({ map: contactRT.texture, transparent: true, depthWrite: false, opacity: 1 })
+    new THREE.MeshBasicMaterial({
+      map: contactRT.texture, transparent: true, depthWrite: false, opacity: 1,
+      side: THREE.BackSide,
+    })
   )
-  contactPlane.rotation.x = Math.PI // the depth buffer is captured upside down
   contactPlane.renderOrder = 2
   contactPlane.position.y = 0.001 // hair above the floor so it never z-fights the grid
   contactGroup.add(contactPlane)
@@ -702,8 +711,14 @@ function initContactShadow() {
 
   // MeshDepthMaterial patched to paint black with distance-faded alpha (near = dark).
   contactDepthMat = new THREE.MeshDepthMaterial()
-  contactDepthMat.depthTest = false
-  contactDepthMat.depthWrite = false
+  // Depth testing is what makes this an AO footprint rather than a silhouette: the camera
+  // looks UP, so nearest = closest to the ground, and each texel keeps the LOWEST surface
+  // above it. Without it the material is opaque-with-NormalBlending, which three resolves to
+  // NoBlending, so the last-drawn fragment simply overwrites — and three sorts opaque draws
+  // front-to-back, i.e. the HIGHEST geometry last. A cape hanging over the boots then erases
+  // their contact and stamps its own faint silhouette instead (test_contact_shadow.html).
+  contactDepthMat.depthTest = true
+  contactDepthMat.depthWrite = true
   const darkness = { value: contactStr.value }
   ;(contactDepthMat as any).userData.darkness = darkness
   contactDepthMat.onBeforeCompile = (shader) => {
@@ -730,14 +745,19 @@ function updateContactBounds() {
   const c = box.getCenter(new THREE.Vector3())
   const size = box.getSize(new THREE.Vector3())
   const foot = Math.max(size.x, size.z) * 1.15 + 0.02
-  // AO-style contact: capture only the LOWER slab of the object (contactSpread × height up
-  // from the floor). Arms/limbs above it are clipped, so the shadow stays a tight grounding
-  // footprint instead of the full spread-out silhouette.
-  const slab = Math.max(size.y * contactSpread.value, 0.03)
+  // AO-style contact: only the thin slab just above the object's base casts. Everything higher
+  // is clipped, so a tilted blade contributes its tip rather than sweeping its whole outline
+  // across the floor.
+  // The slab is measured from box.min.y, not from the floor: a model whose feet do not sit
+  // exactly on y=0 would otherwise lose its shadow entirely (measured: alpha 0 once lifted by
+  // more than the slab). Anchoring it to the base keeps the contact and lets it fade with
+  // height, which is what leaving the ground should look like.
+  // Capped at the model's own height: a slab taller than the object is just its full silhouette.
+  const slab = Math.min(Math.max(contactSlab.value, 1e-3), size.y || 1)
   contactGroup.position.set(c.x, 0, c.z)
   contactCam.left = -foot / 2; contactCam.right = foot / 2
   contactCam.top = foot / 2; contactCam.bottom = -foot / 2
-  contactCam.far = slab
+  contactCam.far = Math.max(box.min.y, 0) + slab
   contactCam.updateProjectionMatrix()
   contactPlane.scale.set(foot, 1, foot)
   contactBlurPlane.scale.set(foot, 1, foot)
@@ -770,9 +790,17 @@ function renderContactShadow() {
   const prevRT = r.getRenderTarget()
   const prevClear = r.getClearColor(new THREE.Color())
   const prevAlpha = r.getClearAlpha()
+  // Only the object may cast into the map. Everything else in the scene is UI that happens to
+  // be 3D — the transform gizmo, the light helpers, the depth range lines — and the override
+  // material strips their own look, so they land as plain dark blobs on the floor.
   const wasGrid = grid?.visible; const wasCatcher = shadowCatcher?.visible
-  if (grid) grid.visible = false // only the object should cast into the map
+  const wasGizmo = !!gizmoHelper?.visible; const wasRange = !!rangeGizmo?.visible
+  const wasHelpers = helpersVisible()
+  if (grid) grid.visible = false
   if (shadowCatcher) shadowCatcher.visible = false
+  if (gizmoHelper) gizmoHelper.visible = false
+  if (rangeGizmo) rangeGizmo.visible = false
+  setHelpersVisible(false)
   // Keep the group visible so the blur plane (its child) can render; hide only the
   // display plane so it doesn't capture itself into the depth map.
   contactGroup.visible = true
@@ -792,6 +820,9 @@ function renderContactShadow() {
   r.setClearColor(prevClear, prevAlpha)
   if (grid) grid.visible = !!wasGrid
   if (shadowCatcher) shadowCatcher.visible = !!wasCatcher
+  if (gizmoHelper) gizmoHelper.visible = wasGizmo
+  if (rangeGizmo) rangeGizmo.visible = wasRange
+  setHelpersVisible(wasHelpers)
   if (contactPlane) contactPlane.visible = true
   contactGroup.visible = contact.value
 }
@@ -1041,7 +1072,7 @@ watch(contact, (on) => {
   if (on) contactDirty = true
 })
 // Darkness/blur/spread changes only need a re-bake, not a transform recompute.
-watch([contactStr, contactBlur, contactSpread], () => { contactDirty = true })
+watch([contactStr, contactBlur, contactSlab], () => { contactDirty = true })
 
 /**
  * The box's height comes from CSS (aspect-ratio bound to the width/height widgets), so
@@ -1726,6 +1757,13 @@ function gizmoLightTarget(id: number) {
 function setHelpersVisible(v: boolean) {
   for (const e of lightObjs.values()) if (e.helper) e.helper.visible = v
 }
+/** They are only ever toggled as a group, so one of them speaks for all. Needed because
+ *  capture() hides them and then calls renderContactShadow, which must put back what it
+ *  found — restoring them to `true` there would bake the helpers into the exported frame. */
+function helpersVisible() {
+  for (const e of lightObjs.values()) if (e.helper) return e.helper.visible
+  return true
+}
 
 
 function cameraInfo() {
@@ -2106,7 +2144,7 @@ function serialise(): string {
     contact: contact.value,
     contactStr: contactStr.value,
     contactBlur: contactBlur.value,
-    contactSpread: contactSpread.value,
+    contactSlab: contactSlab.value,
     occlude: occlude.value,
     occFrom: occFrom.value,
     occTo: occTo.value,
@@ -2162,7 +2200,9 @@ function deserialise(json: string) {
     num(s.shadowStr, shadowStr)
     num(s.contactStr, contactStr)
     num(s.contactBlur, contactBlur)
-    num(s.contactSpread, contactSpread)
+    // Absolute since 2026-07-31. States saved before that carry `contactSpread`, a fraction of
+    // the model height, and are simply dropped — the slab is a taste knob, not worth a migration.
+    num(s.contactSlab, contactSlab)
     if (typeof s.shadows === 'boolean') shadows.value = s.shadows
     if (typeof s.contact === 'boolean') contact.value = s.contact
     if (typeof s.occlude === 'boolean') occlude.value = s.occlude
@@ -2484,7 +2524,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         </label>
         <label>Dark<input type="range" min="0" max="1" step="0.02" v-model.number="contactStr" :disabled="!contact"><span>{{ contactStr.toFixed(2) }}</span></label>
         <label>Blur<input type="range" min="0" max="8" step="0.1" v-model.number="contactBlur" :disabled="!contact"><span>{{ contactBlur.toFixed(1) }}</span></label>
-        <label>Size<input type="range" min="0.08" max="1" step="0.02" v-model.number="contactSpread" :disabled="!contact"><span>{{ contactSpread.toFixed(2) }}</span></label>
+        <label title="Height above the object's base that casts, in scene units. A contact is a physical distance: keep it to the few centimetres where soles, blade tips and hems are actually near the ground — anything higher smears its whole outline across the floor.">Slab<input type="range" min="0.005" max="0.5" step="0.005" v-model.number="contactSlab" :disabled="!contact"><span>{{ contactSlab.toFixed(3) }}</span></label>
         <label class="nkd-check" title="For baked/unlit models (Tripo, splat→mesh): move the texture to albedo so the object takes lights and shadows">
           <input type="checkbox" v-model="unbake"> Unbake → relight
         </label>
