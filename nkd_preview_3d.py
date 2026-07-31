@@ -99,6 +99,37 @@ def _string_to_model_ref(path: str) -> dict:
     return {"filename": name, "type": ftype, "subfolder": subfolder}
 
 
+def _trimesh_to_temp_glb(mesh) -> str:
+    """Write a live TRIMESH to a temp .glb so the viewport can fetch it. Returns the filename.
+
+    Vertex colours ride in `visual.vertex_attributes['color']`, and trimesh's own GLB exporter
+    assumes VEC4 there. Generators overwhelmingly emit RGB, and that combination does not quietly
+    degrade to a grey mesh — it RAISES (`cannot reshape array of size N into shape (4)`), which
+    would surface as a failed node. Promote the array to RGBA for the duration of the export.
+
+    Promoted in place and restored afterwards rather than on a copy: the mesh is the graph's
+    object, shared with anything else wired to that output, so neither a dtype change nor a
+    hundred-megabyte duplicate of a million-triangle mesh belongs here.
+    """
+    temp_dir = folder_paths.get_temp_directory()
+    os.makedirs(temp_dir, exist_ok=True)
+    filename = f"nkd_preview3d_{uuid.uuid4().hex}.glb"
+    path = os.path.join(temp_dir, filename)
+
+    attrs = getattr(getattr(mesh, "visual", None), "vertex_attributes", None)
+    colour = attrs.get("color") if attrs else None
+    promoted = colour is not None and np.asarray(colour).shape[-1] == 3
+    if promoted:
+        from trimesh.visual.color import to_rgba  # only reachable when a trimesh actually arrived
+        attrs["color"] = to_rgba(np.asarray(colour))
+    try:
+        mesh.export(path, file_type="glb")
+    finally:
+        if promoted:
+            attrs["color"] = colour
+    return filename
+
+
 def _outputs_are_consumed(prompt, unique_id) -> bool:
     """Whether any node in the prompt reads an output of node `unique_id`.
 
@@ -211,13 +242,9 @@ class NKDPreview3D(io.ComfyNode):
             model_file.save_to(os.path.join(folder_paths.get_temp_directory(), filename))
             model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
         elif not isinstance(model_file, str) and hasattr(model_file, "export"):
-            # TRIMESH (Hunyuan3D wrapper): a live trimesh.Trimesh. Its own exporter
-            # writes the same .glb Hy3DExportMesh would, textures included.
-            temp_dir = folder_paths.get_temp_directory()
-            os.makedirs(temp_dir, exist_ok=True)
-            filename = f"nkd_preview3d_{uuid.uuid4().hex}.glb"
-            model_file.export(os.path.join(temp_dir, filename), file_type="glb")
-            model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
+            # TRIMESH (Hunyuan3D wrapper): a live trimesh.Trimesh, exported by its own writer.
+            model_ref = {"filename": _trimesh_to_temp_glb(model_file),
+                         "type": "temp", "subfolder": ""}
         elif model_file:
             model_ref = _string_to_model_ref(str(model_file))
         else:
@@ -346,6 +373,32 @@ def demo():
             assert _string_to_model_ref("nope.glb")["type"] == "input", "missing file keeps the old default"
         finally:
             folder_paths.get_input_directory, folder_paths.get_output_directory = orig
+
+    # A TRIMESH carrying RGB vertex colours must come out as COLOR_0, not as an exception, and
+    # the caller's mesh must be handed back exactly as it arrived — it is the graph's object.
+    try:
+        import trimesh
+    except ImportError:
+        print("  (trimesh not installed — skipping the TRIMESH colour check)")
+    else:
+        import struct
+        verts = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+        tm = trimesh.Trimesh(vertices=verts, faces=np.array([[0, 1, 2]]))
+        rgb = np.array([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], dtype=np.float32)
+        tm.visual = trimesh.visual.TextureVisuals(material=trimesh.visual.material.PBRMaterial())
+        tm.visual.vertex_attributes["color"] = rgb
+
+        path = os.path.join(folder_paths.get_temp_directory(), _trimesh_to_temp_glb(tm))
+        with open(path, "rb") as f:
+            blob = f.read()
+        chunk = json.loads(blob[20:20 + struct.unpack("<I", blob[12:16])[0]])
+        attrs = chunk["meshes"][0]["primitives"][0]["attributes"]
+        assert "COLOR_0" in attrs, f"RGB vertex colours must survive the export, got {list(attrs)}"
+        os.remove(path)
+
+        kept = tm.visual.vertex_attributes["color"]
+        assert kept.shape == rgb.shape and kept.dtype == rgb.dtype, \
+            "the caller's mesh must be restored, not left promoted to RGBA"
 
     print("nkd_preview_3d demo OK")
 
