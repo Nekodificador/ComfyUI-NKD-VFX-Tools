@@ -126,6 +126,70 @@ export function solve2vp(state: FSpyState, width: number, height: number): Solve
   };
 }
 
+// ── Moving the vanishing points ───────────────────────────────────────────────
+// Both the horizon drag (raise/lower pitch) and the VP slide (compress/stretch
+// perspective) work the same way: decide where the two VPs should go, then re-aim
+// the 4 control lines at them. Shared here so the editor holds no geometry.
+
+export interface LineSnap { key: "vp1" | "vp2"; moverIdx: number; anchor: V2; dist: number }
+
+/** For each control line, the endpoint FARTHEST from its vanishing point becomes the
+ *  anchor (stays put, usually the one out near the image edge); the near one moves. */
+export function snapshotLines(state: FSpyState, Fu: V2, Fv: V2): LineSnap[] {
+  const out: LineSnap[] = [];
+  for (const [key, vp] of [["vp1", Fu], ["vp2", Fv]] as const)
+    for (const [ia, ib] of [[0, 1], [2, 3]] as const) {
+      const A = state[key][ia], B = state[key][ib];
+      const dA = Math.hypot(A[0] - vp[0], A[1] - vp[1]), dB = Math.hypot(B[0] - vp[0], B[1] - vp[1]);
+      const anchorIdx = dA >= dB ? ia : ib, moverIdx = dA >= dB ? ib : ia;
+      const anchor: V2 = [state[key][anchorIdx][0], state[key][anchorIdx][1]];
+      const m = state[key][moverIdx];
+      out.push({ key, moverIdx, anchor, dist: Math.hypot(m[0] - anchor[0], m[1] - anchor[1]) });
+    }
+  return out;
+}
+
+/** Pivot each snapshotted line about its anchor so it points at the VP's new spot,
+ *  keeping its original length. Writes straight into `state`. */
+export function reaimLines(state: FSpyState, lines: LineSnap[], FuN: V2, FvN: V2): void {
+  const cl = (v: number) => Math.max(0, Math.min(1, v));
+  for (const ln of lines) {
+    const vp = ln.key === "vp1" ? FuN : FvN;
+    const vx = vp[0] - ln.anchor[0], vy = vp[1] - ln.anchor[1];
+    const len = Math.hypot(vx, vy);
+    if (len < 1e-6) continue;
+    state[ln.key][ln.moverIdx] = [cl(ln.anchor[0] + ln.dist * vx / len), cl(ln.anchor[1] + ln.dist * vy / len)];
+  }
+}
+
+/** Slide a point by `t` along the direction A->B (the horizon), so a VP pushed in or
+ *  out stays exactly on the horizon — which is what keeps the solve two-point. */
+export function slideAlong(p: V2, A: V2, B: V2, t: number): V2 {
+  const dx = B[0] - A[0], dy = B[1] - A[1], len = Math.hypot(dx, dy);
+  if (len < 1e-9) return [p[0], p[1]];
+  return [p[0] + (dx / len) * t, p[1] + (dy / len) * t];
+}
+
+/**
+ * Push both vanishing points apart (k>1) or together (k<1) along the horizon, which is
+ * the same as changing the lens: wide apart = long lens, close together = wide angle.
+ *
+ * They are scaled about the FOOT of the principal point on the horizon, not about their
+ * own midpoint. That foot is the point the solve measures the focal length from
+ * (f² = -(Fu-P)·(Fv-P)), so scaling about it moves the lens and leaves the camera
+ * pointing where it was; scaling about the midpoint would swing the view direction too.
+ */
+export function spreadVanishingPoints(Fu: V2, Fv: V2, P: V2, k: number): [V2, V2] {
+  const dx = Fv[0] - Fu[0], dy = Fv[1] - Fu[1], len2 = dx * dx + dy * dy;
+  if (len2 < 1e-18) return [[Fu[0], Fu[1]], [Fv[0], Fv[1]]];
+  const t = ((P[0] - Fu[0]) * dx + (P[1] - Fu[1]) * dy) / len2;
+  const C: V2 = [Fu[0] + t * dx, Fu[1] + t * dy];
+  return [
+    [C[0] + (Fu[0] - C[0]) * k, C[1] + (Fu[1] - C[1]) * k],
+    [C[0] + (Fv[0] - C[0]) * k, C[1] + (Fv[1] - C[1]) * k],
+  ];
+}
+
 /**
  * Build a projector: world point -> Relative image coords [0,1] (or null if behind camera).
  * Camera sits at `distance` along its view axis looking at the origin (orientation-only placement),

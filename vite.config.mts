@@ -55,6 +55,13 @@ export default defineConfig({
         // Likewise: the position-weld normal smoothing, so `node test_autosmooth.mjs` asserts on
         // the SHIPPED function instead of a re-implementation of it.
         nkd_smooth_normals: "./src/smooth_normals.ts",
+        // Likewise: the fSpy solver + VP-moving geometry, so `node test_vp_slide.mjs`
+        // asserts on the shipped code instead of a copy of it.
+        nkd_solver:        "./src/solver.ts",
+        // Likewise: the Shift fine-adjust drag, so `node test_fine_drag.mjs` asserts on
+        // the shipped one. As an internal chunk its filename carries a content hash,
+        // which is not something a test can import by name.
+        nkd_fine_drag:     "./src/fine_drag.ts",
         relighting_widget: "./src/main.ts",
         lens_blur_widget:  "./src/lens_blur_main.ts",
         fspy_camera_widget: "./src/fspy_main.ts",

@@ -43,21 +43,24 @@ const P = reactive({
   edge_mode: "black",
 });
 
+// `def` is the node's own default for that input, and the only place it is
+// written down: it feeds both double-click-to-reset on the slider and the
+// Reset lens button, so the two can no longer disagree.
 const SLIDERS = [
-  { k: "k1", label: "k1", min: -0.75, max: 0.75, step: 0.001, dp: 3 },
-  { k: "k2", label: "k2", min: -0.5, max: 0.5, step: 0.001, dp: 3 },
-  { k: "k3", label: "k3", min: -0.25, max: 0.25, step: 0.001, dp: 3 },
-  { k: "p1", label: "p1 tangential", min: -0.05, max: 0.05, step: 0.0005, dp: 4 },
-  { k: "p2", label: "p2 tangential", min: -0.05, max: 0.05, step: 0.0005, dp: 4 },
-  { k: "center_x", label: "Center X", min: -1, max: 1, step: 0.005, dp: 3 },
-  { k: "center_y", label: "Center Y", min: -1, max: 1, step: 0.005, dp: 3 },
-  { k: "squeeze", label: "Anamorphic", min: 0.25, max: 4, step: 0.01, dp: 2 },
-  { k: "zoom", label: "Zoom", min: 0.25, max: 4, step: 0.005, dp: 3 },
-  { k: "ca_red", label: "CA Red", min: 0.98, max: 1.02, step: 0.0002, dp: 4 },
-  { k: "ca_blue", label: "CA Blue", min: 0.98, max: 1.02, step: 0.0002, dp: 4 },
-  { k: "ca_falloff", label: "CA Falloff", min: 1, max: 6, step: 0.05, dp: 2 },
-  { k: "vignette_amount", label: "Vignette", min: 0, max: 1, step: 0.01, dp: 2 },
-  { k: "vignette_falloff", label: "Falloff", min: 0.5, max: 6, step: 0.05, dp: 2 },
+  { k: "k1", label: "k1", min: -0.75, max: 0.75, step: 0.001, dp: 3, def: 0 },
+  { k: "k2", label: "k2", min: -0.5, max: 0.5, step: 0.001, dp: 3, def: 0 },
+  { k: "k3", label: "k3", min: -0.25, max: 0.25, step: 0.001, dp: 3, def: 0 },
+  { k: "p1", label: "p1 tangential", min: -0.05, max: 0.05, step: 0.0005, dp: 4, def: 0 },
+  { k: "p2", label: "p2 tangential", min: -0.05, max: 0.05, step: 0.0005, dp: 4, def: 0 },
+  { k: "center_x", label: "Center X", min: -1, max: 1, step: 0.005, dp: 3, def: 0 },
+  { k: "center_y", label: "Center Y", min: -1, max: 1, step: 0.005, dp: 3, def: 0 },
+  { k: "squeeze", label: "Anamorphic", min: 0.25, max: 4, step: 0.01, dp: 2, def: 1 },
+  { k: "zoom", label: "Zoom", min: 0.25, max: 4, step: 0.005, dp: 3, def: 1 },
+  { k: "ca_red", label: "CA Red", min: 0.98, max: 1.02, step: 0.0002, dp: 4, def: 1 },
+  { k: "ca_blue", label: "CA Blue", min: 0.98, max: 1.02, step: 0.0002, dp: 4, def: 1 },
+  { k: "ca_falloff", label: "CA Falloff", min: 1, max: 6, step: 0.05, dp: 2, def: 1 },
+  { k: "vignette_amount", label: "Vignette", min: 0, max: 1, step: 0.01, dp: 2, def: 0 },
+  { k: "vignette_falloff", label: "Falloff", min: 0.5, max: 6, step: 0.05, dp: 2, def: 2.5 },
 ] as const;
 
 const lines = reactive<{ v: PlumbLine[] }>({ v: [] });
@@ -533,9 +536,9 @@ function undo() {
 }
 function resetView() { view.s = 1; view.tx = 0; view.ty = 0; redraw(); }
 function resetLens() {
-  const d: Record<string, number> = { k1:0,k2:0,k3:0,p1:0,p2:0,center_x:0,center_y:0,
-    squeeze:1, zoom:1, ca_red:1, ca_blue:1, vignette_amount:0, vignette_falloff:2.5 };
-  for (const k in d) setParam(k, d[k]);
+  // Straight off SLIDERS. The hand-kept list this replaced was one entry short
+  // — ca_falloff never came back to its default when you pressed Reset.
+  for (const f of SLIDERS) setParam(f.k, f.def);
 }
 
 function changed() {
@@ -619,6 +622,7 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
       <span class="nkd-ld-lbl">{{ labelFor(f) }}</span>
       <input type="range" class="nkd-modal-rng nkd-ld-grow"
              :min="f.min" :max="f.max" :step="f.step" :value="(P as any)[f.k]"
+             :data-default="f.def"
              @input="setParam(f.k, parseFloat(($event.target as HTMLInputElement).value))" />
       <span class="nkd-ld-val">{{ Number((P as any)[f.k]).toFixed(f.dp) }}</span>
     </div>
@@ -651,7 +655,8 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
     <button class="nkd-modal-btn" :class="{ on: showPreview }" @click="showPreview = !showPreview; redraw()"
             title="Toggle the lens preview — off shows the untouched photo">Preview</button>
     <label class="nkd-modal-lbl" title="Darken the photo beneath the traces">Dim
-      <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
+      <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" data-default="0"
+             v-model.number="dim" @input="redraw" />
     </label>
     <button class="nkd-modal-btn" @click="resetView">Reset view</button>
     <button class="nkd-modal-btn" :class="{ on: showPanel }" @click="showPanel = !showPanel">Params</button>

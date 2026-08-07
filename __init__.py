@@ -11,6 +11,7 @@ from .nkd_fspy_camera    import NKDfSpyCamera
 from .nkd_preview_3d     import NKDPreview3D
 from .nkd_perspective_dewarp import NKDPerspectiveUnwarp, NKDPerspectiveRewarp
 from .nkd_lens_distort    import NKDLensDistort
+from .nkd_camera_delta    import NKDCameraDeltaPrompt
 
 NODE_CLASS_MAPPINGS = {
     "RelightingNode":         RelightingNode,
@@ -21,6 +22,7 @@ NODE_CLASS_MAPPINGS = {
     "NKDPerspectiveUnwarp":   NKDPerspectiveUnwarp,
     "NKDPerspectiveRewarp":   NKDPerspectiveRewarp,
     "NKDLensDistort":         NKDLensDistort,
+    "NKDCameraDeltaPrompt":   NKDCameraDeltaPrompt,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -32,6 +34,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NKDPerspectiveUnwarp":   "😺NKD Perspective Unwarp",
     "NKDPerspectiveRewarp":   "😺NKD Perspective Rewarp",
     "NKDLensDistort":         "😺NKD Lens Distort",
+    "NKDCameraDeltaPrompt":   "😺NKD Camera Delta Prompt",
 }
 
 WEB_DIRECTORY = "./web/js"

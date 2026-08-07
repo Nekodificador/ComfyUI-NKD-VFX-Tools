@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, nextTick, reactive, ref } from "vue";
-import { solve2vp, makeProjector, type FSpyState } from "./solver";
+import { solve2vp, makeProjector, snapshotLines, reaimLines, slideAlong,
+         spreadVanishingPoints, type FSpyState, type LineSnap } from "./solver";
 import { attachFineRange, isFine, FINE_GAIN } from "./fine_drag";
 
 const props = defineProps<{
@@ -177,7 +178,7 @@ function redraw() {
   }
   // ── Horizon: the line through both vanishing points. Drag it up/down to raise/lower the
   // camera pitch — it translates the 8 handles in Y, moving both VPs and re-aiming everything.
-  horizonLine = null;
+  horizonLine = null; vpGrips = [];
   if (showHorizon.value && res.ok && res.Fu && res.Fv) {
     const A = res.Fu, B = res.Fv, dhx = B[0] - A[0];
     if (Math.abs(dhx) > 1e-6) {                                   // skip a near-vertical horizon
@@ -193,6 +194,24 @@ function redraw() {
       ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke();
       ctx.fillStyle = "rgba(0,0,0,0.8)"; ctx.font = "9px system-ui"; ctx.textAlign = "center";
       ctx.fillText("⇕", g[0], g[1] + 3); ctx.textAlign = "left";
+
+      // ── VP slide grips: push a vanishing point in or out ALONG the horizon.
+      // Closer to the centre = shorter focal = stretched perspective; farther out =
+      // longer lens = compressed. A vanishing point usually lands far off the image,
+      // so the grip is clamped to the visible horizon and the drag is geared by how
+      // much farther the real VP is — otherwise a distant VP would barely budge.
+      const ppx = state.principalPoint?.mode === "manual" ? (state.principalPoint.x ?? 0.5) : 0.5;
+      for (const [key, vp] of [["vp1", A], ["vp2", B]] as const) {
+        const gx = Math.min(0.94, Math.max(0.06, vp[0]));
+        const gain = Math.max(1, Math.abs(vp[0] - ppx) / Math.max(Math.abs(gx - ppx), 1e-3));
+        vpGrips.push({ key, at: [gx, yAt(gx)], gain });
+        const [x, y] = toPx([gx, yAt(gx)]);
+        ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = vpColor(key); ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = "rgba(0,0,0,0.7)"; ctx.stroke();
+        ctx.fillStyle = "rgba(0,0,0,0.8)"; ctx.font = "9px system-ui"; ctx.textAlign = "center";
+        ctx.fillText("⇔", x, y + 3); ctx.textAlign = "left";
+      }
     }
   }
 
@@ -209,7 +228,7 @@ function redraw() {
 
   // Magnifier loupe while dragging — CLEAN image only (no handles/lines), placed next to the cursor,
   // with just a precision crosshair, so you can see the exact pixel under the point.
-  if (drag && drag.key !== "horizon" && img) {
+  if (drag && drag.key !== "horizon" && drag.key !== "vpslide" && drag.key !== "box" && img) {
     const hp = drag.key === "origin" ? state.origin : state[drag.key][drag.idx];
     const [hx, hy] = toPx(hp);
     const z = 3.5, L = 140, m = 8, gap = 22;
@@ -247,7 +266,7 @@ function solveNow() {
 function emit() { props.onChange?.(JSON.stringify(state)); }
 
 // ── Dragging ──────────────────────────────────────────────────────────────────
-let drag: { key: "vp1" | "vp2" | "origin" | "horizon" | "box"; idx: number } | null = null;
+let drag: { key: "vp1" | "vp2" | "origin" | "horizon" | "box" | "vpslide"; idx: number } | null = null;
 const BOX_ORDER = ["w", "h", "d"] as const;
 /** Face-centre handles, rebuilt on every redraw: where each sits on screen, which
  *  way it grows, and how far it travels per world unit. */
@@ -256,13 +275,16 @@ let boxSnap: { k: "w" | "h" | "d"; val: number; lastN: [number, number];
                dir: [number, number]; per: number } | null = null;
 // Horizon line (through the two VPs), in Relative coords — set each redraw, used for hit-testing.
 let horizonLine: { A: [number, number]; B: [number, number] } | null = null;
-// Snapshot taken when the horizon drag starts. Each of the 4 control lines pivots around its
-// endpoint FARTHEST from the horizon (kept anchored on the image edge); only the near endpoint
-// moves, re-aiming the line at the vanishing point's new (raised/lowered) position.
+// The two "slide this VP along the horizon" grips, likewise rebuilt every redraw.
+let vpGrips: { key: "vp1" | "vp2"; at: [number, number]; gain: number }[] = [];
+// Snapshot taken when a horizon or VP-slide drag starts: where the VPs were, and the 4 control
+// lines pivoting about their far endpoints (see snapshotLines/reaimLines in solver.ts).
 let horizonSnap: {
-  startY: number;
+  start: [number, number];
   Fu: [number, number]; Fv: [number, number];
-  lines: { key: "vp1" | "vp2"; moverIdx: number; anchor: [number, number]; dist: number }[];
+  gain: number;                       // VP-slide only: screen travel -> VP travel
+  slide: "vp1" | "vp2" | null;        // null = horizon drag (both VPs move in Y)
+  lines: LineSnap[];
 } | null = null;
 function eventNorm(e: PointerEvent): [number, number] {
   const cv = canvas.value!; const rect = cv.getBoundingClientRect();
@@ -271,7 +293,7 @@ function eventNorm(e: PointerEvent): [number, number] {
   const [ix, iy, iw, ih] = imgRect();
   return [(px - ix) / iw, (py - iy) / ih];
 }
-function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin" | "horizon"; idx: number } | null {
+function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin" | "horizon" | "vpslide"; idx: number } | null {
   const [, , iw, ih] = imgRect(); const tolX = (HANDLE_R + 8) / iw, tolY = (HANDLE_R + 8) / ih;
   for (const key of ["vp1", "vp2"] as const)
     for (let i = 0; i < 4; i++) { const p = state[key][i]; if (Math.abs(p[0] - n[0]) < tolX && Math.abs(p[1] - n[1]) < tolY) return { key, idx: i }; }
@@ -280,6 +302,10 @@ function hitTest(n: [number, number]): { key: "vp1" | "vp2" | "origin" | "horizo
     const h = boxHandles[i];
     if (Math.abs(h.at[0] - n[0]) < tolX && Math.abs(h.at[1] - n[1]) < tolY)
       return { key: "box", idx: BOX_ORDER.indexOf(h.k) };
+  }
+  for (let i = 0; i < vpGrips.length; i++) {
+    const g = vpGrips[i];
+    if (Math.abs(g.at[0] - n[0]) < tolX && Math.abs(g.at[1] - n[1]) < tolY) return { key: "vpslide", idx: i };
   }
   // Horizon line last (handles win): perpendicular distance from the cursor to the line.
   if (horizonLine) {
@@ -299,20 +325,15 @@ function onDown(e: PointerEvent) {
     if (!h) { drag = null; return; }
     boxSnap = { k, val: boxDims()[k], lastN: eventNorm(e), dir: h.dir, per: h.per };
   }
-  if (hit.key === "horizon") {
+  if (hit.key === "horizon" || hit.key === "vpslide") {
     const res = solveNow();
     if (!res.Fu || !res.Fv) { drag = null; return; }
-    const Fu = res.Fu, Fv = res.Fv;
-    const linesFor = (key: "vp1" | "vp2", vp: [number, number]) =>
-      ([[0, 1], [2, 3]] as const).map(([ia, ib]) => {
-        const A = state[key][ia], B = state[key][ib];
-        const dA = Math.hypot(A[0] - vp[0], A[1] - vp[1]), dB = Math.hypot(B[0] - vp[0], B[1] - vp[1]);
-        const anchorIdx = dA >= dB ? ia : ib, moverIdx = dA >= dB ? ib : ia; // anchor = farther from VP
-        const anchor: [number, number] = [state[key][anchorIdx][0], state[key][anchorIdx][1]];
-        const m = state[key][moverIdx];
-        return { key, moverIdx, anchor, dist: Math.hypot(m[0] - anchor[0], m[1] - anchor[1]) };
-      });
-    horizonSnap = { startY: eventNorm(e)[1], Fu, Fv, lines: [...linesFor("vp1", Fu), ...linesFor("vp2", Fv)] };
+    horizonSnap = {
+      start: eventNorm(e), Fu: res.Fu, Fv: res.Fv,
+      gain: hit.key === "vpslide" ? vpGrips[hit.idx].gain : 1,
+      slide: hit.key === "vpslide" ? vpGrips[hit.idx].key : null,
+      lines: snapshotLines(state, res.Fu, res.Fv),
+    };
   }
   canvas.value!.setPointerCapture(e.pointerId); e.preventDefault();
 }
@@ -331,20 +352,23 @@ function onMove(e: PointerEvent) {
     redraw(); emit();
     return;
   }
-  if (drag.key === "horizon") {
-    if (!horizonSnap) return;
-    const dy = raw[1] - horizonSnap.startY;                 // how far the horizon was dragged in Y
-    const FuN: [number, number] = [horizonSnap.Fu[0], horizonSnap.Fu[1] + dy]; // VPs ride the horizon
-    const FvN: [number, number] = [horizonSnap.Fv[0], horizonSnap.Fv[1] + dy];
-    const cl = (v: number) => Math.max(0, Math.min(1, v));
-    for (const ln of horizonSnap.lines) {
-      const vp = ln.key === "vp1" ? FuN : FvN;             // re-aim this line at its VP's new spot
-      const vx = vp[0] - ln.anchor[0], vy = vp[1] - ln.anchor[1];
-      const len = Math.hypot(vx, vy);
-      if (len < 1e-6) continue;
-      // Far endpoint (anchor) stays; the near endpoint pivots to the same distance along the new aim.
-      state[ln.key][ln.moverIdx] = [cl(ln.anchor[0] + ln.dist * vx / len), cl(ln.anchor[1] + ln.dist * vy / len)];
+  if (drag.key === "horizon" || drag.key === "vpslide") {
+    const s = horizonSnap; if (!s) return;
+    let FuN: [number, number], FvN: [number, number];
+    if (s.slide) {
+      // Slide ONE vanishing point along the horizon — Shift for the usual tenth speed.
+      const u = [s.Fv[0] - s.Fu[0], s.Fv[1] - s.Fu[1]];
+      const len = Math.hypot(u[0], u[1]) || 1;
+      const t = ((raw[0] - s.start[0]) * u[0] / len + (raw[1] - s.start[1]) * u[1] / len)
+              * s.gain * (isFine() ? FINE_GAIN : 1);
+      FuN = s.slide === "vp1" ? slideAlong(s.Fu, s.Fu, s.Fv, t) : s.Fu;
+      FvN = s.slide === "vp2" ? slideAlong(s.Fv, s.Fu, s.Fv, t) : s.Fv;
+    } else {
+      const dy = raw[1] - s.start[1];                       // both VPs ride the horizon up/down
+      FuN = [s.Fu[0], s.Fu[1] + dy];
+      FvN = [s.Fv[0], s.Fv[1] + dy];
     }
+    reaimLines(state, s.lines, FuN, FvN);
     redraw(); emit();
     return;
   }
@@ -356,6 +380,28 @@ function onMove(e: PointerEvent) {
 function onUp(e: PointerEvent) { if (drag) { drag = null; horizonSnap = null; boxSnap = null; try { canvas.value!.releasePointerCapture(e.pointerId); } catch {} emit(); } }
 
 function onAxis() { redraw(); emit(); }
+
+// ── Spread slider: move both vanishing points apart / together at once ─────────
+// There is no "spread" number in the state — the truth is the 8 control points — so
+// the slider is RELATIVE to where they were when the drag began, and springs back to
+// its centre on release. That also makes it re-appliable: nudge, let go, nudge again.
+const spread = ref(0);   // log2 of the scale, so the centre detent is exactly 1x
+let spreadSnap: { Fu: [number, number]; Fv: [number, number]; lines: LineSnap[] } | null = null;
+function ppRel(): [number, number] {
+  const pp = state.principalPoint;
+  return pp?.mode === "manual" ? [pp.x ?? 0.5, pp.y ?? 0.5] : [0.5, 0.5];
+}
+function onSpread() {
+  if (!spreadSnap) {                       // first tick of a drag — or an arrow key, which
+    const res = solveNow();                // never sends a pointerdown
+    if (!res.ok || !res.Fu || !res.Fv) return;
+    spreadSnap = { Fu: res.Fu, Fv: res.Fv, lines: snapshotLines(state, res.Fu, res.Fv) };
+  }
+  const [FuN, FvN] = spreadVanishingPoints(spreadSnap.Fu, spreadSnap.Fv, ppRel(), Math.pow(2, spread.value));
+  reaimLines(state, spreadSnap.lines, FuN, FvN);
+  redraw(); emit();
+}
+function endSpread() { spreadSnap = null; spread.value = 0; }
 
 /** Put every draggable back where it started. The 8 vanishing-line handles have
  *  no undo, so dragging one off the image used to be unrecoverable. */
@@ -413,7 +459,7 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
     <button class="nkd-modal-btn" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
     <button class="nkd-modal-btn" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
     <button class="nkd-modal-btn" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
-    <button class="nkd-modal-btn" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch">Horizon</button>
+    <button class="nkd-modal-btn" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch. Drag a coloured ⇔ grip sideways to slide that vanishing point along the horizon: toward the centre stretches the perspective (wider lens), outward compresses it (longer lens).">Horizon</button>
     <template v-if="showBox">
       <label class="nkd-modal-lbl" v-for="ax in BOX_AXES" :key="ax.k" :title="ax.tip">{{ ax.label }}
         <input type="range" class="nkd-modal-rng nkd-fspy-box" min="0.1" max="20" step="0.05"
@@ -422,6 +468,13 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
         <span class="nkd-fspy-num">{{ boxDims()[ax.k].toFixed(2) }}</span>
       </label>
     </template>
+    <label class="nkd-modal-lbl" :class="{ off: !hud.ok }"
+           title="Spread the two vanishing points apart or squeeze them together along the horizon, about the principal point — apart compresses the perspective (longer lens), together stretches it (wider). Relative: it springs back to 1× on release so you can keep nudging. Shift for fine steps.">Spread
+      <input type="range" class="nkd-modal-rng nkd-fspy-box" min="-1" max="1" step="0.005"
+             v-model.number="spread" :disabled="!hud.ok"
+             @input="onSpread" @pointerup="endSpread" @pointercancel="endSpread" @change="endSpread" />
+      <span class="nkd-fspy-num">{{ Math.pow(2, spread).toFixed(2) }}×</span>
+    </label>
     <label class="nkd-modal-lbl" title="Darken the image beneath the overlay">Darken
       <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
     </label>
@@ -447,4 +500,6 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 .nkd-fspy-wrap canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
 .nkd-fspy-box { width: 64px; }
 .nkd-fspy-num { color: #4ab4ff; font-variant-numeric: tabular-nums; min-width: 30px; text-align: right; }
+/* Spread needs a valid solve to have vanishing points to move. */
+.nkd-modal-lbl.off { opacity: 0.4; }
 </style>

@@ -1,0 +1,121 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NKD white environment — GPU self-check</title>
+<!--
+  Self-check for updateEnvironment()'s no-plate fallback in src/Preview3DWidget.vue: with no
+  bg_image wired, a flat white 64x32 equirect goes through the SAME PMREM path a photo does,
+  so the Env slider reads as a plain global white fill instead of doing nothing.
+  Check 2b pins WHY it is 64x32 and not 1x1.
+
+  Needs a real GL context (PMREM renders), so it can't live in a .mjs.
+
+    python -m http.server 8791    # from the repo root, so ./node_modules/three resolves
+    open http://127.0.0.1:8791/test_white_env.html
+-->
+<body style="background:#14171c;color:#d6dae0;font:13px/1.55 ui-monospace,Consolas,monospace;padding:18px">
+<pre id="out">running…</pre>
+<script type="module">
+import * as THREE from './node_modules/three/build/three.module.js'
+
+const L = [], out = document.getElementById('out')
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n') }
+let failed = 0
+const check = (ok, msg) => { if (!ok) failed++; log(`${ok ? '  ok  ' : ' FAIL '} ${msg}`) }
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true })
+renderer.setPixelRatio(1)
+renderer.setSize(64, 64)
+
+const scene = new THREE.Scene()
+// Same rig as initScene(): a low ambient, the fill is meant to come from the environment.
+scene.add(new THREE.AmbientLight(0xffffff, 0.15))
+const ball = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 32, 32),
+  // Mid grey, not white: a white albedo clips at full white as soon as Env hits 1,
+  // and a clipped readout can't show the slider still scaling anything.
+  new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 1, metalness: 0 })
+)
+scene.add(ball)
+const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100)
+camera.position.set(0, 0, 4)
+
+let pmrem = null, envRT = null
+
+// ---- keep in sync with updateEnvironment() in src/Preview3DWidget.vue ----
+function updateEnvironment(bgTexture, env) {
+  envRT?.dispose()
+  envRT = null
+  pmrem = pmrem ?? new THREE.PMREMGenerator(renderer)
+  pmrem.compileEquirectangularShader()
+  const equirect = bgTexture
+    ? bgTexture.clone()
+    : new THREE.DataTexture(new Uint8Array(64 * 32 * 4).fill(255), 64, 32)
+  equirect.needsUpdate = true
+  equirect.mapping = THREE.EquirectangularReflectionMapping
+  envRT = pmrem.fromEquirectangular(equirect)
+  equirect.dispose()
+  scene.environment = envRT.texture
+  scene.environmentIntensity = env
+}
+// ---- end synced block ----
+
+// Read through a render target, not the default framebuffer: PMREM leaves its own targets
+// bound and a raw gl.readPixels after it comes back empty.
+const readRT = new THREE.WebGLRenderTarget(64, 64)
+function frame() {
+  renderer.setRenderTarget(readRT)
+  renderer.render(scene, camera)
+  renderer.setRenderTarget(null)
+  const px = new Uint8Array(64 * 64 * 4)
+  renderer.readRenderTargetPixels(readRT, 0, 0, 64, 64, px)
+  return px
+}
+const at = (px, x, y) => (px[(y * 64 + x) * 4] + px[(y * 64 + x) * 4 + 1] + px[(y * 64 + x) * 4 + 2]) / 3
+
+/** Mean luminance of the sphere's centre. */
+function shade() {
+  const px = frame()
+  let s = 0, n = 0
+  for (let y = 30; y < 34; y++) for (let x = 30; x < 34; x++) { s += at(px, x, y); n++ }
+  return s / n
+}
+
+// 1. The bug this fixes: no environment at all → the ambient alone, near black.
+scene.environment = null
+const bare = shade()
+check(bare > 0 && bare < 30, `no environment: sphere is barely lit (${bare.toFixed(1)}, 0 < x < 30)`)
+
+// 2. The fix: a white equirect survives PMREM and brightens the geometry.
+updateEnvironment(null, 1.0)
+const white = shade()
+check(white > bare * 3, `white env lifts the shade (${bare.toFixed(1)} → ${white.toFixed(1)}, >3x)`)
+
+// 2b. Rebuild the sizing trap so the test can't pass by luck: PMREM sizes its cube off
+//     image.width/4, so a 1x1 source emits `#define CUBEUV_TEXEL_HEIGHT 1` (an int) and the
+//     standard-material shader fails to compile — the sphere goes BLACK, not brighter.
+//     Expect a wall of shader errors in the console while this runs.
+const tiny = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1)
+tiny.needsUpdate = true
+updateEnvironment(tiny, 1.0)
+const broken = shade()
+check(broken < 1, `a 1x1 equirect really does break the shader (${broken.toFixed(1)} < 1)`)
+ball.material.needsUpdate = true // drop the failed program before carrying on
+
+// 3. The Env slider still drives it — the same one control, not a second path.
+updateEnvironment(null, 0.25)
+const dim = shade()
+updateEnvironment(null, 3.0)
+const hot = shade()
+check(dim < white && white < hot, `Env scales the fill (${dim.toFixed(1)} < ${white.toFixed(1)} < ${hot.toFixed(1)})`)
+
+// 4. A flat fill is FLAT: with no directional content the sphere shades evenly, so it reads
+//    as global illumination rather than a light coming from somewhere.
+updateEnvironment(null, 1.0)
+const px = frame()
+let lo = 255, hi = 0
+for (let x = 20; x < 45; x++) { const v = at(px, x, 32); lo = Math.min(lo, v); hi = Math.max(hi, v) }
+check(hi - lo <= 6, `fill is directionless across the sphere (spread ${(hi - lo).toFixed(1)} <= 6)`)
+
+log()
+log(failed ? `${failed} FAILED` : 'all checks passed')
+</script>

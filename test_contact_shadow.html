@@ -1,0 +1,146 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NKD contact shadow — GPU self-check</title>
+<!--
+  Self-check for what the contact-shadow capture actually WRITES.  Needs a real GL context, so
+  it can't live in test_contact_shadow.mjs (that one covers the orientation, on the CPU).
+
+    python -m http.server 8791    # from the repo root, so ./node_modules/three resolves
+    open http://127.0.0.1:8791/test_contact_shadow.html
+
+  It rebuilds the rig from renderContactShadow()/updateContactBounds() in
+  src/Preview3DWidget.vue and reads the render target back.  Keep the marked block in sync.
+-->
+<body style="background:#14171c;color:#d6dae0;font:13px/1.55 ui-monospace,Consolas,monospace;padding:18px">
+<pre id="out">running…</pre>
+<script type="module">
+import * as THREE from './node_modules/three/build/three.module.js'
+
+const RES = 512, DARK = 0.8
+const L = [], out = document.getElementById('out')
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n') }
+let failed = 0
+const check = (ok, msg) => { if (!ok) failed++; log(`${ok ? '  ok  ' : ' FAIL '} ${msg}`) }
+
+const mesh = (w, h, d, y) => new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
+  new THREE.MeshBasicMaterial()).translateY(y)
+
+/** boots y 0.0–0.2 · cape y 0.4–0.5 covering them · body y 0.6–2.0 (above any slab) */
+function figure(lift) {
+  const g = new THREE.Group()
+  g.add(mesh(0.3, 0.2, 0.3, 0.1), mesh(1.2, 0.1, 1.2, 0.45), mesh(0.4, 1.4, 0.4, 1.3))
+  g.position.y = lift
+  return g
+}
+
+/** A blade leaning 20° off vertical, resting its lower tip on the floor. Thin, but its
+ *  silhouette sweeps a long way sideways the higher up you keep looking. */
+function sword() {
+  const g = new THREE.Group()
+  const blade = mesh(0.06, 1.6, 0.02, 0.8)
+  blade.rotation.z = 20 * Math.PI / 180
+  blade.position.x = Math.sin(20 * Math.PI / 180) * 0.8
+  blade.position.y = Math.cos(20 * Math.PI / 180) * 0.8
+  g.add(blade)
+  return g
+}
+
+function capture({ depthTest = true, farFromBase = true, lift = 0, slab: slabWanted = 0.05,
+                   build = figure } = {}) {
+  const r = new THREE.WebGLRenderer({ canvas: document.createElement('canvas'), alpha: true })
+  r.setSize(8, 8)
+  const scene = new THREE.Scene()
+  const model = build(lift)
+  scene.add(model)
+
+  const mat = new THREE.MeshDepthMaterial()
+  mat.depthTest = depthTest
+  mat.depthWrite = depthTest
+  const darkness = { value: DARK }
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.darkness = darkness
+    sh.fragmentShader = 'uniform float darkness;\n' + sh.fragmentShader.replace(
+      'gl_FragColor = vec4( vec3( 1.0 - fragCoordZ ), opacity );',
+      'gl_FragColor = vec4( vec3( 0.0 ), ( 1.0 - fragCoordZ ) * darkness );')
+  }
+
+  // ── updateContactBounds(), as in the widget ──────────────────────────────
+  const box = new THREE.Box3().setFromObject(model)
+  const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3())
+  const foot = Math.max(size.x, size.z) * 1.15 + 0.02
+  const slab = Math.min(Math.max(slabWanted, 1e-3), size.y || 1)
+  const cam = new THREE.OrthographicCamera(-foot / 2, foot / 2, foot / 2, -foot / 2, 0,
+    farFromBase ? Math.max(box.min.y, 0) + slab : slab)
+  cam.rotation.x = Math.PI / 2                        // look up from the floor
+  const group = new THREE.Group()
+  group.position.set(c.x, 0, c.z)                     // y stays on the fSpy floor
+  group.add(cam); scene.add(group)
+  cam.updateProjectionMatrix()
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const rt = new THREE.WebGLRenderTarget(RES, RES)
+  scene.overrideMaterial = mat
+  r.setRenderTarget(rt)
+  r.setClearColor(0x000000, 0)
+  r.clear()
+  r.render(scene, cam)
+  scene.overrideMaterial = null
+
+  const all = new Uint8Array(RES * RES * 4)
+  r.readRenderTargetPixels(rt, 0, 0, RES, RES, all)
+  const at = (dx) => all[((RES / 2) * RES + (RES / 2 + dx)) * 4 + 3]
+  let covered = 0
+  for (let i = 3; i < all.length; i += 4) if (all[i] > 0) covered++
+
+  const res = {
+    boots: at(0), capeOnly: at(140), covered,
+    expBoots: Math.round((1 - box.min.y / cam.far) * DARK * 255),
+    expCape: Math.round((1 - (0.4 + lift) / cam.far) * DARK * 255),
+    far: cam.far, foot,
+  }
+  r.setRenderTarget(null); r.dispose()
+  return res
+}
+
+// ── 1. without depth testing the texel is decided by draw order ──────────────
+// Deliberately a thick slab: the cape has to be inside it for there to be a contest at all.
+const off = capture({ depthTest: false, slab: 0.5 })
+log(`slab far = ${off.far.toFixed(3)}  ->  boots are worth alpha ${off.expBoots}, the cape ${off.expCape}`)
+log()
+log(`depthTest OFF (pre-fix)  boots texel = ${off.boots}   cape-only texel = ${off.capeOnly}`)
+check(off.boots === off.expCape,
+  'without depth testing the cape overwrites the boots — reproduces the reported symptom')
+
+// ── 2. with it, nearest-to-ground wins, which is what AO contact means ───────
+const on = capture({ depthTest: true, slab: 0.5 })
+log(`depthTest ON  (shipped)  boots texel = ${on.boots}   cape-only texel = ${on.capeOnly}`)
+check(on.boots === on.expBoots, 'the boots keep their own contact under the cape')
+check(on.boots > on.capeOnly, 'contact is darkest where the model actually meets the floor')
+
+// ── 3. the slab must follow the object, not the floor ────────────────────────
+log()
+const liftedFloor = capture({ lift: 0.5, farFromBase: false, slab: 0.5 })
+const liftedBase = capture({ lift: 0.5, farFromBase: true, slab: 0.5 })
+const grounded = capture({ slab: 0.5 })
+log(`lifted 0.5 · far = slab       boots texel = ${liftedFloor.boots}`)
+log(`lifted 0.5 · far = base+slab  boots texel = ${liftedBase.boots}`)
+check(liftedFloor.boots === 0, 'measuring the slab from the floor loses the shadow once lifted')
+check(liftedBase.boots > 0 && liftedBase.boots < grounded.boots,
+  'measuring it from the base keeps a shadow, weaker than when grounded')
+
+// ── 4. a thin slab is what keeps a leaning blade from smearing its outline ───
+log()
+const thick = capture({ build: sword, slab: 0.5 })
+const thin = capture({ build: sword, slab: 0.05 })
+const pct = (n) => (100 * n / (RES * RES)).toFixed(2) + '%'
+log(`leaning blade · slab 0.500  footprint = ${pct(thick.covered)} of the map`)
+log(`leaning blade · slab 0.050  footprint = ${pct(thin.covered)} of the map`)
+check(thin.covered * 3 < thick.covered,
+  'a 10x thinner slab shrinks the blade footprint to the tip that actually touches')
+check(thin.covered > 0, 'the tip still casts something')
+
+log()
+log(failed ? `${failed} CHECK(S) FAILED` : 'all checks passed')
+document.title = failed ? `FAIL (${failed})` : 'PASS'
+</script>
+</body>

@@ -182,7 +182,14 @@ const occTo = ref(1.0)
 // Auto Z always used. Mirrors of the uniforms, which Vue cannot observe.
 const dNearUI = ref(1)
 const dFarUI = ref(30)
-const depthView = ref(true)    // paint the depth pass in the viewport while the panel is open
+// Paint the depth pass in the viewport while the panel is open. OFF to start:
+// opening the Depth tab used to replace the viewport with the depth map on the
+// spot, and with no object loaded that is a black screen with no clue as to why
+// — the tab reads as broken. Off, the panel opens on the scene you were already
+// looking at with the near/far planes drawn on the ground, which is what you
+// need to set the range in the first place; tick Preview to check the map. The
+// value is saved with the widget, so anyone who likes it on keeps it on.
+const depthView = ref(false)
 const showRange = ref(true)    // draw where the near/far planes cut the ground
 // Auto Z as a MODE, not a one-shot: the fit depends on where the camera is (the object's
 // distance with no map; the floor rays with one), so orbiting invalidates it the moment it
@@ -245,10 +252,22 @@ const renderer = shallowRef<THREE.WebGLRenderer | null>(null)
 const scene = new THREE.Scene()
 const DEFAULT_FOV = 35
 const camera = new THREE.PerspectiveCamera(DEFAULT_FOV, 1, 0.01, 10000)
-// Mirror of camera.fov, which Vue cannot observe. The camera stays the single source of
-// truth (it is what cameraInfo() reports and what the export renders through); this ref
-// only exists so the field can show it.
-const fov = ref(DEFAULT_FOV)
+// Full-frame 36mm back, so the millimetre readout is the same number the fSpy node
+// solves: its focalMm = 36 / (2·tan(fovH/2)) is algebraically identical to three's
+// vertical form once the aspect is folded in. three's own default gauge is 35, which
+// would read ~3% short of every other lens figure in the pack.
+camera.filmGauge = 36
+// Mirror of the camera's focal length in 35mm-equivalent mm, which Vue cannot observe.
+// The camera stays the single source of truth (camera.fov is what cameraInfo() reports
+// and what the export renders through); this ref only exists so the field can show it.
+// Millimetres, not degrees, because that is what a lens is labelled with — you match a
+// plate by knowing it was shot on a 24mm, and nobody reads a spec sheet in degrees.
+const focal = ref(camera.getFocalLength())
+// The ↺ target: DEFAULT_FOV expressed in mm at the CURRENT format. Reads props.aspect
+// directly so it re-runs when the export size changes — a fixed angle is a different
+// focal length on a different film back.
+const defaultFocal = computed(() =>
+  0.5 * (36 / Math.max(props.aspect.w / props.aspect.h, 1)) / Math.tan(THREE.MathUtils.degToRad(DEFAULT_FOV / 2)))
 // Dutch angle, in degrees. Unlike fov this one has no home on the camera: OrbitControls
 // re-runs lookAt(target) every frame, which rebuilds the orientation from camera.up — so
 // a roll written into camera.rotation.z would be wiped before it was ever drawn. Rolling
@@ -445,6 +464,16 @@ let ro: ResizeObserver | null = null
 // this behind them. The isolated `object` pass skips the backdrop entirely, so its alpha and
 // the mask are untouched whatever this is set to. Default = the old hardcoded grey.
 const bgColor = ref('#111318')
+// Draw the wired plate, or just its colour? Off keeps the environment lighting the photo
+// gives (that is the point — grab its colours as GI) while leaving the photo out of the
+// viewport AND out of the export, since both go through the same quad.
+const showBg = ref(true)
+const hasBgImage = ref(false) // mirrors bgTexture for the template (bgTexture is a plain let)
+// Was a plate wired the last time a payload landed? Only the RISING edge (none -> wired)
+// re-shows the backdrop. Reacting to every run instead would make the hide button useless,
+// and never reacting leaves a plate you just connected invisible with its toggle buried —
+// the same flank rule the camera lock already uses.
+let bgWired = false
 
 function initScene() {
   scene.background = null
@@ -494,6 +523,7 @@ function initScene() {
 
   camera.position.set(2, 1.5, 3)
   camera.lookAt(0, 0, 0)
+  updateEnvironment() // no plate yet → the white fill, so Env does something from the start
 }
 
 /** Cover-fit the backdrop quad. Bails on a non-finite aspect rather than writing NaN.
@@ -653,20 +683,31 @@ function onSphereDown(e: PointerEvent) {
 // being SHOWN — not the tab being clicked, which never happens in the sidebar.
 watch(lightPanelOpen, (on) => { if (on) void nextTick(drawSphere) }, { immediate: true })
 
+/** Flat white 2:1 equirect for the no-plate case. NOT 1×1: PMREM sizes its cube off
+ *  image.width/4, and a source that small gives a negative max mip — three then emits
+ *  `#define CUBEUV_TEXEL_HEIGHT 1` (an int) and the standard-material shader fails to
+ *  compile, which renders the whole scene black. 64×32 is 8 kB and mips cleanly. */
+function whiteEquirect() {
+  return new THREE.DataTexture(new Uint8Array(64 * 32 * 4).fill(255), 64, 32)
+}
+
 /** The backdrop as an environment, so the model picks up the scene's colour.
- *  A flat photo is not a 360 capture — this is a colour cast, not true reflections. */
+ *  A flat photo is not a 360 capture — this is a colour cast, not true reflections.
+ *  With nothing wired it is a flat white equirect, so Env reads as a plain global fill
+ *  on the geometry instead of doing nothing at all. Same PMREM path either way — one
+ *  code path, one slider. Follows the WIRE, not `showBg`: hiding the plate while keeping
+ *  its colours as light is exactly what the toggle is for. */
 function updateEnvironment() {
   const r = renderer.value
   if (!r) return
   envRT?.dispose()
   envRT = null
-  scene.environment = null
-  if (!bgTexture) return
   pmrem = pmrem ?? new THREE.PMREMGenerator(r)
   pmrem.compileEquirectangularShader()
   // Clone: the backdrop quad draws from this same texture, and switching its mapping to
   // equirect would wreck how the photo itself is drawn.
-  const equirect = bgTexture.clone()
+  const equirect = bgTexture ? bgTexture.clone() : whiteEquirect()
+  equirect.needsUpdate = true
   equirect.mapping = THREE.EquirectangularReflectionMapping
   envRT = pmrem.fromEquirectangular(equirect)
   equirect.dispose()
@@ -947,6 +988,23 @@ function renderFrame(drawBackdrop = true) {
  *
  * `forExport` hides the range gizmo; the preview wants it drawn over the map.
  */
+
+/**
+ * Whether the depth pass would come out with anything in it.
+ *
+ * Exactly the two things it draws: the injected scene map, and the model's own
+ * meshes. Splats are deliberately not among them — SparkRenderer is hidden for
+ * the pass — so a scene holding only a splat is as empty here as one holding
+ * nothing, however much of it you can see in the viewport.
+ *
+ * Only the live preview asks. The export renders the pass regardless: a blank
+ * depth map is a legitimate output for a scene with no geometry, and silently
+ * substituting the colour frame there would be a lie about what was rendered.
+ */
+function depthHasSubject(): boolean {
+  return !!sceneDepthTexture || (!!model && !modelIsSplat)
+}
+
 function renderDepthPass(forExport: boolean) {
   const r = renderer.value
   if (!r) return
@@ -1057,7 +1115,13 @@ function loop() {
   // code as the export, full size, and the range gizmo drawn over it.
   if (depthPanelOpen.value) {
     updateDepthGizmo()
-    if (depthView.value) renderDepthPass(false)
+    // Only paint the depth pass when it would actually contain something. With
+    // nothing to measure it renders a flat void, and a viewport that goes black
+    // reads as a broken tab rather than as "there is no geometry here yet" —
+    // which is exactly the wrong message while you are still loading a model.
+    // Falling back to the normal frame keeps the near/far gizmo on a scene you
+    // can see, and the pass takes over by itself the moment there is depth.
+    if (depthView.value && depthHasSubject()) renderDepthPass(false)
     else renderFrame()
   } else {
     if (rangeGizmo) rangeGizmo.visible = false
@@ -1116,6 +1180,7 @@ function resize() {
   r.setSize(w, h, false)
   camera.aspect = props.aspect.w / props.aspect.h
   camera.updateProjectionMatrix()
+  syncLens()          // a new format turns the same angle into a different focal length
   fitBackground()
 }
 
@@ -1134,29 +1199,39 @@ function viewUrl(ref: { filename: string; type: string; subfolder: string }) {
   return `${props.apiBase}/view?${q}`
 }
 
+/** The ONE writer of the backdrop quad's material. The photo draws only when it is wired
+ *  AND `showBg` is on; otherwise the flat colour, so a holed mesh still has something
+ *  behind it. Everything — viewport and export — goes through this quad, so hiding it
+ *  here hides it everywhere. Scale stays with fitBackground: a cover-fit is >= the screen,
+ *  and over-scaling a solid colour is invisible. */
+function applyBackdrop() {
+  if (!bgMesh) return
+  const m = bgMesh.material as THREE.MeshBasicMaterial
+  const show = !!bgTexture && showBg.value
+  m.map = show ? bgTexture : null
+  m.color.set(show ? 0xffffff : bgColor.value)
+  m.needsUpdate = true
+}
+
 async function setBackground(ref: { filename: string; type: string; subfolder: string } | null) {
   if (!ref) {
     bgTexture?.dispose()
     bgTexture = null
-    if (bgMesh) {
-      const m = bgMesh.material as THREE.MeshBasicMaterial
-      m.map = null
-      m.color.set(bgColor.value)
-      m.needsUpdate = true
-      bgMesh.scale.set(1, 1, 1)
-    }
+    hasBgImage.value = false
+    bgWired = false        // so re-connecting a plate later counts as a fresh edge
+    applyBackdrop()
+    bgMesh?.scale.set(1, 1, 1)
+    updateEnvironment() // back to the white fill; without this the unwired plate kept lighting
     return
   }
   const texture = await new THREE.TextureLoader().loadAsync(viewUrl(ref))
   texture.colorSpace = THREE.SRGBColorSpace
   bgTexture?.dispose()
   bgTexture = texture
-  if (bgMesh) {
-    const m = bgMesh.material as THREE.MeshBasicMaterial
-    m.map = texture
-    m.color.set(0xffffff)
-    m.needsUpdate = true
-  }
+  hasBgImage.value = true
+  if (!bgWired) showBg.value = true   // just connected: show it. Before applyBackdrop, which reads it.
+  bgWired = true
+  applyBackdrop()
   fitBackground()
   updateEnvironment()
 }
@@ -1428,20 +1503,34 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
   }
 }
 
-/** A photo backdrop wins: with bg_image wired the quad carries the texture and tinting it
- *  would tint the photo. The colour is still stored, ready for when the image is unwired. */
+/** A shown photo backdrop wins: tinting the quad would tint the photo. The colour is still
+ *  stored, ready for when the image is unwired — or hidden with the toggle. */
 function setBgColor(v: string) {
   bgColor.value = v
-  if (bgMesh && !bgTexture) (bgMesh.material as THREE.MeshBasicMaterial).color.set(v)
+  applyBackdrop()
 }
 
-/** Vertical field of view, in degrees — the lens. Wide flattens nothing and exaggerates
- *  perspective; long compresses it. Matching the plate's lens is what makes a composite sit. */
-function setFov(v: number) {
-  fov.value = v
-  camera.fov = v
-  camera.updateProjectionMatrix()
+/** Show/hide the wired plate. The environment is untouched on purpose. */
+function toggleBg() {
+  showBg.value = !showBg.value
+  applyBackdrop()
 }
+
+/** Focal length in 35mm-equivalent millimetres — the lens. Short exaggerates perspective,
+ *  long compresses it. Matching the plate's lens is what makes a composite sit.
+ *  three owns the film-back maths: setFocalLength writes camera.fov and reprojects. */
+function setFocal(mm: number) {
+  camera.setFocalLength(mm)
+  // Show what was ASKED, not the read-back. The mm→fov→mm round trip drifts by up to
+  // 4.5e-13 (measured over the field's whole range), which is invisible in the readout
+  // but is enough for the ↺ affordance's exact compare to keep showing after you click
+  // it. The field has already clamped the value, so this cannot show an unreachable one.
+  focal.value = mm
+}
+/** camera.fov is the truth; refresh the mm mirror from it. Must run whenever the ASPECT
+ *  changes too, not just the angle: the same fov on a different format is a different
+ *  focal length. */
+function syncLens() { focal.value = camera.getFocalLength() }
 
 /** Tilt the horizon. The view axis is the roll axis, so the direction is read from the
  *  camera itself and stays valid wherever the orbit has taken it. */
@@ -1459,7 +1548,7 @@ function applyCameraInfo(info: any) {
   if (info.quaternion) {
     camera.quaternion.set(info.quaternion.x, info.quaternion.y, info.quaternion.z, info.quaternion.w)
   }
-  if (typeof info.fov === 'number') { camera.fov = info.fov; fov.value = info.fov }
+  if (typeof info.fov === 'number') { camera.fov = info.fov; syncLens() }  // the wire format stays degrees
   if (typeof info.zoom === 'number') camera.zoom = info.zoom
   camera.updateProjectionMatrix()
   if (controls && info.target) {
@@ -2134,6 +2223,7 @@ function serialise(): string {
     camera: cameraInfo(),
     roll: roll.value,
     bgColor: bgColor.value,
+    showBg: showBg.value,
     env: env.value,
     lightAz: lightAz.value,
     lightEl: lightEl.value,
@@ -2184,7 +2274,15 @@ function deserialise(json: string) {
       lockChosenByUser = true
       applyControlsEnabled()
     }
+    // showBg first: setBgColor writes the quad through applyBackdrop, which reads it.
+    if (typeof s.showBg === 'boolean') showBg.value = s.showBg
+    // A saved `false` can only have been produced by clicking the hide button, and that
+    // button only exists while a plate is wired — so it proves one was. Seeding the flank
+    // with it is what stops the first run after a reload from undoing a deliberate hide.
+    // No new serialised field, so workflows saved before this behave the same way.
+    bgWired = s.showBg === false
     if (typeof s.bgColor === 'string') setBgColor(s.bgColor)
+    else applyBackdrop()
     if (typeof s.showGrid === 'boolean') {
       showGrid.value = s.showGrid
       if (grid) grid.visible = s.showGrid
@@ -2442,10 +2540,10 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
       </template>
       <label class="nkd-barfield" :title="hasCamera
-        ? 'Vertical field of view. A solved camera drives this — the next run puts its lens back.'
-        : 'Vertical field of view, in degrees. Drag to scrub, click to type.'">FOV
-        <DragNumber :model-value="fov" :step="0.25" :min="1" :max="170" :decimals="1"
-                    :reset-to="DEFAULT_FOV" @update:model-value="setFov" />
+        ? 'Focal length, 35mm-equivalent. A solved camera drives this — the next run puts its lens back.'
+        : 'Focal length in 35mm-equivalent mm (full-frame 36mm back), the same figure the fSpy node solves. Short = wide and exaggerated, long = compressed. Drag to scrub, click to type.'">Lens
+        <DragNumber :model-value="focal" :step="0.5" :min="2" :max="2000" :decimals="1"
+                    :reset-to="defaultFocal" @update:model-value="setFocal" />mm
       </label>
       <label class="nkd-barfield" title="Camera roll (dutch angle), in degrees. Tilts the horizon; orbiting keeps it.">Roll
         <DragNumber :model-value="roll" :step="0.25" :min="-180" :max="180" :decimals="1"
@@ -2647,6 +2745,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
              emoji ignores `color` and reads as a sticker next to the others. -->
         <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid">
           <i class="pi pi-th-large" />
+        </button>
+        <button v-if="hasBgImage" :class="{ on: showBg }" @click="toggleBg"
+                :title="showBg
+                  ? 'Backdrop image shown — click to hide it here AND in the export; its colours keep lighting the model'
+                  : 'Backdrop image hidden (viewport and export) — it still lights the model. Click to show it'">
+          <i :class="showBg ? 'pi pi-image' : 'pi pi-eye-slash'" />
         </button>
         <button :disabled="camLocked" @click="frameModel"
                 :title="camLocked ? 'Camera locked — unlock to reframe' : 'Frame model'">

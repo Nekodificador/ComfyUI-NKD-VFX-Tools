@@ -11,6 +11,20 @@
  * DragNumber follows. Toggling Shift halfway through a drag must not make the
  * value jump; it just changes how fast it moves from wherever it already is.
  *
+ * **The drag is ours, not the browser's**, and that is the whole trick. The
+ * previous version let the native control drag and rescaled the `input` event
+ * afterwards, which cannot work past one screenful: the value the browser
+ * reports is derived from the cursor's position *on the track*, so once the
+ * cursor reaches the end there is no more delta to scale and the slider stops.
+ * A tenth-speed drag could therefore never travel more than a tenth of the
+ * range — on a −1…1 slider that is a hard ceiling of 0.2, whatever you do with
+ * the mouse. Accumulating raw pointer deltas under pointer capture has no such
+ * ceiling: keep moving and it keeps going, off the end of the track and past
+ * the edge of the window.
+ *
+ * Double-click resets a slider to its default, for any input carrying a
+ * `data-default` attribute. Sliders without one simply do not reset.
+ *
  * No imports, so this file copies into any other ComfyUI-NKD-* pack as-is.
  */
 
@@ -26,86 +40,114 @@ if (typeof window !== "undefined") {
   window.addEventListener("blur", () => { shiftHeld = false; });
 }
 
-/** True while the fine-adjust modifier is held. */
+/** True while the fine-adjust modifier is held. Used by the 3D gizmo, which
+ *  has no pointer event of its own to read at the moment it needs to know. */
 export function isFine(): boolean { return shiftHeld; }
 
-interface Anchor { shift: boolean; val: number; raw: number; step: string }
+const isRange = (t: EventTarget | null): t is HTMLInputElement =>
+  !!t && (t as HTMLInputElement).tagName === "INPUT" && (t as HTMLInputElement).type === "range";
+
+const num = (s: string, fallback: number) => {
+  const v = parseFloat(s);
+  return Number.isFinite(v) ? v : fallback;
+};
 
 /**
- * Make every <input type="range"> under `root` respect the fine modifier.
+ * Write a value back and tell the framework about it.
  *
- * Delegated and capture-phase on purpose: the listener rewrites the element's
- * value BEFORE the control's own bubble-phase handler (v-model included) reads
- * it, so not one of the ~26 slider templates in this pack needs touching.
+ * Quantized here rather than by the control: `step` is loosened to "any" for the
+ * duration of a drag (a range input snaps whatever you assign to its step, which
+ * would swallow a tenth-speed move whole), so the rounding has to happen on this
+ * side. Integer-stepped controls stay integer — some of them count iterations,
+ * and 2.5 passes is not a thing.
+ */
+function emit(el: HTMLInputElement, v: number, fine: boolean,
+              step: number, min: number, max: number): void {
+  const q = fine ? (Number.isInteger(step) && step >= 1 ? 1 : step * FINE_GAIN) : step;
+  if (q > 0) v = Math.round(v / q) * q;
+  v = Math.min(max, Math.max(min, v));
+  // Rounded again to kill the float dust that leaves 0.30000000000000004 in a
+  // readout bound straight to the value.
+  v = Math.round(v * 1e6) / 1e6;
+  if (el.value === String(v)) return;
+  el.value = String(v);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/**
+ * Make every <input type="range"> under `root` drag by pointer delta, respect
+ * the fine modifier, and reset on double-click.
+ *
+ * Delegated and capture-phase on purpose: not one of the ~26 slider templates in
+ * this pack needs touching. A template opts into double-click reset by adding
+ * `data-default`; everything else works with no template change at all.
  *
  * Returns a detach function.
  */
 export function attachFineRange(root: HTMLElement): () => void {
-  const anchors = new WeakMap<HTMLInputElement, Anchor>();
-
-  const isRange = (t: EventTarget | null): t is HTMLInputElement =>
-    !!t && (t as HTMLInputElement).tagName === "INPUT" && (t as HTMLInputElement).type === "range";
-
-  const reset = (e: Event) => {
-    if (isRange(e.target)) {
-      const a = anchors.get(e.target);
-      if (a) e.target.step = a.step;          // leave the control as we found it
-      anchors.delete(e.target);
-    }
-  };
-
-  const onInput = (e: Event) => {
+  const onDown = (e: PointerEvent) => {
     const el = e.target;
-    if (!isRange(el)) return;
-    const raw = parseFloat(el.value);
-    if (!Number.isFinite(raw)) return;
+    if (!isRange(el) || el.disabled || e.button !== 0) return;
+    // The second press of a double-click would otherwise jump the value to the
+    // cursor a frame before the reset lands.
+    if (e.detail > 1) { e.preventDefault(); return; }
 
-    let a = anchors.get(el);
-    if (!a || a.shift !== shiftHeld) {
-      // Re-anchor on every Shift transition, KEEPING the value we are already
-      // at and only re-basing the pointer reference. That is what stops the
-      // value snapping to wherever the cursor drifted to while fine mode was
-      // lagging behind it. On the first event of a drag there is no previous
-      // value, so val = raw and the control tracks the pointer exactly.
-      a = { shift: shiftHeld, val: a ? a.val : raw, raw, step: a?.step ?? (el.step || "any") };
-      anchors.set(el, a);
-      // The step attribute quantises the value, so a tenth-speed drag would be
-      // swallowed whole by it. Loosen it while fine, restore it after.
-      const base = parseFloat(a.step);
-      if (shiftHeld && Number.isFinite(base) && base > 0) {
-        // Integer-stepped controls stay integer: some of them count iterations,
-        // and 2.5 passes is not a thing.
-        el.step = String(Number.isInteger(base) && base >= 1 ? 1 : base * FINE_GAIN);
-      } else {
-        el.step = a.step;
-      }
-    }
+    e.preventDefault();                    // the native drag would fight ours
+    el.focus();
+    try { el.setPointerCapture(e.pointerId); } catch { /* detached */ }
 
-    // Gain 1 is NOT a no-op path to skip: coarse has to stay offset-based too,
-    // or releasing Shift would jump the value to the pointer. Offset-based with
-    // gain 1 tracks the pointer exactly, just carrying whatever lag fine mode
-    // built up — which is what every app does.
-    const gain = shiftHeld ? FINE_GAIN : 1;
-    const min = parseFloat(el.min !== "" ? el.min : "0");
-    const max = parseFloat(el.max !== "" ? el.max : "100");
-    let v = a.val + (raw - a.raw) * gain;
-    if (Number.isFinite(min)) v = Math.max(v, min);
-    if (Number.isFinite(max)) v = Math.min(v, max);
-    const q = parseFloat(el.step);
-    if (Number.isFinite(q) && q > 0) v = Math.round(v / q) * q;
-    el.value = String(v);
-    // Carry the value forward so the next event measures from here, not from a
-    // stale anchor — this is the "incremental" part.
-    a.val = parseFloat(el.value);
-    a.raw = raw;
+    const rect = el.getBoundingClientRect();
+    const width = Math.max(1, rect.width);
+    const min = num(el.min, 0);
+    const max = num(el.max, 100);
+    const span = max - min;
+    const step = num(el.step, 0);          // step="any" → 0 → no quantization
+    const restore = el.step;
+    el.step = "any";                       // or the control snaps our fine values
+
+    // Shift means "adjust what is already there", so it must not jump to the
+    // cursor first. Without Shift, pressing the track jumps, as it always did.
+    let v = e.shiftKey
+      ? num(el.value, min)
+      : min + ((e.clientX - rect.left) / width) * span;
+    emit(el, v, e.shiftKey, step, min, max);
+
+    let prevX = e.clientX;
+    const move = (ev: PointerEvent) => {
+      const gain = ev.shiftKey ? FINE_GAIN : 1;
+      v = Math.min(max, Math.max(min, v + ((ev.clientX - prevX) / width) * span * gain));
+      prevX = ev.clientX;
+      emit(el, v, ev.shiftKey, step, min, max);
+    };
+    const up = (ev: PointerEvent) => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+      el.step = restore;
+      try { el.releasePointerCapture(ev.pointerId); } catch { /* already gone */ }
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
   };
 
-  root.addEventListener("pointerdown", reset, true);
-  root.addEventListener("change", reset, true);
-  root.addEventListener("input", onInput, true);
+  const onDblClick = (e: MouseEvent) => {
+    const el = e.target;
+    if (!isRange(el) || el.disabled) return;
+    const raw = el.dataset.default;
+    if (raw == null) return;               // no declared default: nothing to do
+    const d = parseFloat(raw);
+    if (!Number.isFinite(d)) return;
+    e.preventDefault();
+    emit(el, d, false, num(el.step, 0), num(el.min, 0), num(el.max, 100));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  root.addEventListener("pointerdown", onDown, true);
+  root.addEventListener("dblclick", onDblClick, true);
   return () => {
-    root.removeEventListener("pointerdown", reset, true);
-    root.removeEventListener("change", reset, true);
-    root.removeEventListener("input", onInput, true);
+    root.removeEventListener("pointerdown", onDown, true);
+    root.removeEventListener("dblclick", onDblClick, true);
   };
 }
