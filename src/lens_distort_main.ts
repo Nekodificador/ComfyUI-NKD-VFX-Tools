@@ -15,6 +15,7 @@ import { app as comfyApp } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import LensDistortWidget from "@/LensDistortWidget.vue";
 import { openNkdModal, type NkdModal } from "@/nkd_modal";
+import { queueNode } from "@/queueNode";
 
 const NODE_NAME = "NKDLensDistort";
 const EXT_NAME = "NKD.LensDistort.Vue";
@@ -111,12 +112,6 @@ comfyApp.registerExtension({
             life: 6000,
           });
         }
-        modal = openNkdModal({
-          title: "😺 Lens Distort — plumb lines",
-          hint: "click along something straight (3+ points) · double-click ends a trace · shift-click removes a point · right-drag pans · scroll zooms",
-          onClose: () => teardown(),
-        });
-
         // Snapshot every lens widget so the editor opens on the node's real
         // state, and hand back a setter so edits flow straight to the widgets.
         const PARAM_NAMES = ["mode", "k1", "k2", "k3", "p1", "p2", "center_x", "center_y",
@@ -124,6 +119,21 @@ comfyApp.registerExtension({
                              "vignette_amount", "vignette_falloff", "edge_mode"];
         const params: Record<string, any> = {};
         for (const p of PARAM_NAMES) { const w = wid(p); if (w) params[p] = w.value; }
+        // Only the coefficients count as a change worth re-running for —
+        // lens_state carries the plumb-line traces, which do not alter the image.
+        const solved = () => PARAM_NAMES.some((p) => wid(p) && wid(p).value !== params[p]);
+
+        modal = openNkdModal({
+          title: "😺 Lens Distort — plumb lines",
+          hint: "click along something straight (3+ points) · double-click ends a trace · shift-click removes a point · right-drag pans · scroll zooms",
+          onClose: () => {
+            const rerun = solved();
+            teardown();
+            // Run the node so its preview and everything downstream show the
+            // lens that was just solved. Closing without a change runs nothing.
+            if (rerun) void queueNode(self, "NKD Lens Distort");
+          },
+        });
 
         vueApp = createApp(LensDistortWidget, {
           initialUrl: url,

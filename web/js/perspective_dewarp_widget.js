@@ -33,6 +33,91 @@ function imageUrl(node) {
   return api.apiURL ? api.apiURL(u) : u;
 }
 
+// The frame the backend resolved for each node, keyed by node id. The filename
+// probe above only works when a Load Image is wired straight in; anything that
+// generates or processes the image has no filename anywhere, so the node pushes
+// its resolved input on execute and this is where it lands.
+const pushedFrames = new Map();
+
+function rgbToDataUrl(bytes, w, h) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  if (!ctx) return "";
+  const im = ctx.createImageData(w, h);
+  for (let i = 0, j = 0, n = w * h; i < n; i++) {
+    im.data[j++] = bytes[i * 3];
+    im.data[j++] = bytes[i * 3 + 1];
+    im.data[j++] = bytes[i * 3 + 2];
+    im.data[j++] = 255;
+  }
+  ctx.putImageData(im, 0, 0);
+  return c.toDataURL("image/png");
+}
+
+function storeFrame(d) {
+  if (!d?.img) return "";
+  try {
+    const bin = atob(d.img);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const url = rgbToDataUrl(bytes, d.width, d.height);
+    pushedFrames.set(String(d.node_id), url);
+    return url;
+  } catch { return ""; }
+}
+
+api.addEventListener("nkd-dewarp-source", (e) => storeFrame(e?.detail));
+
+// The push only fires when the node actually executes, and ComfyUI skips it
+// whenever nothing upstream changed — so ask the backend for the frame it kept.
+async function fetchStoredFrame(nodeId) {
+  try {
+    const res = await api.fetchApi(`/nkd/vfx/source?node_id=${encodeURIComponent(nodeId)}`,
+                                   { cache: "no-store" });
+    return res.ok ? storeFrame(await res.json()) : "";
+  } catch { return ""; }
+}
+
+// Live upstream filename first — it tracks a new file with no run — then the
+// last frame this node resolved.
+function sourceUrl(node) {
+  return imageUrl(node) || pushedFrames.get(String(node.id)) || "";
+}
+
+// Run this node and its upstream dependencies, nothing else. `app.queuePrompt`
+// has no "just this node" form, so the serialised graph is intercepted for one
+// call and trimmed. Same trick as ComfyUI-NKD-Basic-Tools' spline editors.
+function collectUpstream(nodeId, output, into) {
+  if (into[nodeId] || !output[nodeId]) return;
+  into[nodeId] = output[nodeId];
+  for (const value of Object.values(output[nodeId].inputs ?? {})) {
+    if (Array.isArray(value)) collectUpstream(String(value[0]), output, into);
+  }
+}
+
+async function queueNode(node) {
+  const origQueue = api.queuePrompt;   // the method itself, so .call() works
+  try {
+    api.queuePrompt = async function (index, prompt) {
+      api.queuePrompt = origQueue;     // one call only
+      if (prompt?.output) {
+        const filtered = {};
+        collectUpstream(String(node.id), prompt.output, filtered);
+        prompt = { ...prompt, output: filtered };
+      }
+      return origQueue.call(api, index, prompt);
+    };
+    await app.queuePrompt(0, 1);
+  } catch (err) {
+    api.queuePrompt = origQueue;
+    console.error("[NKD Perspective Unwarp] queue failed:", err);
+    app.extensionManager?.toast?.add?.({
+      severity: "error", summary: "Queue Failed", detail: String(err), life: 6000,
+    });
+  }
+}
+
 function hide(w) {
   if (!w) return;
   w.type = "hidden"; w.hidden = true;
@@ -114,7 +199,7 @@ function applyH(H, u, v) {
 }
 
 function openModal(node, cornersWidget) {
-  const url = imageUrl(node);
+  const url = sourceUrl(node);
   const state = (() => {
     try { const s = JSON.parse(cornersWidget.value); if (s?.corners?.length === 4) return s; } catch {}
     return JSON.parse(JSON.stringify(DEFAULT));
@@ -386,10 +471,16 @@ function openModal(node, cornersWidget) {
   // Called by the modal on every exit path (primary button, ✕, Esc, backdrop).
   // The chrome owns removing the overlay and its key listener.
   function commit() {
-    cornersWidget.value = JSON.stringify(state);
+    const json = JSON.stringify(state);
+    const moved = json !== cornersWidget.value;
+    cornersWidget.value = json;
     node.setDirtyCanvas(true, true);
     ro.disconnect();
     window.removeEventListener("blur", onBlur);
+    // Run the node so its preview and everything downstream show the quad that
+    // was just placed. Only when the corners actually moved — closing without
+    // touching anything runs nothing.
+    if (moved) void queueNode(node);
   }
 
   const ro = new ResizeObserver(resize); ro.observe(wrap);
@@ -409,14 +500,18 @@ app.registerExtension({
       if (idx !== undefined && idx >= 0) this.removeInput(idx);
       const node = this;
       this.addWidget("button", "📐 Edit corners", null, () => {
-        if (!imageUrl(node)) {
-          app.extensionManager?.toast?.add?.({
-            severity: "warn", summary: "Perspective Unwarp",
-            detail: "Connect an image (Load Image) to the input first.", life: 5000,
-          });
-          return;
-        }
-        openModal(node, cornersWidget);
+        void (async () => {
+          if (!sourceUrl(node)) await fetchStoredFrame(String(node.id));
+          if (!sourceUrl(node)) {
+            app.extensionManager?.toast?.add?.({
+              severity: "warn", summary: "Perspective Unwarp",
+              detail: "Connect an image and run this node once (blue play) to load the plate into the editor.",
+              life: 6000,
+            });
+            return;
+          }
+          openModal(node, cornersWidget);
+        })();
       });
 
       // Wire the combos so hiding follows selection, then apply the initial state.

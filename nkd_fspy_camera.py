@@ -149,6 +149,29 @@ def _build_camera_info(solve, distance, origin):
     }
 
 
+# Last frame each node resolved, oldest first so overflow drops the stalest.
+_SOURCE_CACHE: dict = {}
+_SOURCE_CACHE_MAX = 8
+
+try:
+    from server import PromptServer as _PS  # type: ignore
+    from aiohttp import web as _web
+
+    @_PS.instance.routes.get("/nkd/vfx/source")
+    async def _nkd_vfx_source(request):
+        """The frame a node last resolved — same payload as the websocket push.
+
+        Needed because the push rides on execution, and a node whose inputs did
+        not change is served from the executor's cache and never runs.
+        """
+        payload = _SOURCE_CACHE.get(request.rel_url.query.get("node_id", ""))
+        if payload is None:
+            return _web.Response(status=404, text="no frame for that node yet")
+        return _web.json_response(payload)
+except Exception:  # not inside ComfyUI (standalone tests import this module bare)
+    pass
+
+
 def _send_source_to_widget(unique_id, image, event: str = "nkd-fspy-source") -> None:
     """Push the RESOLVED input image to this node's viewer, so partial-executing the node
     loads the photo even when the source isn't a directly-connected Load Image (the widget
@@ -172,9 +195,15 @@ def _send_source_to_widget(unique_id, image, event: str = "nkd-fspy-source") -> 
     ph, pw = int(s.shape[0]), int(s.shape[1])
     arr = s.clamp(0.0, 1.0).mul(255).byte().cpu().numpy()
     b64 = base64.b64encode(arr.tobytes()).decode("ascii")
-    PromptServer.instance.send_sync(
-        event, {"node_id": str(unique_id), "img": b64, "width": pw, "height": ph,
-                "src_width": w, "src_height": h})
+    payload = {"node_id": str(unique_id), "img": b64, "width": pw, "height": ph,
+               "src_width": w, "src_height": h}
+    # Keep it too: the push only rides on execution, and ComfyUI skips a node
+    # whose inputs did not change — which is the normal state by the time you
+    # open the editor. The frontend refetches it over /nkd/vfx/source.
+    _SOURCE_CACHE[str(unique_id)] = payload
+    while len(_SOURCE_CACHE) > _SOURCE_CACHE_MAX:
+        _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
+    PromptServer.instance.send_sync(event, payload)
 
 
 class NKDfSpyCamera(io.ComfyNode):

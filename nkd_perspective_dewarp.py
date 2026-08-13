@@ -314,6 +314,11 @@ def _rewarp_pipeline(flat_image, data: "NKDWarpData", feather, edge_hardness,
 # --- ComfyUI node classes (require comfy_api; skipped in the standalone tests) ---
 if _HAS_COMFY:
 
+    try:
+        from .nkd_fspy_camera import _send_source_to_widget
+    except ImportError:  # pragma: no cover - standalone (pack dir on sys.path)
+        from nkd_fspy_camera import _send_source_to_widget
+
     @comfytype(io_type="NKD_WARPDATA")
     class NKDWarpDataType(ComfyTypeIO):
         Type = NKDWarpData
@@ -371,12 +376,19 @@ if _HAS_COMFY:
                     NKDWarpDataType.Output("warp_data",
                                            tooltip="Connect to 😺NKD Perspective Rewarp."),
                 ],
+                hidden=[io.Hidden.unique_id],   # to target this node's editor
             )
 
         @classmethod
         def execute(cls, image, corners, aspect_source, manual_ratio_w, manual_ratio_h,
                     resolution_mode, longest_side, megapixels,
                     focal_length_mm=35.0) -> io.NodeOutput:
+            # The editor can only read a filename off a directly-connected Load
+            # Image; a generated plate has none. Push the resolved frame so the
+            # node works anywhere in the graph — same as Lens Distort / fSpy.
+            _send_source_to_widget(
+                getattr(getattr(cls, "hidden", None), "unique_id", None),
+                image, event="nkd-dewarp-source")
             flat, data = _unwarp_pipeline(
                 image, corners, aspect_source, focal_length_mm, manual_ratio_w,
                 manual_ratio_h, resolution_mode, longest_side, megapixels)
