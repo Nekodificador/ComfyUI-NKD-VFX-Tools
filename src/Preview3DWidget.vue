@@ -16,7 +16,10 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { attachFineRange, isFine, FINE_GAIN } from './fine_drag'
 import { groundHit, viewZSpan } from './depth_range'
 import { smoothNormalsByPosition } from './smooth_normals'
+import { objectBase, objPosition, pivotFromGroup, type Quat, type V3 } from './pivot'
+import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
+import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
 import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
@@ -141,6 +144,7 @@ const hasCamera = ref(false)      // camera_info is wired and arriving
 // otherwise unlocking would only last until the next execute.
 let lockChosenByUser = false
 let gizmoDragging = false
+let orbiting = false // a camera drag is live: Shift damps its pointer, same as the gizmo's
 let detachFine: (() => void) | null = null
 let detachGizmoFine: (() => void) | null = null
 // One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
@@ -229,7 +233,11 @@ let lightSeq = 1
 const objPos = reactive({ x: 0, y: 0, z: 0 })
 const objRot = reactive({ x: 0, y: 0, z: 0 }) // degrees
 const objScale = ref(1)
-const pivotMode = ref<'bottom' | 'center' | 'origin'>('bottom')
+const pivotMode = ref<'bottom' | 'center' | 'origin' | 'custom'>('bottom')
+// 'custom' pivot: a point the user placed by hand, in group-local space. MoGe/DA3 meshes often
+// arrive with their bbox nowhere near what you want to spin, and the three presets can't help.
+const pivotCustom = new THREE.Vector3()
+const pivotEdit = ref(false) // Alt held: the gizmo moves the PIVOT, leaving the object put
 const gizmoMode = ref<'off' | 'translate' | 'rotate' | 'scale'>('off')
 // Which axes the gizmo hands you: the world's, or the object's own. three's own default is
 // 'world'. NOTE it has no say over Scale — TransformControls hard-codes `space = 'local'` for
@@ -274,6 +282,21 @@ const defaultFocal = computed(() =>
 // UP is the version lookAt cannot undo, and it survives orbiting for free.
 const roll = ref(0)
 let controls: OrbitControls | null = null
+let viewHelper: ViewHelper | null = null // axis gizmo, bottom-right: click an axis for that view
+// An axis view is for judging alignment, and perspective is exactly what ruins that: parallel
+// edges converge and a straight-on face still shows its sides. So those views render through an
+// orthographic twin of the camera. It is a TWIN, not a replacement — the perspective camera
+// stays the one piece of state (the lens, the roll, camera_info, what fSpy solves against), and
+// the twin only mirrors it, so nothing has to be converted back on the way out.
+const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 10000)
+const orthoView = ref(false)
+const orthoAim = new THREE.Quaternion() // the orientation the axis view was entered at
+let wasFlying = false // the ViewHelper was animating on the PREVIOUS frame — see loop()
+// Saved viewpoints. cameraInfo() already carries pose + lens + orbit target, so a slot is just
+// that plus the roll, which lives outside it (it is baked into camera.up, not the quaternion).
+const CAM_SLOTS = 4
+const camSlots = ref<({ cam: any; roll: number } | null)[]>(Array(CAM_SLOTS).fill(null))
+const viewClock = new THREE.Clock()
 let transformControls: TransformControls | null = null
 let gizmoHelper: THREE.Object3D | null = null // what actually gets added to the scene in r0.18x
 const gizmoLightId = ref<number | null>(null) // when the gizmo is dragging a light body
@@ -412,7 +435,8 @@ let farLine: THREE.Line | null = null
 
 let grid: THREE.GridHelper | null = null
 let pivotGroup: THREE.Group | null = null // wraps the model; carries the user transform
-let pivotP = new THREE.Vector3() // pivot point in group-local space, cached
+let pivotP = new THREE.Vector3() // pivot point in MODEL space, cached
+let modelHolder: THREE.Group | null = null // inside pivotGroup at -pivotP, so the group sits ON the pivot
 let keyLight: THREE.DirectionalLight | null = null
 let shadowCatcher: THREE.Mesh | null = null
 
@@ -487,6 +511,10 @@ function initScene() {
 
   pivotGroup = new THREE.Group()
   scene.add(pivotGroup)
+  // The model hangs one level down, offset by -pivot. That is what lets pivotGroup's own origin
+  // BE the pivot - which is where TransformControls draws itself and what it rotates about.
+  modelHolder = new THREE.Group()
+  pivotGroup.add(modelHolder)
 
   keyLight = new THREE.DirectionalLight(0xffffff, lightInt.value)
   keyLight.castShadow = true
@@ -959,6 +987,53 @@ function layBackdropDepth() {
 // the backdrop). With Occlude on, the composite pass lays the photo's depth first so nearer
 // foreground hides the model. The mask/object pass (drawBackdrop=false) never occludes — the
 // silhouette must stay whole.
+/** Copy the lens's pose and its footprint at the orbit target onto the ortho twin. Matching
+ *  the frustum to what the lens sees AT THAT DISTANCE is what makes the switch seamless: the
+ *  plane you are looking at keeps its size, only the convergence goes away.
+ *
+ *  Called at render time, not once on entry: near/far are rewritten by the depth pass and the
+ *  aspect by capture(), and the twin has to carry both. */
+function syncOrthoCam() {
+  const dist = camera.position.distanceTo(controls?.target ?? new THREE.Vector3()) || 1
+  const { halfW, halfH } = orthoFrustum(camera.fov, camera.aspect, dist)
+  orthoCam.position.copy(camera.position)
+  orthoCam.quaternion.copy(camera.quaternion)
+  orthoCam.up.copy(camera.up)
+  orthoCam.left = -halfW
+  orthoCam.right = halfW
+  orthoCam.top = halfH
+  orthoCam.bottom = -halfH
+  orthoCam.near = camera.near
+  orthoCam.far = camera.far
+  orthoCam.zoom = camera.zoom
+  orthoCam.updateProjectionMatrix()
+  orthoCam.updateMatrixWorld()
+}
+
+/** The camera the viewport (and therefore the export) draws through. */
+function viewCam(): THREE.Camera {
+  if (!orthoView.value) return camera
+  syncOrthoCam()
+  return orthoCam
+}
+
+/** Enter/leave the orthographic axis view. Turning the camera away leaves it: the lens is what
+ *  the node is really for, so ortho is a look, not a mode you can forget you left on.
+ *
+ *  It is TURNING that ends it, not any interaction. The first cut listened to OrbitControls'
+ *  'start', which fires on pointerdown before TransformControls has claimed the drag — so
+ *  grabbing the object's gizmo dropped you back into perspective (reported). Watching the
+ *  orientation itself also leaves dolly and pan inside the ortho view, which is what you want
+ *  while lining something up: zoom in on a straight-on face without losing the projection. */
+function setOrthoView(on: boolean) {
+  if (orthoView.value === on) return
+  orthoView.value = on
+  if (on) { orthoAim.copy(camera.quaternion); syncOrthoCam() }
+  // The gizmo has to pick through the same projection it is drawn in, or dragging drifts.
+  if (transformControls) transformControls.camera = on ? orthoCam : camera
+  status.value = on ? 'Ortho view — moving the camera returns to the lens' : ''
+}
+
 function renderFrame(drawBackdrop = true) {
   const r = renderer.value
   if (!r) return
@@ -971,7 +1046,7 @@ function renderFrame(drawBackdrop = true) {
     r.toneMapping = tone
     if (occlude.value && sceneDepthTexture) layBackdropDepth()
   }
-  r.render(scene, camera)
+  r.render(scene, viewCam())
   r.autoClear = true
 }
 
@@ -1077,7 +1152,7 @@ function renderDepthPass(forExport: boolean) {
     // Off: clear it so the object always wins (composite-over, the original behaviour).
     if (!occlude.value) r.clearDepth()
   }
-  r.render(scene, camera)
+  r.render(scene, viewCam())
   r.autoClear = true
 
   originals.forEach((mat, mesh) => { mesh.material = mat })
@@ -1105,7 +1180,25 @@ function lgScale(): number {
 
 let lastScale = 0
 function loop() {
+  // getDelta() every frame, animating or not: it measures the gap since the LAST call, so
+  // asking for it only while animating would hand the first step the whole idle time and
+  // snap the camera to the new view instead of turning to it.
+  const dt = viewClock.getDelta()
+  if (viewHelper?.animating) viewHelper.update(dt)
   controls?.update()
+  const flying = !!viewHelper?.animating
+  if (orthoView.value) {
+    // While flying to the axis the camera is turning on purpose: follow it instead of bailing.
+    // `wasFlying` covers the ARRIVAL frame, and it is not a nicety: `animating` goes false
+    // inside the very update that takes the last step, so without it that step (up to ~0.1 rad
+    // at 60fps) is measured as a user turn and the view drops out of ortho the instant it gets
+    // there — which read as "clicking an axis leaves you in perspective" (reported).
+    if (flying || wasFlying) orthoAim.copy(camera.quaternion)
+    // 1e-3 rad (0.06°) rather than exact: with damping the tail of a previous orbit can still
+    // be bleeding off, and that must not read as "the user turned the camera".
+    else if (orthoAim.angleTo(camera.quaternion) > 1e-3) setOrthoView(false)
+  }
+  wasFlying = flying
   // Re-fit the resolution when the canvas zoom changes — a CSS transform that fires no
   // ResizeObserver, so it must be polled. Reading a number (no layout reflow) is cheap.
   const s = lgScale()
@@ -1127,6 +1220,7 @@ function loop() {
     if (rangeGizmo) rangeGizmo.visible = false
     renderFrame()
   }
+  drawViewHelper()
   raf = requestAnimationFrame(loop)
 }
 
@@ -1494,7 +1588,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
       applyUnbake() // re-apply if Unbake was left on for the previous model
       applySmoothNormals()
     }
-    ;(pivotGroup ?? scene).add(model)
+    ;(modelHolder ?? scene).add(model)
     recomputePivot()
     applyObjectTransform()
     status.value = ''
@@ -1576,24 +1670,40 @@ function applyModelInfo(list: any) {
 
 /** Model bbox in group-local space: measured with the group forced to identity,
  *  because Box3.setFromObject works off world matrices. */
-function recomputePivot() {
+/** The model's bbox in MODEL space — the frame pivotP lives in. Box3.setFromObject works off
+ *  world matrices, so both the group AND the holder's pivot offset have to be neutralised, or
+ *  the measurement would chase the very pivot it is about to define. */
+function localBox(): THREE.Box3 | null {
   const g = pivotGroup
-  if (!g || !model) return
-  if (pivotMode.value === 'origin') {
-    pivotP.set(0, 0, 0)
-    return
-  }
+  if (!g || !model) return null
   const saved = { p: g.position.clone(), q: g.quaternion.clone(), s: g.scale.clone() }
+  const savedHolder = modelHolder?.position.clone()
   g.position.set(0, 0, 0)
   g.quaternion.identity()
   g.scale.set(1, 1, 1)
+  modelHolder?.position.set(0, 0, 0)
   g.updateMatrixWorld(true)
   const box = new THREE.Box3().setFromObject(model)
   g.position.copy(saved.p)
   g.quaternion.copy(saved.q)
   g.scale.copy(saved.s)
+  if (savedHolder) modelHolder!.position.copy(savedHolder)
   g.updateMatrixWorld(true)
-  if (box.isEmpty()) {
+  return box.isEmpty() ? null : box
+}
+
+function recomputePivot() {
+  if (!pivotGroup || !model) return
+  if (pivotMode.value === 'origin') {
+    pivotP.set(0, 0, 0)
+    return
+  }
+  if (pivotMode.value === 'custom') {
+    pivotP.copy(pivotCustom) // placed by hand; a bbox says nothing about it
+    return
+  }
+  const box = localBox()
+  if (!box) {
     pivotP.set(0, 0, 0)
     return
   }
@@ -1612,26 +1722,86 @@ function applyObjectTransform() {
   const s = Math.max(0.001, objScale.value)
   g.quaternion.copy(q)
   g.scale.setScalar(s)
-  // position = t + p − q·(s·p) ⇒ points map to q·s·(x−p) + p + t: about the pivot.
-  g.position.set(objPos.x, objPos.y, objPos.z)
-    .add(pivotP)
-    .sub(pivotP.clone().multiplyScalar(s).applyQuaternion(q))
+  // The group IS the pivot: it goes to the pivot's world place, the model hangs at -pivot.
+  g.position.set(objPos.x + pivotP.x, objPos.y + pivotP.y, objPos.z + pivotP.z)
+  modelHolder?.position.copy(pivotP).multiplyScalar(-1)
   contactDirty = true // the footprint moved — re-bake the grounding shadow
 }
 
-function setPivotMode(m: 'bottom' | 'center' | 'origin') {
-  // Switching pivot must not move the object: fold the placement difference the new
-  // pivot introduces back into the position offset. Only future edits feel the change.
-  const before = pivotGroup?.position.clone()
-  pivotMode.value = m
-  recomputePivot()
+/** Where the object sits, independent of the pivot. Capture it, move the pivot, restore it:
+ *  that is the whole trick, and it is exact instead of a fold-back estimate (the old one
+ *  ignored the q·s term and drifted on a rotated or scaled object). */
+function objectBaseNow(): V3 | null {
+  const g = pivotGroup
+  if (!g) return null
+  return objectBase(g.position, pivotP, g.quaternion.toArray() as Quat, g.scale.x)
+}
+
+/** Re-derive Pos so the object stays exactly put after `mutate` has moved the pivot. */
+function repivot(mutate: () => void) {
+  const g = pivotGroup
+  const base = objectBaseNow()
+  mutate()
+  if (!g || !base) { applyObjectTransform(); return }
+  const o = objPosition(base, pivotP, g.quaternion.toArray() as Quat, g.scale.x)
+  objPos.x = +o.x.toFixed(4)
+  objPos.y = +o.y.toFixed(4)
+  objPos.z = +o.z.toFixed(4)
   applyObjectTransform()
-  if (pivotGroup && before) {
-    objPos.x += before.x - pivotGroup.position.x
-    objPos.y += before.y - pivotGroup.position.y
-    objPos.z += before.z - pivotGroup.position.z
-    applyObjectTransform()
-  }
+}
+
+function setPivotMode(m: 'bottom' | 'center' | 'origin' | 'custom') {
+  // Switching pivot must not move the object. Only future edits feel the change.
+  repivot(() => { pivotMode.value = m; recomputePivot() })
+}
+
+/** Alt: drag the gizmo itself and leave the object behind.
+ *
+ *  No second handle is needed — the gizmo is already ON the pivot, because that is where the
+ *  group's origin is. Dragging it moves the group; holding the object's `base` fixed then says
+ *  what pivot that implies (pivotFromGroup), and the holder's -pivot offset puts the model
+ *  straight back where it was. Net effect: the gizmo moves, nothing else does.
+ *
+ *  Translate only: a pivot is a POINT, so rotating or scaling it is a no-op by definition. */
+let pivotDragBase: V3 | null = null
+function setPivotEdit(on: boolean) {
+  if (on === pivotEdit.value) return
+  if (gizmoDragging) return // switching what a live drag means tears the drag apart
+  if (on && (gizmoMode.value === 'off' || gizmoLightId.value != null || gizmoTargetId.value != null)) return
+  if (!transformControls || !pivotGroup) return
+  pivotEdit.value = on
+  pivotDragBase = on ? objectBaseNow() : null
+  transformControls.setMode(on ? 'translate' : (gizmoMode.value === 'off' ? 'translate' : gizmoMode.value))
+  status.value = on ? 'Alt — moving the object origin' : ''
+}
+
+function resetTransform() {
+  objPos.x = objPos.y = objPos.z = 0
+  objRot.x = objRot.y = objRot.z = 0
+  objScale.value = 1
+  applyObjectTransform() // the pivot is not a transform — a hand-placed one survives
+}
+
+/** Fit to the ground, like the new frontend's 3D viewer: biggest dimension normalised to
+ *  FIT_SIZE and the bbox's floor centre dropped on the origin. Generated meshes come in at
+ *  arbitrary scale and offset, and that is the state everything else here assumes. */
+const FIT_SIZE = 2 // world units, against a 10-unit grid
+function fitToGround() {
+  const box = localBox()
+  if (!box) return
+  const size = box.getSize(new THREE.Vector3())
+  const maxd = Math.max(size.x, size.y, size.z)
+  if (!(maxd > 0)) return
+  objRot.x = objRot.y = objRot.z = 0
+  objScale.value = FIT_SIZE / maxd
+  pivotMode.value = 'bottom' // direct: repivot would preserve the placement we're replacing
+  recomputePivot()
+  // World pivot = pivotP + Pos (the group's own position), so this drops the bbox's floor
+  // centre exactly on the origin. NOT Pos = 0: that would leave it wherever it was authored.
+  objPos.x = -pivotP.x
+  objPos.y = -pivotP.y
+  objPos.z = -pivotP.z
+  applyObjectTransform()
 }
 
 // The gizmo drags pivotGroup directly. Decompose its pose back into the panel values so the
@@ -1664,6 +1834,21 @@ function readbackGizmo() {
   }
   const g = pivotGroup
   if (!g) return
+  // Alt: the drag moved the pivot, not the object. Read the pivot it implies and undo the
+  // group's move on the model side, so the object never budges.
+  if (pivotEdit.value && pivotDragBase) {
+    const q = g.quaternion.toArray() as Quat
+    const np = pivotFromGroup(g.position, pivotDragBase, q, g.scale.x)
+    pivotCustom.set(np.x, np.y, np.z)
+    pivotMode.value = 'custom'
+    pivotP.copy(pivotCustom)
+    const o = objPosition(pivotDragBase, pivotP, q, g.scale.x)
+    objPos.x = +o.x.toFixed(4)
+    objPos.y = +o.y.toFixed(4)
+    objPos.z = +o.z.toFixed(4)
+    applyObjectTransform() // writes the holder's -pivot offset; the object lands back on base
+    return
+  }
   const q = g.quaternion.clone()
   const s = g.scale.x
   objScale.value = s
@@ -1671,10 +1856,10 @@ function readbackGizmo() {
   objRot.x = +THREE.MathUtils.radToDeg(e.x).toFixed(2)
   objRot.y = +THREE.MathUtils.radToDeg(e.y).toFixed(2)
   objRot.z = +THREE.MathUtils.radToDeg(e.z).toFixed(2)
-  const off = pivotP.clone().multiplyScalar(s).applyQuaternion(q) // q·(s·pivotP)
-  objPos.x = +(g.position.x - pivotP.x + off.x).toFixed(4)
-  objPos.y = +(g.position.y - pivotP.y + off.y).toFixed(4)
-  objPos.z = +(g.position.z - pivotP.z + off.z).toFixed(4)
+  // The group sits on the pivot, so Pos is simply how far the pivot has been moved.
+  objPos.x = +(g.position.x - pivotP.x).toFixed(4)
+  objPos.y = +(g.position.y - pivotP.y).toFixed(4)
+  objPos.z = +(g.position.z - pivotP.z).toFixed(4)
   contactDirty = true
 }
 
@@ -1695,6 +1880,7 @@ function setGizmoMode(m: 'off' | 'translate' | 'rotate' | 'scale') {
   gizmoMode.value = m
   gizmoLightId.value = null // switching to the object (or off) releases any light/target
   gizmoTargetId.value = null
+  pivotEdit.value = false // this re-attaches below; no setPivotEdit round-trip needed
   if (!transformControls || !gizmoHelper) return
   if (m === 'off' || !pivotGroup) {
     transformControls.detach()
@@ -1826,6 +2012,7 @@ function gizmoLight(id: number) {
   gizmoMode.value = 'off' // the object-gizmo buttons are not the active target now
   gizmoTargetId.value = null
   gizmoLightId.value = id
+  pivotEdit.value = false // the gizmo is the light's now — Alt must not steal it back
 }
 
 /** Attach the translate gizmo to a light's aim target (spot/area). */
@@ -1841,6 +2028,7 @@ function gizmoLightTarget(id: number) {
   gizmoMode.value = 'off'
   gizmoLightId.value = null
   gizmoTargetId.value = id
+  pivotEdit.value = false
 }
 
 function setHelpersVisible(v: boolean) {
@@ -2195,6 +2383,25 @@ function toggleCamLock() {
   status.value = camLocked.value ? 'Camera locked' : 'Camera free'
 }
 
+/** Store the current viewpoint in a slot. Overwrites without asking: a slot is a working
+ *  bookmark, and one click to re-park it is the whole point. */
+function saveCamSlot(i: number) {
+  camSlots.value[i] = { cam: cameraInfo(), roll: roll.value }
+  status.value = `Camera ${i + 1} saved`
+}
+
+/** Go back to a stored viewpoint. An empty slot stores instead, so a slot never does nothing. */
+function recallCamSlot(i: number) {
+  const slot = camSlots.value[i]
+  if (!slot) { saveCamSlot(i); return }
+  // Same rule as Frame model: recalling moves the camera, which is what the lock forbids.
+  if (camLocked.value) { status.value = 'Camera is locked — unlock to recall'; return }
+  setOrthoView(false) // a saved view is a lens view; ortho is only ever the axis look
+  applyCameraInfo(slot.cam)
+  applyRoll(slot.roll) // after the pose: the roll axis IS the view direction it just set
+  status.value = ''
+}
+
 function frameModel() {
   // Framing moves the camera, which is exactly what the lock exists to prevent.
   if (camLocked.value) { status.value = 'Camera is locked — unlock to reframe'; return }
@@ -2207,6 +2414,67 @@ function frameModel() {
   camera.position.copy(center).add(new THREE.Vector3(0.6, 0.4, 1).normalize().multiplyScalar(size * 1.4))
   camera.updateProjectionMatrix()
   controls?.update()
+}
+
+/** Draw the axis gizmo on top of whatever the frame ended up being.
+ *
+ *  ONLY from the loop, never from renderFrame — capture() calls renderFrame directly, so the
+ *  gizmo stays out of the exported image for free rather than by remembering to hide it.
+ *
+ *  autoClear has to go off around it: ViewHelper.render() calls renderer.render(), which with
+ *  autoClear on would wipe the colour buffer and leave nothing but the gizmo on screen. */
+/** The canvas as the ViewHelper should see it: a rect in UNSCALED canvas pixels, matching the
+ *  offsetWidth/offsetHeight it measures everything else with. See onViewHelperClick. */
+function viewHelperEl(el: HTMLCanvasElement): any {
+  return {
+    get offsetWidth() { return el.offsetWidth },
+    get offsetHeight() { return el.offsetHeight },
+    getBoundingClientRect() {
+      return unscaledRect(el.getBoundingClientRect(), el.offsetWidth, el.offsetHeight)
+    },
+  }
+}
+
+function drawViewHelper() {
+  const r = renderer.value
+  if (!r || !viewHelper) return
+  r.autoClear = false
+  viewHelper.render(r)
+  r.autoClear = true
+}
+
+/** Click an axis of the gizmo to fly to that view. It reads the pointer against the gizmo's
+ *  own corner, so a click anywhere else falls through to the orbit as before.
+ *
+ *  The zoom compensation is not optional here: ViewHelper.handleClick mixes
+ *  getBoundingClientRect() (which INCLUDES LiteGraph's CSS zoom) with offsetWidth (which does
+ *  not), so on a graph at any zoom but 1 the hit area drifts away from the drawn gizmo. Both
+ *  the rect it sees (viewHelperEl) and the pointer we hand it are put back in unscaled canvas
+ *  space, which is also the space its render() draws in. */
+function onViewHelperClick(ev: PointerEvent) {
+  // The lock exists to protect a solved camera, and this moves it as surely as an orbit does.
+  const el = renderer.value?.domElement
+  if (!viewHelper || !el || camLocked.value || gizmoDragging) return
+  // The flight is around viewHelper.center, so that point is what ends up in the middle of the
+  // screen. Left on the orbit target it is the world origin, and a model sitting anywhere else
+  // just swings past — which is the "it only turns the camera where it already was" report.
+  const c = viewCentre()
+  viewHelper.center.copy(c)
+  const p = unzoomedClient(el.getBoundingClientRect(), el.offsetWidth, ev.clientX, ev.clientY)
+  if (!viewHelper.handleClick(p as PointerEvent)) return
+  // The orbit target has to follow, or the first drag afterwards snaps the view back.
+  controls?.target.copy(c)
+  setOrthoView(true)
+  ev.stopPropagation()
+}
+
+/** What a view should look AT: the model, falling back to the orbit target when there is none. */
+function viewCentre(): THREE.Vector3 {
+  if (model) {
+    const b = new THREE.Box3().setFromObject(model)
+    if (!b.isEmpty()) return b.getCenter(new THREE.Vector3())
+  }
+  return controls?.target.clone() ?? new THREE.Vector3()
 }
 
 function forceResize(): boolean {
@@ -2222,6 +2490,7 @@ function serialise(): string {
     camLocked: camLocked.value,
     camera: cameraInfo(),
     roll: roll.value,
+    camSlots: camSlots.value,
     bgColor: bgColor.value,
     showBg: showBg.value,
     env: env.value,
@@ -2259,6 +2528,7 @@ function serialise(): string {
       rot: { ...objRot },
       scale: objScale.value,
       pivot: pivotMode.value,
+      pivotC: { x: pivotCustom.x, y: pivotCustom.y, z: pivotCustom.z },
       gizmoSpace: gizmoSpace.value,
     },
   })
@@ -2350,7 +2620,8 @@ function deserialise(json: string) {
       if (o.pos) Object.assign(objPos, o.pos)
       if (o.rot) Object.assign(objRot, o.rot)
       if (typeof o.scale === 'number') objScale.value = o.scale
-      if (o.pivot === 'bottom' || o.pivot === 'center' || o.pivot === 'origin') pivotMode.value = o.pivot
+      if (o.pivotC) pivotCustom.set(o.pivotC.x ?? 0, o.pivotC.y ?? 0, o.pivotC.z ?? 0)
+      if (o.pivot === 'bottom' || o.pivot === 'center' || o.pivot === 'origin' || o.pivot === 'custom') pivotMode.value = o.pivot
       // Absent in workflows saved before the toggle existed: those keep three's default, world.
       if (o.gizmoSpace === 'world' || o.gizmoSpace === 'local') setGizmoSpace(o.gizmoSpace)
       // The model may not be loaded yet — setModel recomputes the pivot and re-applies.
@@ -2361,6 +2632,13 @@ function deserialise(json: string) {
     if (s.camera) applyCameraInfo(s.camera)
     // After the camera: the roll axis is the view direction, which the line above just set.
     if (typeof s.roll === 'number') applyRoll(s.roll)
+    // Slots are plain data; keep the array's length ours so a stale blob can't grow the strip.
+    if (Array.isArray(s.camSlots)) {
+      for (let i = 0; i < CAM_SLOTS; i++) {
+        const v = s.camSlots[i]
+        camSlots.value[i] = v?.cam?.position ? { cam: v.cam, roll: typeof v.roll === 'number' ? v.roll : 0 } : null
+      }
+    }
   } catch {
     /* a malformed blob must not take the viewport down */
   }
@@ -2400,8 +2678,21 @@ function onGizmoKey(ev: KeyboardEvent) {
   else toggleGizmoSpace()
 }
 
+/** Alt down/up toggles pivot editing. Also on window blur: Alt+Tab steals the keyup, and a
+ *  stuck pivot mode would silently swallow the next object drag. */
+function onAltKey(ev: KeyboardEvent) {
+  if (ev.key !== 'Alt') return
+  if (!popped.value && !pointerInView) return
+  ev.preventDefault() // bare Alt otherwise reaches for the browser menu bar
+  setPivotEdit(ev.type === 'keydown')
+}
+function onWindowBlur() { setPivotEdit(false) }
+
 function cleanup() {
   window.removeEventListener('keydown', onGizmoKey, true)
+  window.removeEventListener('keydown', onAltKey, true)
+  window.removeEventListener('keyup', onAltKey, true)
+  window.removeEventListener('blur', onWindowBlur)
   detachFine?.()
   detachGizmoFine?.()
   cancelAnimationFrame(raf)
@@ -2409,6 +2700,8 @@ function cleanup() {
   if (writebackTimer) { clearTimeout(writebackTimer); writebackTimer = 0 }
   ro?.disconnect()
   controls?.dispose()
+  renderer.value?.domElement.removeEventListener('pointerup', onViewHelperClick)
+  viewHelper?.dispose()
   transformControls?.dispose()
   for (const id of [...lightObjs.keys()]) removeLight(id)
   bgTexture?.dispose()
@@ -2447,11 +2740,22 @@ onMounted(() => {
   controls.dampingFactor = 0.12
   // The key light's world position depends on the camera yaw — track it while orbiting.
   controls.addEventListener('change', applyLighting)
+  // Shift = tenth-speed orbit/pan/dolly, the same modifier as every slider and the gizmo. It
+  // rides the SAME pointer damping the gizmo uses (see below) — OrbitControls reads clientX/Y
+  // out of the event exactly like TransformControls does, so one shadowing covers both.
+  controls.addEventListener('start', () => { orbiting = true })
+  controls.addEventListener('end', () => { orbiting = false })
   // deserialise() may have restored a locked state before controls existed.
   applyControlsEnabled()
 
   // Transform gizmo: drag the object in the viewport. r0.18x's TransformControls is a Controls
   // (not an Object3D) — add its getHelper() to the scene, not the control itself.
+  // Axis gizmo. OrbitControls.update() re-derives its spherical from the camera's ACTUAL
+  // position every frame, so the fly-to writing camera.position/quaternion is not fought by it
+  // — no need to disable the controls during the animation.
+  viewHelper = new ViewHelper(camera, viewHelperEl(r.domElement))
+  r.domElement.addEventListener('pointerup', onViewHelperClick)
+
   transformControls = new TransformControls(camera, r.domElement)
   // deserialise() can restore a space before this exists (same reason applyControlsEnabled is
   // re-run after the OrbitControls are built), so push the current value in now.
@@ -2477,7 +2781,7 @@ onMounted(() => {
   let realXY: { x: number; y: number } | null = null
   let virtXY: { x: number; y: number } | null = null
   const dampPointer = (e: PointerEvent) => {
-    if (!gizmoDragging) { realXY = null; virtXY = null; return }
+    if (!gizmoDragging && !orbiting) { realXY = null; virtXY = null; return }
     if (!realXY || !virtXY) {
       realXY = { x: e.clientX, y: e.clientY }
       virtXY = { x: e.clientX, y: e.clientY }
@@ -2509,6 +2813,9 @@ onMounted(() => {
   // never see the modal being resized — the box that changes is the one above it.
   if (viewWrap.value) ro.observe(viewWrap.value)
   window.addEventListener('keydown', onGizmoKey, true)
+  window.addEventListener('keydown', onAltKey, true)
+  window.addEventListener('keyup', onAltKey, true)
+  window.addEventListener('blur', onWindowBlur)
   resize()
   loop()
 })
@@ -2583,7 +2890,16 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
             <option value="bottom">Bottom</option>
             <option value="center">Center</option>
             <option value="origin">Origin</option>
+            <option value="custom">Custom</option>
           </select>
+          <button class="nkd-gizmo" @click="fitToGround"
+                  title="Fit to ground: normalise the scale and drop the model's floor centre on the origin.">Fit</button>
+          <button class="nkd-gizmo" @click="resetTransform"
+                  title="Reset Pos/Rot/Scale. A hand-placed pivot is kept.">Reset</button>
+        </div>
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag"></span>
+          <span class="nkd-obj-hint">Hold Alt to move the origin gizmo without the object</span>
         </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Pos</span>
@@ -2774,6 +3090,15 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                   + ' — Q (hover the viewport). Does not affect Scale: three always orients scale to the object.'">
           <i :class="gizmoSpace === 'world' ? 'pi pi-globe' : 'pi pi-box'" />
         </button>
+        <!-- Saved viewpoints. Working on a matched perspective and needing another angle to
+             move something is the case this exists for: park the view, go, come back. -->
+        <span class="nkd-ovsep" />
+        <button v-for="(slot, i) in camSlots" :key="i" class="nkd-camslot" :class="{ on: !!slot }"
+                :title="slot
+                  ? `Camera ${i + 1} — click to go back to it, Shift+click to overwrite with the current view`
+                  : `Camera ${i + 1} is empty — click to save the current view here`"
+                @click="$event.shiftKey ? saveCamSlot(i) : recallCamSlot(i)">{{ i + 1 }}</button>
+        <span class="nkd-ovsep" />
         <button :class="{ on: gizmoMode === 'translate' }" title="Move gizmo — W (hover the viewport)"
                 @click="toggleGizmoMode('translate')">
           <i class="pi pi-arrows-alt" />
@@ -2841,6 +3166,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-obj-row { display: flex; align-items: center; gap: 5px; }
 .nkd-obj-tag { color: rgba(255, 255, 255, 0.45); font-size: 10px; flex: 0 0 34px; }
 .nkd-obj-hint { color: rgba(255, 255, 255, 0.35); font-size: 9px; white-space: nowrap; }
+/* Slots carry a digit, not an icon. Specificity has to match `.nkd-overlay button`, which sets
+   font-size for the glyphs — a bare `.nkd-camslot` would lose to it and leave a 13px digit. */
+.nkd-overlay button.nkd-camslot { font-family: system-ui, sans-serif; font-size: 10px; font-weight: 600; }
 .nkd-obj-row select {
   flex: 1 1 0; min-width: 0; width: 0;
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
