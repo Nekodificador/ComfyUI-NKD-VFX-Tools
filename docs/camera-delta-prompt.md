@@ -3,10 +3,14 @@
 Writes the move between two cameras as the JSON a *"the camera has moved by: {...}"*
 LoRA expects, dropped straight into your prompt.
 
-```
-😺NKD fSpy Camera ──▶ camera_from ─┐
-                                   ├─▶ 😺NKD Camera Delta Prompt ──▶ prompt
-😺NKD Preview 3D ──▶ camera_to ────┘
+```mermaid
+flowchart LR
+    FSPY["**NKD fSpy Camera**"]:::nkd -- camera_from --> CD
+    P3D["**NKD Preview 3D**"]:::nkd -- camera_to --> CD
+    CD["**NKD Camera Delta Prompt**"]:::nkd -- prompt --> OUT(["your prompt"]):::output
+
+    classDef nkd fill:#3b3b6b,stroke:#8ab4ff,stroke-width:2px,color:#fff
+    classDef output fill:#1f4a1f,stroke:#7fd97f,color:#fff
 ```
 
 - `camera_from` is where the shot started, usually the solved plate camera or the
