@@ -64,7 +64,7 @@ def _mesh_to_temp_glb(mesh) -> str:
     single-item batch — per-image vertex counts differ, so they can't stack. Core's
     own GLB writer does the packing; there is no reason for a second one here.
     """
-    vertices, faces, colors, uvs = get_mesh_batch_item(mesh, 0)
+    vertices, faces, colors, uvs, normals = get_mesh_batch_item(mesh, 0)
     if vertices.shape[0] == 0 or faces.shape[0] == 0:
         raise ValueError("😺NKD Preview 3D was handed an empty mesh.")
 
@@ -79,7 +79,7 @@ def _mesh_to_temp_glb(mesh) -> str:
     filename = f"nkd_preview3d_{uuid.uuid4().hex}.glb"
     save_glb(vertices, faces, os.path.join(temp_dir, filename),
              uvs=uvs, vertex_colors=colors, texture_image=tex_img,
-             unlit=getattr(mesh, "unlit", False))
+             normals=normals, unlit=getattr(mesh, "unlit", False))
     return filename
 
 
