@@ -1,0 +1,134 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NKD Relight shader — GPU self-check</title>
+<!--
+  Self-check for the WebGL preview shader in src/components/RelightingCanvas.vue:
+  per-light masks (select / invert / amount) and the per-light shadow opt-out must
+  match what the Python pipeline does (python relighting_node.py, blocks 6 and 7).
+  The shader source is pulled straight out of the .vue so this can't drift from it.
+
+  Needs a real GL context, so it can't live in a .mjs.
+
+    python -m http.server 8791    # from the repo root
+    open http://127.0.0.1:8791/test_relight_shader.html
+-->
+<body style="background:#14171c;color:#d6dae0;font:13px/1.55 ui-monospace,Consolas,monospace;padding:18px">
+<pre id="out">running…</pre>
+<script type="module">
+const L = [], out = document.getElementById('out')
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n') }
+let failed = 0
+const check = (ok, msg) => { if (!ok) failed++; log(`${ok ? '  ok  ' : ' FAIL '} ${msg}`) }
+
+const vue = await (await fetch('src/components/RelightingCanvas.vue')).text()
+const grab = name => {
+  const m = vue.match(new RegExp('const ' + name + ' = `([\\s\\S]*?)`;'))
+  if (!m) throw new Error(name + ' not found in the .vue')
+  return m[1]
+}
+const VERT = grab('VERT_SRC'), FRAG = grab('FRAG_SRC')
+
+const W = 16, H = 16
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H
+const gl = cv.getContext('webgl', { preserveDrawingBuffer: true })
+const sh = (type, src) => {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s)
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
+  return s
+}
+let prog
+try {
+  prog = gl.createProgram()
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG))
+  gl.linkProgram(prog)
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog))
+  check(true, 'fragment shader compiles and links (WebGL 1)')
+} catch (e) {
+  check(false, 'shader compile: ' + e.message); log(`\n${failed} failed`); throw e
+}
+gl.useProgram(prog)
+const u = n => gl.getUniformLocation(prog, n)
+
+const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW)
+const aPos = gl.getAttribLocation(prog, 'aPos'); gl.enableVertexAttribArray(aPos)
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0)
+
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1)
+const tex = (unit, fmt, data, w = W, h = H) => {
+  const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, fmt, gl.UNSIGNED_BYTE, data)
+  return t
+}
+const fill = (ch, fn) => { const d = new Uint8Array(W * H * ch); for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const v = fn(x, y); for (let c = 0; c < ch; c++) d[(y * W + x) * ch + c] = v[c] } return d }
+const enc = (x, y, z) => { const l = Math.hypot(x, y, z); return [Math.round((x / l + 1) * 127.5), Math.round((-y / l + 1) * 127.5), Math.round((z / l + 1) * 127.5)] }
+
+// Same scene as Python block 6: grey 0.5 plate, camera-facing normals, flat depth,
+// mask slot 2 (G channel) = right half white.
+tex(0, gl.RGB, fill(3, () => [128, 128, 128]))
+const facing = tex(1, gl.RGB, fill(3, () => enc(0, 0, 1)))
+const flat = tex(2, gl.RGB, fill(3, () => [0, 0, 0]))
+tex(3, gl.RGB, new Uint8Array(3), 1, 1); tex(4, gl.RGB, new Uint8Array(3), 1, 1)
+tex(5, gl.RGBA, fill(4, x => [0, x >= W / 2 ? 255 : 0, 0, 0]))
+;['uRgb','uNormals','uDepth','uAlbedo','uRoughness','uMasks'].forEach((n, i) => gl.uniform1i(u(n), i))
+
+const setLight = (o) => {
+  gl.uniform1i(u('uLightCount'), 1)
+  gl.uniform1i(u('uLType[0]'), o.type === 'point' ? 1 : 0)
+  gl.uniform1fv(u('uLColorR'), [1,1,1]); gl.uniform1fv(u('uLColorG'), [1,1,1]); gl.uniform1fv(u('uLColorB'), [1,1,1])
+  gl.uniform1fv(u('uLIntensity'), [1,0,0])
+  gl.uniform1fv(u('uLAzimuth'), [(o.az ?? 0) * Math.PI / 180, 0, 0]); gl.uniform1fv(u('uLElevation'), [0,0,0])
+  gl.uniform1fv(u('uLX'), [0,0,0]); gl.uniform1fv(u('uLY'), [0,0,0]); gl.uniform1fv(u('uLZ'), [0,0,0]); gl.uniform1fv(u('uLRadius'), [1,1,1])
+  const sel = new Float32Array(12); if (o.mask) sel[o.mask - 1] = 1
+  gl.uniform4fv(u('uLMaskSel'), sel)
+  gl.uniform1fv(u('uLMaskInv'), [o.inv ? 1 : 0, 0, 0]); gl.uniform1fv(u('uLMaskAmt'), [o.amt ?? 1, 1, 1])
+  gl.uniform1fv(u('uLShadow'), [o.cast === false ? 0 : 1, 1, 1])
+}
+gl.uniform1f(u('uAmbR'), 1); gl.uniform1f(u('uAmbG'), 1); gl.uniform1f(u('uAmbB'), 1)
+gl.uniform1f(u('uAmbientIntensity'), 0.2); gl.uniform1f(u('uDelitMix'), 0); gl.uniform1f(u('uRoughnessStrength'), 1)
+gl.uniform1i(u('uHasAlbedo'), 0); gl.uniform1i(u('uHasRoughness'), 0)
+const setShadows = on => { gl.uniform1i(u('uShadowOn'), on ? 1 : 0); gl.uniform1f(u('uShadowStrength'), 0.6); gl.uniform1f(u('uShadowSoftness'), 0.3); gl.uniform1f(u('uShadowRange'), 0.15) }
+setShadows(false)
+
+const px = (x) => { gl.viewport(0, 0, W, H); gl.drawArrays(gl.TRIANGLES, 0, 6); const p = new Uint8Array(4); gl.readPixels(x, H / 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return p[0] }
+const near = (a, b, tol = 2) => Math.abs(a - b) <= tol
+const left = 0, right = W - 1
+
+// 1. Light confined to mask 2: left = ambient only (0.1 → 26), right = full (0.6 → 153).
+setLight({ mask: 2 })
+let l = px(left), r = px(right)
+check(near(l, 26) && near(r, 153), `mask 2: left ${l} (26) right ${r} (153)`)
+
+// 2. Invert swaps the halves.
+setLight({ mask: 2, inv: true }); l = px(left); r = px(right)
+check(near(l, 153) && near(r, 26), `invert: left ${l} (153) right ${r} (26)`)
+
+// 3. Amount 0.5: half exclusion on the left → 0.5 × (0.2 + 0.5) = 0.35 → 89.
+setLight({ mask: 2, amt: 0.5 }); l = px(left); r = px(right)
+check(near(l, 89) && near(r, 153), `amount 0.5: left ${l} (89) right ${r} (153)`)
+
+// 4. No mask, and an UNWIRED slot (selector all zero, as renderWebGL sends it) → untouched.
+setLight({ mask: 0 }); const a0 = px(left)
+setLight({ mask: 3, inv: true }); const a3 = px(left)
+check(near(a0, 153) && near(a3, 153), `none / unwired slot leave the light alone: ${a0}, ${a3} (153)`)
+
+// 5. Per-light shadow opt-out (Python block 7): wall on the right, tilted normals, light
+//    from the right. Master on + cast → darker next to the wall; master on + no cast →
+//    same as master off (the control).
+gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, facing)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, fill(3, () => enc(1, 0, 1)))
+gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, flat)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, fill(3, x => x >= W / 2 ? [255,255,255] : [0,0,0]))
+const wallPx = W / 2 - 1
+setShadows(false); setLight({ az: 90 }); const off = px(wallPx)
+setShadows(true);  setLight({ az: 90 }); const cast = px(wallPx)
+setLight({ az: 90, cast: false }); const noCast = px(wallPx)
+check(cast < off - 10, `shadow cast darkens next to the wall: ${cast} < ${off}`)
+check(near(noCast, off, 1), `castShadow off under the master = shadows off: ${noCast} vs ${off}`)
+
+log(`\n${failed ? failed + ' FAILED' : 'all checks passed'}`)
+</script>

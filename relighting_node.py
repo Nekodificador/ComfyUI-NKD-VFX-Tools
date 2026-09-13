@@ -64,9 +64,50 @@ def _parse_state(lights_config):
     return lights, ambient_intensity, ambient_color, delit_mix, roughness_strength, shadows
 
 
-def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""):
+MASK_SLOTS = 4  # mask_1..mask_4 — one per RGBA channel of the preview's packed texture
+
+
+def _light_mask(light, masks):
+    """Per-light occlusion factor from the mask the light selected, or None.
+
+    `masks` is the MASK_SLOTS-long list of (B,H,W) tensors (None = slot not
+    wired). An unwired slot is "no mask": the light is unaffected whatever
+    Invert says — mirrored by the preview, which zeroes the selector for
+    unwired slots.
+    """
+    if not masks:
+        return None
+    idx = int(light.get("mask", 0) or 0)
+    if idx < 1 or idx > len(masks) or masks[idx - 1] is None:
+        return None
+    m = masks[idx - 1]
+    if light.get("maskInvert", False):
+        m = 1.0 - m
+    amt = max(0.0, min(1.0, float(light.get("maskAmount", 1.0))))
+    if amt < 1.0:
+        m = 1.0 - amt + amt * m  # mix(1, m, amt): partial exclusion
+    return m
+
+
+def _match_mask(mask, target_h, target_w, batch):
+    """MASK (B,H,W) → float (B or 1,H,W) at the rgb resolution, broadcastable."""
+    m = mask.float()
+    if m.dim() == 2:
+        m = m.unsqueeze(0)
+    if m.shape[1] != target_h or m.shape[2] != target_w:
+        m = _match_size(m.unsqueeze(-1), target_h, target_w).squeeze(-1)
+    if m.shape[0] != batch and m.shape[0] != 1:
+        m = m[:1]  # ponytail: batch mismatch → first mask for the whole batch
+    return m.clamp(0.0, 1.0)
+
+
+def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id="",
+             masks=None):
     """Whole node body minus the ComfyUI wrapper: resize passes, push the preview
-    passes to the frontend, run the GPU pipeline."""
+    passes to the frontend, run the GPU pipeline.
+
+    masks: dict {"mask_1": MASK, ...} from the Autogrow input (unwired slots absent).
+    """
     (lights, ambient_intensity, ambient_color, delit_mix,
      roughness_strength, shadows) = _parse_state(lights_config)
 
@@ -81,21 +122,28 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     if roughness is not None and (roughness.shape[1] != target_h or roughness.shape[2] != target_w):
         roughness = _match_size(roughness, target_h, target_w)
 
+    # Masks by slot, resized to rgb; None where nothing is wired
+    mask_list = [None] * MASK_SLOTS
+    for k in range(MASK_SLOTS):
+        m = (masks or {}).get(f"mask_{k + 1}")
+        if m is not None:
+            mask_list[k] = _match_mask(m, target_h, target_w, rgb.shape[0])
+
     # Send downscaled pass data to frontend (GPU resize → CPU only for encoding)
     if unique_id:
-        _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness)
+        _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, mask_list)
 
     # Full batched relighting on GPU
     return _relight_gpu(
         rgb, normals, depth, albedo, roughness,
         lights, ambient_intensity, ambient_color, delit_mix, roughness_strength,
-        shadows
+        shadows, mask_list
     )
 
 
 def _relight_gpu(rgb, normals, depth, albedo, roughness,
                  lights, ambient_intensity, ambient_color, delit_mix, roughness_strength,
-                 shadows=None):
+                 shadows=None, masks=None):
     """Batched Lambertian + Blinn-Phong relighting, all ops on device."""
     B, H, W, _ = rgb.shape
     dev = rgb.device
@@ -144,10 +192,15 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
         )
         l_int = float(light.get("intensity", 1.0))
         contrib = (diffuse + specular) if roughness_s is not None else diffuse
-        # Screen-space shadow: march along the depth pass toward the light
-        if shadows_on and sdir is not None:
+        # Screen-space shadow: march along the depth pass toward the light.
+        # Global switch is the master; each light can opt out (castShadow).
+        if shadows_on and sdir is not None and light.get("castShadow", True):
             shadow_factor = _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev)
             contrib = contrib * shadow_factor
+        # Per-light mask: confines this light (and its shadow) to a region
+        mask_factor = _light_mask(light, masks)
+        if mask_factor is not None:
+            contrib = contrib * mask_factor
         # contrib: (B,H,W) → (B,H,W,1) * (1,1,1,3) → (B,H,W,3) added in-place
         light_accum.add_(contrib.unsqueeze(-1) * (l_rgb * l_int))
 
@@ -293,7 +346,20 @@ def _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev):
     return 1.0 - strength * occ
 
 
-def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness):
+def _pack_masks(masks, batch_h, batch_w):
+    """Pack the MASK_SLOTS per-light masks into one (1,H,W,4) tensor for the preview:
+    one channel per slot, 0 where nothing is wired. The preview reads a slot by a
+    one-hot selector, so one texture serves every light."""
+    if not masks or all(m is None for m in masks):
+        return None, [False] * MASK_SLOTS
+    ref = next(m for m in masks if m is not None)
+    chans = []
+    for m in masks:
+        chans.append(m[0:1] if m is not None else torch.zeros(1, batch_h, batch_w, device=ref.device))
+    return torch.stack(chans, dim=-1), [m is not None for m in masks]
+
+
+def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, masks=None):
     """GPU-resize passes then transfer to CPU only for base64 encoding."""
     max_size = 512
     H, W = rgb.shape[1], rgb.shape[2]
@@ -314,6 +380,8 @@ def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness):
     d  = prepare(depth)
     a  = prepare(albedo)
     ro = prepare(roughness)
+    packed, slots = _pack_masks(masks, H, W)
+    mk = prepare(packed)
 
     def to_b64(t):
         if t is None:
@@ -333,6 +401,9 @@ def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness):
         data["albedo"] = to_b64(a)
     if ro is not None:
         data["roughness"] = to_b64(ro)
+    if mk is not None:
+        data["masks"] = to_b64(mk)  # RGBA, one slot per channel
+        data["maskSlots"] = slots
 
     from server import PromptServer  # type: ignore  # only inside ComfyUI
     PromptServer.instance.send_sync("nkd-relight-passes", {
@@ -388,6 +459,19 @@ if _HAS_COMFY:
                     # real DOM textarea that survives the widget-hiding tricks (measured on
                     # Preview 3D).
                     io.String.Input("lights_config", default="{}", multiline=False, optional=True),
+                    # mask_1..mask_4: a fresh slot appears as you wire one. Each light picks
+                    # a slot in the preview to confine its light (and shadow) to that region.
+                    io.Autogrow.Input(
+                        "masks",
+                        template=io.Autogrow.TemplateNames(
+                            io.Mask.Input("mask"),
+                            names=[f"mask_{k + 1}" for k in range(MASK_SLOTS)],
+                            min=0,
+                        ),
+                        optional=True,
+                        tooltip="Masks a light can be confined to (pick one per light in the "
+                                "editor). Feather them upstream; white = lit.",
+                    ),
                 ],
                 outputs=[io.Image.Output(display_name="relit_image")],
                 hidden=[io.Hidden.unique_id],
@@ -403,10 +487,11 @@ if _HAS_COMFY:
 
         @classmethod
         def execute(cls, rgb, normals, depth, albedo=None, roughness=None,
-                    lights_config="{}") -> io.NodeOutput:
+                    lights_config="{}", masks=None) -> io.NodeOutput:
             uid = cls.hidden.unique_id
             out = _relight(rgb, normals, depth, albedo, roughness, lights_config,
-                           unique_id=str(uid) if uid is not None else "")
+                           unique_id=str(uid) if uid is not None else "",
+                           masks=masks)
             return io.NodeOutput(out)
 
 
@@ -468,6 +553,45 @@ def demo() -> None:
     out = _relight(rgba, small, torch.zeros(1, 4, 4, 3), None, None, cfg)
     assert out.shape == (1, H, W, 4) and torch.allclose(out[..., 3], torch.full((1, H, W), 0.25))
     assert torch.allclose(out[..., :3], torch.full((1, H, W, 3), 0.6), atol=1e-6)
+
+    # 6. Per-light mask. Left half masked out (mask 0), right half lit (mask 1), light of
+    #    block 2 → left = ambient only (0.1), right = full (0.6). Invert swaps the halves.
+    #    An UNWIRED slot is "no mask" whatever Invert says (mirrors the preview).
+    half = torch.zeros(1, H, W)
+    half[:, :, W // 2:] = 1.0
+    L = {"type": "directional", "azimuth": 0, "elevation": 0, "intensity": 1.0}
+    def run(**light_extra):
+        cfg = json.dumps({"lights": [dict(L, **light_extra)]})
+        return _relight(rgb, facing, flat_depth, None, None, cfg, masks={"mask_2": half})
+    o = run(mask=2)
+    assert torch.allclose(o[0, :, :W // 2], torch.full((H, W // 2, 3), 0.1), atol=1e-6)
+    assert torch.allclose(o[0, :, W // 2:], torch.full((H, W // 2, 3), 0.6), atol=1e-6)
+    o = run(mask=2, maskInvert=True)
+    assert torch.allclose(o[0, :, :W // 2], torch.full((H, W // 2, 3), 0.6), atol=1e-6)
+    assert torch.allclose(o[0, :, W // 2:], torch.full((H, W // 2, 3), 0.1), atol=1e-6)
+    o = run(mask=2, maskAmount=0.5)  # half exclusion: 0.5 × (0.2 + 0.5) = 0.35 on the left
+    assert torch.allclose(o[0, :, :W // 2], torch.full((H, W // 2, 3), 0.35), atol=1e-6)
+    for extra in (dict(mask=0), dict(mask=3), dict(mask=3, maskInvert=True)):
+        assert torch.allclose(run(**extra), torch.full((1, H, W, 3), 0.6), atol=1e-6), extra
+    # A mask at another resolution and batch 1 against rgb batch 2 still lands per pixel.
+    small_half = torch.zeros(1, 4, 4); small_half[:, :, 2:] = 1.0
+    o = _relight(rgb.repeat(2, 1, 1, 1), facing.repeat(2, 1, 1, 1), flat_depth.repeat(2, 1, 1, 1),
+                 None, None, json.dumps({"lights": [dict(L, mask=1)]}), masks={"mask_1": small_half})
+    assert o.shape[0] == 2 and float(o[1, 0, 0, 0]) < 0.15 and float(o[1, 0, W - 1, 0]) > 0.55
+
+    # 7. Per-light shadow toggle: castShadow=false under the global switch equals shadows
+    #    off (block 4's setup). castShadow absent keeps the old behaviour (shadow cast).
+    no_cast = json.dumps({"lights": [dict(light, castShadow=False)], "shadowsEnabled": True,
+                          "shadowStrength": 0.6, "shadowSoftness": 0.3, "shadowRange": 0.15})
+    assert torch.equal(_relight(rgb, tilted, wall, None, None, no_cast), o_off)
+    assert torch.equal(_relight(rgb, tilted, wall, None, None, on), o_on)
+
+    # 8. Preview packing: wired slots land in their channel, unwired ones are zero.
+    packed, slots = _pack_masks([None, half, None, 1.0 - half], H, W)
+    assert packed.shape == (1, H, W, 4) and slots == [False, True, False, True]
+    assert float(packed[0, 0, W - 1, 1]) == 1.0 and float(packed[0, 0, 0, 3]) == 1.0
+    assert float(packed[..., 0].abs().sum()) == 0.0 and float(packed[..., 2].abs().sum()) == 0.0
+    assert _pack_masks([None] * 4, H, W) == (None, [False] * 4)
 
     print("relighting_node self-check OK")
 

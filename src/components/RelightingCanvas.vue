@@ -44,7 +44,7 @@
       >
         <div class="rl-sec-head" @click="selectLight(light.id)">
           <span class="rl-chev" :class="{ open: light.id === selectedId }">▸</span>
-          <span class="rl-light-icon">{{ light.type === 'point' ? '💡' : '☀️' }}</span>
+          <i class="pi rl-light-icon" :class="light.type === 'point' ? 'pi-lightbulb' : 'pi-sun'" />
           <span class="rl-sec-title">{{ light.type === 'point' ? 'Point' : 'Dir' }} {{ (idx as number) + 1 }}</span>
           <input class="rl-swatch" type="color" v-model="light.color" @input="emit" @click.stop />
           <button class="rl-x" @click.stop="removeLight(light.id)">×</button>
@@ -80,6 +80,33 @@
               <span class="rl-fval">{{ Math.round(light.elevation) }}°</span>
             </div>
           </template>
+          <!-- Mask: confine this light (and its shadow) to a wired mask_N -->
+          <div class="rl-field">
+            <span class="rl-flabel">Mask</span>
+            <select class="rl-select" v-model.number="light.mask" @change="emit" @click.stop
+                    title="Confine this light to a mask wired into mask_1..mask_4. White = lit. Feather it upstream.">
+              <option :value="0">None</option>
+              <option v-for="k in MASK_SLOTS" :key="k" :value="k">Mask {{ k }}{{ maskSlots[k - 1] ? '' : ' (not wired)' }}</option>
+            </select>
+            <label class="rl-check" :class="{ disabled: !light.mask }" @click.stop
+                   title="Use the mask's complement: one subject mask serves both a rim light on the subject and a fill on the background.">
+              <input type="checkbox" v-model="light.maskInvert" :disabled="!light.mask" @change="emit" /> Invert
+            </label>
+          </div>
+          <div class="rl-field" v-if="light.mask > 0">
+            <span class="rl-flabel">Mask amount</span>
+            <input class="rl-range" :style="rangeStyle(light.maskAmount, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskAmount" @input="emit" @click.stop
+                   title="1 = the light is fully confined to the mask; lower values let some of it leak outside." />
+            <span class="rl-fval">{{ light.maskAmount.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field">
+            <span class="rl-flabel">Shadow</span>
+            <label class="rl-switch" @click.stop title="Cast screen-space shadows from this light. The Shadows section is the master switch and holds the tracer settings.">
+              <input type="checkbox" v-model="light.castShadow" @change="emit" />
+              <span class="rl-switch-track"><span class="rl-switch-thumb"></span></span>
+            </label>
+            <span class="rl-fval rl-fval-wide">{{ !shadowsEnabled ? 'master off' : (light.castShadow ? 'cast' : 'none') }}</span>
+          </div>
         </div>
       </div>
 
@@ -166,6 +193,17 @@ interface Light {
   elevation: number;
   radius: number;
   falloff: number;
+  mask: number;         // 0 = none, 1..MASK_SLOTS = mask_N input
+  maskInvert: boolean;
+  maskAmount: number;   // mix(1, mask, amount)
+  castShadow: boolean;  // under the global Shadows master switch
+}
+
+const MASK_SLOTS = 4;
+
+// Lights saved before masks / per-light shadows existed lack these fields.
+function normLight(l: Partial<Light>): Light {
+  return { mask: 0, maskInvert: false, maskAmount: 1, castShadow: true, ...(l as Light) };
 }
 
 interface State {
@@ -186,6 +224,8 @@ interface PassData {
   depth: string;
   albedo?: string;
   roughness?: string;
+  masks?: string;        // RGBA, one mask_N per channel
+  maskSlots?: boolean[]; // which of mask_1..4 are wired
   width: number;
   height: number;
 }
@@ -218,10 +258,12 @@ let passNormals:   Uint8Array | null = null;
 let passDepth:     Uint8Array | null = null;
 let passAlbedo:    Uint8Array | null = null;
 let passRoughness: Uint8Array | null = null;
+let passMasks:     Uint8Array | null = null;  // (H,W,4)
 let passW = 0;
 let passH = 0;
 const hasAlbedo    = ref(false);
 const hasRoughness = ref(false);
+const maskSlots    = ref<boolean[]>(Array(MASK_SLOTS).fill(false));
 const isProcessing = ref(false);
 
 const pointLights = computed(() => lights.value.filter((l: Light) => l.type === "point"));
@@ -422,6 +464,10 @@ function addLight(type: "point" | "directional") {
     elevation: 45,
     radius: 0.5,
     falloff: 2.0,
+    mask: 0,
+    maskInvert: false,
+    maskAmount: 1,
+    castShadow: true,
   };
   lights.value.push(light);
   selectedId.value = light.id;
@@ -522,6 +568,13 @@ uniform float uLZ[3];
 uniform float uLRadius[3];
 uniform float uLAzimuth[3];
 uniform float uLElevation[3];
+// Per-light mask: one-hot channel selector into uMasks (all-zero = no mask), invert, amount
+uniform sampler2D uMasks;
+uniform vec4  uLMaskSel[3];
+uniform float uLMaskInv[3];
+uniform float uLMaskAmt[3];
+// Per-light shadow opt-out (uShadowOn stays the master)
+uniform float uLShadow[3];
 
 // Screen-space shadow tracer — marches the depth pass toward the light.
 // uv0/d0: surface image-UV + depth. sdir: screen-space dir toward the light
@@ -547,62 +600,12 @@ float traceShadow(vec2 uv0, float d0, vec3 sdir) {
   return occ;
 }
 
-vec3 calcLight(int i, vec3 N, vec2 imgUv, float dVal, float smoothness, float shininess) {
-  float contrib         = 0.0;
-  float att             = 1.0;
-  vec3  ld              = vec3(0.0);
-  float lightSolidAngle = 0.0;
-  vec3  sdir            = vec3(0.0);
-
-  if (uLType[i] == 0) {
-    // Directional light — uniform direction across all pixels
-    float az = uLAzimuth[i];
-    float el = uLElevation[i];
-    ld = normalize(vec3(cos(el) * sin(az), sin(el), cos(el) * cos(az)));
-    // Screen-space marching dir matches point lights: ld is in the same mixed
-    // space as imgUv (N has been pre-flipped via N.y = -N.y), so no Y flip here.
-    sdir = ld;
-    contrib = max(dot(N, ld), 0.0);
-  } else {
-    // Point light — per-pixel direction and attenuation
-    vec3 toLight = vec3(uLX[i] - imgUv.x, uLY[i] - imgUv.y, uLZ[i] - dVal);
-    float dist = max(length(toLight), 1.0e-8);
-    ld = toLight / dist;
-    // Marching dir already in image-UV space (v down, +z toward camera)
-    sdir = ld;
-    // Windowed falloff: att reaches exactly 0 at dist=radius, so the radius
-    // defines the boundary of the lit region without affecting brightness within it.
-    float nd = dist / uLRadius[i];
-    att = pow(max(1.0 - nd * nd, 0.0), 2.0);
-    // Map radius slider [0.05, 2.0] → softness [0.1, 1.0].
-    lightSolidAngle = clamp((uLRadius[i] - 0.05) / 1.95, 0.0, 1.0);
-    // Wrapped diffuse: large radius adds fill light near the shadow terminator,
-    // matching the behaviour of a large physical light source (softbox, window).
-    // Normalization by (1+w) keeps full brightness on the lit side unchanged.
-    float w = lightSolidAngle * 1.0;
-    float rawDot = dot(N, ld);
-    contrib = max(rawDot + w, 0.0) / (1.0 + w) * att;
-  }
-
-  // Blinn-Phong specular: H = normalize(L + V), view direction V = (0, 0, 1)
-  if (uHasRoughness == 1) {
-    vec3 H = normalize(ld + vec3(0.0, 0.0, 1.0));
-    float ndoth = max(dot(N, H), 0.0);
-    // Larger solid angle → lower effective shininess → softer, broader highlight.
-    // Directional lights: lightSolidAngle = 0.0, so effShininess = shininess (unchanged).
-    float effShininess = (uLType[i] == 1)
-        ? shininess * (1.0 - lightSolidAngle * 0.95) + 1.0
-        : shininess;
-    float spec = pow(ndoth, effShininess) * smoothness * smoothness * att;
-    contrib += spec;
-  }
-
-  // Screen-space shadow attenuation
-  float shadow = traceShadow(imgUv, dVal, sdir);
-  contrib *= (1.0 - uShadowStrength * shadow);
-
-  return contrib * vec3(uLColorR[i], uLColorG[i], uLColorB[i]) * uLIntensity[i];
-}
+// One light's contribution, inlined into main()'s loop on purpose: GLSL ES 1.0 lets a
+// fragment shader index a uniform array only with a constant or a LOOP variable, and a
+// function parameter is neither — as a function this never compiled (ANGLE: 'Index
+// expression can only contain const or loop symbols'), so the preview fell back to the
+// JS pixel loop. Kept as a macro-like block: the body reads N, imgUv, dVal, smoothness,
+// shininess and lightAccum from main().
 
 void main() {
   // vUv: (0,0)=bottom-left, (1,1)=top-right (OpenGL convention)
@@ -641,10 +644,76 @@ void main() {
   // Ambient seed
   vec3 lightAccum = vec3(uAmbR, uAmbG, uAmbB) * uAmbientIntensity;
 
-  // Accumulate lights (unrolled to avoid GLSL ES loop-variable restrictions)
-  if (uLightCount > 0) lightAccum += calcLight(0, N, imgUv, dVal, smoothness, shininess);
-  if (uLightCount > 1) lightAccum += calcLight(1, N, imgUv, dVal, smoothness, shininess);
-  if (uLightCount > 2) lightAccum += calcLight(2, N, imgUv, dVal, smoothness, shininess);
+  // Accumulate lights. A loop variable is the ONLY non-constant index a fragment
+  // shader may use on a uniform array in GLSL ES 1.0 (see the note above).
+  for (int i = 0; i < 3; i++) {
+    if (i >= uLightCount) break;
+    float contrib         = 0.0;
+    float att             = 1.0;
+    vec3  ld              = vec3(0.0);
+    float lightSolidAngle = 0.0;
+    vec3  sdir            = vec3(0.0);
+
+    if (uLType[i] == 0) {
+      // Directional light — uniform direction across all pixels
+      float az = uLAzimuth[i];
+      float el = uLElevation[i];
+      ld = normalize(vec3(cos(el) * sin(az), sin(el), cos(el) * cos(az)));
+      // Screen-space marching dir matches point lights: ld is in the same mixed
+      // space as imgUv (N has been pre-flipped via N.y = -N.y), so no Y flip here.
+      sdir = ld;
+      contrib = max(dot(N, ld), 0.0);
+    } else {
+      // Point light — per-pixel direction and attenuation
+      vec3 toLight = vec3(uLX[i] - imgUv.x, uLY[i] - imgUv.y, uLZ[i] - dVal);
+      float dist = max(length(toLight), 1.0e-8);
+      ld = toLight / dist;
+      // Marching dir already in image-UV space (v down, +z toward camera)
+      sdir = ld;
+      // Windowed falloff: att reaches exactly 0 at dist=radius, so the radius
+      // defines the boundary of the lit region without affecting brightness within it.
+      float nd = dist / uLRadius[i];
+      att = pow(max(1.0 - nd * nd, 0.0), 2.0);
+      // Map radius slider [0.05, 2.0] → softness [0.1, 1.0].
+      lightSolidAngle = clamp((uLRadius[i] - 0.05) / 1.95, 0.0, 1.0);
+      // Wrapped diffuse: large radius adds fill light near the shadow terminator,
+      // matching the behaviour of a large physical light source (softbox, window).
+      // Normalization by (1+w) keeps full brightness on the lit side unchanged.
+      float w = lightSolidAngle * 1.0;
+      float rawDot = dot(N, ld);
+      contrib = max(rawDot + w, 0.0) / (1.0 + w) * att;
+    }
+
+    // Blinn-Phong specular: H = normalize(L + V), view direction V = (0, 0, 1)
+    if (uHasRoughness == 1) {
+      vec3 H = normalize(ld + vec3(0.0, 0.0, 1.0));
+      float ndoth = max(dot(N, H), 0.0);
+      // Larger solid angle → lower effective shininess → softer, broader highlight.
+      // Directional lights: lightSolidAngle = 0.0, so effShininess = shininess (unchanged).
+      float effShininess = (uLType[i] == 1)
+          ? shininess * (1.0 - lightSolidAngle * 0.95) + 1.0
+          : shininess;
+      float spec = pow(ndoth, effShininess) * smoothness * smoothness * att;
+      contrib += spec;
+    }
+
+    // Screen-space shadow attenuation (this light may opt out)
+    if (uLShadow[i] > 0.5) {
+      float shadow = traceShadow(imgUv, dVal, sdir);
+      contrib *= (1.0 - uShadowStrength * shadow);
+    }
+
+    // Per-light mask: confines the light (and its shadow) to the selected mask_N.
+    // dot() with a one-hot selector reads one channel without indexing a sampler array.
+    vec4 sel = uLMaskSel[i];
+    if (dot(sel, sel) > 0.5) {
+      float m = dot(texture2D(uMasks, vec2(imgUv.x, 1.0 - imgUv.y)), sel);
+      m = mix(m, 1.0 - m, uLMaskInv[i]);
+      contrib *= mix(1.0, m, uLMaskAmt[i]);
+    }
+
+    lightAccum += contrib * vec3(uLColorR[i], uLColorG[i], uLColorB[i]) * uLIntensity[i];
+  }
 
   gl_FragColor = vec4(clamp(base * lightAccum, 0.0, 1.0), 1.0);
 }`;
@@ -702,7 +771,7 @@ function initWebGL(w: number, h: number): boolean {
       gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_T, gl!.CLAMP_TO_EDGE);
       return t;
     };
-    glTextures = { rgb: mkTex(), normals: mkTex(), depth: mkTex(), albedo: mkTex(), roughness: mkTex() };
+    glTextures = { rgb: mkTex(), normals: mkTex(), depth: mkTex(), albedo: mkTex(), roughness: mkTex(), masks: mkTex() };
 
     // Cache uniform locations
     gl.useProgram(glProgram);
@@ -722,6 +791,8 @@ function initWebGL(w: number, h: number): boolean {
       uLIntensity: u("uLIntensity"),
       uLX: u("uLX"), uLY: u("uLY"), uLZ: u("uLZ"), uLRadius: u("uLRadius"),
       uLAzimuth: u("uLAzimuth"), uLElevation: u("uLElevation"),
+      uMasks: u("uMasks"), uLMaskSel: u("uLMaskSel"), uLMaskInv: u("uLMaskInv"),
+      uLMaskAmt: u("uLMaskAmt"), uLShadow: u("uLShadow"),
     };
 
     // Bind texture units once
@@ -730,6 +801,7 @@ function initWebGL(w: number, h: number): boolean {
     gl.uniform1i(glLocs.uDepth, 2);
     gl.uniform1i(glLocs.uAlbedo, 3);
     gl.uniform1i(glLocs.uRoughness, 4);
+    gl.uniform1i(glLocs.uMasks, 5);
 
     glAPos = gl.getAttribLocation(glProgram, "aPos");
     glW = w; glH = h;
@@ -747,14 +819,15 @@ function uploadPassTextures() {
   // UNPACK_FLIP_Y_WEBGL: first row of data (image top) maps to texture t=1 (screen top)
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
 
-  const upload = (tex: WebGLTexture | null, data: Uint8Array | null) => {
+  const upload = (tex: WebGLTexture | null, data: Uint8Array | null, fmt: number = gl!.RGB) => {
     if (!tex) return;
+    const ch = fmt === gl!.RGBA ? 4 : 3;
     gl!.bindTexture(gl!.TEXTURE_2D, tex);
     if (data) {
-      gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGB, passW, passH, 0, gl!.RGB, gl!.UNSIGNED_BYTE, data);
+      gl!.texImage2D(gl!.TEXTURE_2D, 0, fmt, passW, passH, 0, fmt, gl!.UNSIGNED_BYTE, data);
     } else {
       // Upload a 1x1 black pixel as placeholder for optional passes
-      gl!.texImage2D(gl!.TEXTURE_2D, 0, gl!.RGB, 1, 1, 0, gl!.RGB, gl!.UNSIGNED_BYTE, new Uint8Array(3));
+      gl!.texImage2D(gl!.TEXTURE_2D, 0, fmt, 1, 1, 0, fmt, gl!.UNSIGNED_BYTE, new Uint8Array(ch));
     }
   };
 
@@ -763,6 +836,7 @@ function uploadPassTextures() {
   upload(glTextures.depth,    passDepth);
   upload(glTextures.albedo,   passAlbedo);
   upload(glTextures.roughness, passRoughness);
+  upload(glTextures.masks,    passMasks, gl.RGBA);
 
   texturesDirty = false;
 }
@@ -794,6 +868,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   bindTex(2, glTextures.depth);
   bindTex(3, glTextures.albedo);
   bindTex(4, glTextures.roughness);
+  bindTex(5, glTextures.masks);
 
   // Global uniforms
   const [ar, ag, ab] = hexToRgb(ambientColor.value);
@@ -821,9 +896,16 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   const lX: number[] = [0, 0, 0], lY: number[] = [0, 0, 0], lZ: number[] = [0, 0, 0];
   const lRad: number[] = [1, 1, 1];
   const lAz: number[] = [0, 0, 0], lEl: number[] = [0, 0, 0];
+  const lSel = new Float32Array(12);  // 3 lights × vec4 one-hot
+  const lInv: number[] = [0, 0, 0], lAmt: number[] = [1, 1, 1], lSh: number[] = [1, 1, 1];
 
   for (let i = 0; i < count; i++) {
     const l = ls[i];
+    // An unwired slot selects nothing → the shader leaves the light alone (parity with Python)
+    if (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1]) lSel[i * 4 + l.mask - 1] = 1;
+    lInv[i] = l.maskInvert ? 1 : 0;
+    lAmt[i] = l.maskAmount;
+    lSh[i]  = l.castShadow ? 1 : 0;
     lType[i] = l.type === "directional" ? 0 : 1;
     const [r, g, b] = hexToRgb(l.color);
     lR[i] = r; lG[i] = g; lB[i] = b;
@@ -848,6 +930,10 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   gl.uniform1fv(glLocs.uLRadius, lRad);
   gl.uniform1fv(glLocs.uLAzimuth, lAz);
   gl.uniform1fv(glLocs.uLElevation, lEl);
+  gl.uniform4fv(glLocs.uLMaskSel, lSel);
+  gl.uniform1fv(glLocs.uLMaskInv, lInv);
+  gl.uniform1fv(glLocs.uLMaskAmt, lAmt);
+  gl.uniform1fv(glLocs.uLShadow, lSh);
 
   // Draw full-screen quad
   gl.bindBuffer(gl.ARRAY_BUFFER, glQuadBuf);
@@ -884,7 +970,11 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
     type: l.type, color: hexToRgb(l.color), intensity: l.intensity,
     x: l.x, y: l.y, z: l.z, radius: l.radius,
     azimuth: l.azimuth * Math.PI / 180, elevation: l.elevation * Math.PI / 180,
+    // channel index into passMasks, or -1 (none / unwired slot — parity with Python)
+    maskCh: (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1] && passMasks) ? l.mask - 1 : -1,
+    maskInvert: l.maskInvert, maskAmount: l.maskAmount, castShadow: l.castShadow,
   }));
+  const masks = passMasks;
 
   // Screen-space shadow setup (parity with WebGL/Python tracer)
   const shOn   = shadowsEnabled.value;
@@ -966,9 +1056,14 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
               : shininess;
           contrib += Math.pow(ndoth, effShininess) * smoothness * smoothness * att;
         }
-        if (shOn) {
+        if (shOn && lp.castShadow) {
           const occ = traceShadow(pu, pv, dVal, sdx, sdy, sdz);
           contrib *= (1 - shStr * occ);
+        }
+        if (lp.maskCh >= 0 && masks) {
+          let m = masks[(sy * pw + sx) * 4 + lp.maskCh] / 255;
+          if (lp.maskInvert) m = 1 - m;
+          contrib *= 1 - lp.maskAmount + lp.maskAmount * m;
         }
         lR += contrib * lp.color[0] * lp.intensity;
         lG += contrib * lp.color[1] * lp.intensity;
@@ -1240,6 +1335,8 @@ function setPasses(data: PassData) {
   passDepth   = decodeB64(data.depth);
   passAlbedo  = data.albedo   ? decodeB64(data.albedo)   : null;
   passRoughness = data.roughness ? decodeB64(data.roughness) : null;
+  passMasks     = data.masks     ? decodeB64(data.masks)     : null;
+  maskSlots.value = Array.from({ length: MASK_SLOTS }, (_, k) => !!(passMasks && data.maskSlots?.[k]));
 
   hasAlbedo.value    = passAlbedo    !== null;
   hasRoughness.value = passRoughness !== null;
@@ -1279,9 +1376,9 @@ function deserialise(json: string) {
   try {
     const parsed = JSON.parse(json);
     if (Array.isArray(parsed)) {
-      lights.value = parsed;
+      lights.value = parsed.map(normLight);
     } else {
-      lights.value              = parsed.lights              ?? [];
+      lights.value              = (parsed.lights ?? []).map(normLight);
       ambientIntensity.value    = parsed.ambientIntensity    ?? 0.2;
       ambientColor.value        = parsed.ambientColor        ?? "#ffffff";
       delitMix.value            = parsed.delitMix            ?? 0.0;
@@ -1436,7 +1533,30 @@ onUnmounted(() => {
 }
 .rl-chev.open { transform: rotate(90deg); }
 
-.rl-light-icon { flex-shrink: 0; font-size: 13px; }
+.rl-light-icon { flex-shrink: 0; font-size: 12px; color: var(--descrip-text, #9ca3af); }
+.rl-select {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  font-size: 10px;
+  color: var(--input-text, #cbd5e1);
+  background: var(--comfy-input-bg, #374151);
+  border: 1px solid var(--border-color, #374151);
+  border-radius: 4px;
+}
+.rl-check {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--descrip-text, #9ca3af);
+  cursor: pointer;
+}
+.rl-check.disabled { opacity: 0.45; cursor: default; }
+.rl-check input { margin: 0; }
+.rl-fval-wide { width: auto; text-align: left; }
 
 .rl-sec-title {
   flex: 1 1 auto;
