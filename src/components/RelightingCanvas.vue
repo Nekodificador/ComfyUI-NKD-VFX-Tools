@@ -33,6 +33,7 @@
         <button class="rl-btn" :disabled="lights.length >= 3" @click="addLight('point')">+ Point</button>
         <button class="rl-btn" :disabled="lights.length >= 3" @click="addLight('directional')">+ Dir</button>
         <button class="rl-btn rl-btn-ghost" :disabled="lights.length === 0" @click="clearLights">Clear</button>
+        <button class="rl-btn rl-btn-ghost" title="Remove the lights and put every setting back to its default" @click="resetAll">Reset</button>
       </div>
 
       <!-- Per-light collapsible rows -->
@@ -218,6 +219,11 @@
             <input class="rl-range" data-default="1" :style="rangeStyle(hazeEnd, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="hazeEnd" @input="emit" />
             <span class="rl-fval">{{ hazeEnd.toFixed(2) }}</span>
           </div>
+          <div class="rl-field" title="How much the haze takes the colour of the lights reaching it: a point light leaves a halo of its colour, a directional one tints the whole veil. Unlit haze goes dark.">
+            <span class="rl-flabel">Lit</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(hazeLit, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="hazeLit" @input="emit" />
+            <span class="rl-fval">{{ hazeLit.toFixed(2) }}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -271,6 +277,7 @@ interface State {
   hazeColor: string;
   hazeStart: number;
   hazeEnd: number;
+  hazeLit: number;
 }
 
 interface PassData {
@@ -306,6 +313,7 @@ const hazeAmount          = ref(0.0);
 const hazeColor           = ref("#c8d0dc");
 const hazeStart           = ref(0.0);
 const hazeEnd             = ref(1.0);
+const hazeLit             = ref(0.0);
 const WB_GAIN = 0.25;   // kept in sync with Python
 const HAZE_EPS = 1e-4;  // idem
 
@@ -560,6 +568,15 @@ function clearLights() {
   emit();
 }
 
+// Reset = Clear + every setting back to its default. deserialise("{}") already IS the
+// default state (each field falls back to its default), so this is that plus the emit.
+function resetAll() {
+  deserialise("{}");
+  selectedId.value = null;
+  hiddenArcs.value.clear();
+  emit();
+}
+
 function selectLight(id: number) {
   selectedId.value = selectedId.value === id ? null : id;
 }
@@ -649,6 +666,7 @@ uniform float uHazeAmount;
 uniform vec3  uHazeColor;
 uniform float uHazeStart;
 uniform float uHazeInvSpan;  // 1 / span, signed (End < Start = reversed ramp)
+uniform float uHazeLit;
 
 // Flat light arrays (max 3) — avoids struct array issues in GLSL ES 1.00
 uniform int   uLType[3];
@@ -737,6 +755,8 @@ void main() {
 
   // Ambient seed
   vec3 lightAccum = vec3(uAmbR, uAmbG, uAmbB) * uAmbientIntensity;
+  // Light reaching the haze itself: no normals, no shadows (parity with Python's fog_accum)
+  vec3 fogAccum = lightAccum;
 
   // Accumulate lights. A loop variable is the ONLY non-constant index a fragment
   // shader may use on a uniform array in GLSL ES 1.0 (see the note above).
@@ -800,13 +820,17 @@ void main() {
     // Per-light mask: confines the light (and its shadow) to the selected mask_N.
     // dot() with a one-hot selector reads one channel without indexing a sampler array.
     vec4 sel = uLMaskSel[i];
+    float maskF = 1.0;
     if (dot(sel, sel) > 0.5) {
       float m = dot(texture2D(uMasks, vec2(imgUv.x, 1.0 - imgUv.y)), sel);
       m = mix(m, 1.0 - m, uLMaskInv[i]);
-      contrib *= mix(1.0, m, uLMaskAmt[i]);
+      maskF = mix(1.0, m, uLMaskAmt[i]);
     }
+    contrib *= maskF;
 
-    lightAccum += contrib * vec3(uLColorR[i], uLColorG[i], uLColorB[i]) * uLIntensity[i];
+    vec3 lCol = vec3(uLColorR[i], uLColorG[i], uLColorB[i]) * uLIntensity[i];
+    lightAccum += contrib * lCol;
+    fogAccum += att * maskF * lCol;
   }
 
   vec3 c = clamp(base * lightAccum, 0.0, 1.0);
@@ -815,7 +839,8 @@ void main() {
   c = c * uExposure * uWbGain;
   float luma = dot(c, vec3(0.299, 0.587, 0.114));
   c = luma + (c - luma) * uSaturation;
-  c = mix(c, uHazeColor, uHazeAmount * clamp((1.0 - dVal - uHazeStart) * uHazeInvSpan, 0.0, 1.0));
+  vec3 hazeCol = uHazeColor * mix(vec3(1.0), fogAccum, uHazeLit);
+  c = mix(c, hazeCol, uHazeAmount * clamp((1.0 - dVal - uHazeStart) * uHazeInvSpan, 0.0, 1.0));
   gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
@@ -838,6 +863,20 @@ function initWebGL(w: number, h: number): boolean {
     const ctx = glOffscreen.getContext("webgl", { preserveDrawingBuffer: true, antialias: false });
     if (!ctx) { glReady = false; return false; }
     gl = ctx as WebGLRenderingContext;
+    // Passes arrive tightly packed. WebGL's default UNPACK_ALIGNMENT of 4 wants every
+    // row padded to 4 bytes, so any RGB pass whose width × 3 is not a multiple of 4
+    // (409, 370, most real widths) makes texImage2D throw INVALID_OPERATION and the
+    // preview goes black — measured live, see CLAUDE.md.
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    // The browser evicts GL contexts when a page holds too many (reloads with several
+    // widgets get there). The 2D canvas keeps drawing the HUD while the offscreen image
+    // silently goes black — so drop the dead context and rebuild it on the next draw.
+    glOffscreen.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      destroyWebGL();
+      texturesDirty = true;
+      scheduleRedraw();
+    });
 
     const vert = compileShader(gl, gl.VERTEX_SHADER, VERT_SRC);
     const frag = compileShader(gl, gl.FRAGMENT_SHADER, FRAG_SRC);
@@ -888,7 +927,7 @@ function initWebGL(w: number, h: number): boolean {
       uShadowSoftness: u("uShadowSoftness"), uShadowRange: u("uShadowRange"),
       uExposure: u("uExposure"), uWbGain: u("uWbGain"), uSaturation: u("uSaturation"),
       uHazeAmount: u("uHazeAmount"), uHazeColor: u("uHazeColor"),
-      uHazeStart: u("uHazeStart"), uHazeInvSpan: u("uHazeInvSpan"),
+      uHazeStart: u("uHazeStart"), uHazeInvSpan: u("uHazeInvSpan"), uHazeLit: u("uHazeLit"),
       uLightCount: u("uLightCount"),
       uLType0: u("uLType[0]"), uLType1: u("uLType[1]"), uLType2: u("uLType[2]"),
       uLColorR: u("uLColorR"), uLColorG: u("uLColorG"), uLColorB: u("uLColorB"),
@@ -926,6 +965,12 @@ function uploadPassTextures() {
   const upload = (tex: WebGLTexture | null, data: Uint8Array | null, fmt: number = gl!.RGB) => {
     if (!tex) return;
     const ch = fmt === gl!.RGBA ? 4 : 3;
+    if (data && data.length < passW * passH * ch) {
+      // A short buffer makes texImage2D throw INVALID_OPERATION and the preview goes
+      // black with no hint. Say so, and upload the 1×1 stand-in instead.
+      console.warn(`NKD Relight: pass buffer ${data.length} B < ${passW}×${passH}×${ch}, skipped`);
+      data = null;
+    }
     gl!.bindTexture(gl!.TEXTURE_2D, tex);
     if (data) {
       gl!.texImage2D(gl!.TEXTURE_2D, 0, fmt, passW, passH, 0, fmt, gl!.UNSIGNED_BYTE, data);
@@ -998,6 +1043,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   const [hzStart, hzSpan] = hazeRamp();
   gl.uniform1f(glLocs.uHazeStart,   hzStart);
   gl.uniform1f(glLocs.uHazeInvSpan, 1 / hzSpan);
+  gl.uniform1f(glLocs.uHazeLit, hazeLit.value);
 
   // Per-light uniforms — padded to 3 elements
   const ls = lights.value;
@@ -1098,7 +1144,7 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
   // Look post-process (parity with Python / GLSL)
   const ev = Math.pow(2, lookExposure.value), wb = wbGain(), sat = lookSaturation.value;
   const hzA = hazeAmount.value, hz = hexToRgb(hazeColor.value);
-  const [hzS, hzSpan] = hazeRamp(); const hzInv = 1 / hzSpan;
+  const [hzS, hzSpan] = hazeRamp(); const hzInv = 1 / hzSpan; const hzLit = hazeLit.value;
   const sampleDepth = (u: number, v: number): number => {
     const ix = Math.max(0, Math.min(pw - 1, Math.round(u * pw)));
     const iy = Math.max(0, Math.min(ph - 1, Math.round(v * ph)));
@@ -1143,6 +1189,7 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
         baseB = (1 - mix) * b + mix * alb[pi+2] / 255;
       }
       let lR = ambInt * ar, lG = ambInt * ag, lB = ambInt * ab;
+      let fR = lR, fG = lG, fB = lB;  // light reaching the haze (parity with Python / GLSL)
       const pu = sx / pw, pv = sy / ph;
       for (const lp of lightParams) {
         let contrib = 0, att = 1.0, ldx = 0, ldy = 0, ldz = 0, lightSolidAngle = 0.0;
@@ -1178,14 +1225,18 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
           const occ = traceShadow(pu, pv, dVal, sdx, sdy, sdz);
           contrib *= (1 - shStr * occ);
         }
+        let maskF = 1;
         if (lp.maskCh >= 0 && masks) {
           let m = masks[(sy * pw + sx) * 4 + lp.maskCh] / 255;
           if (lp.maskInvert) m = 1 - m;
-          contrib *= 1 - lp.maskAmount + lp.maskAmount * m;
+          maskF = 1 - lp.maskAmount + lp.maskAmount * m;
         }
+        contrib *= maskF;
         lR += contrib * lp.color[0] * lp.intensity;
         lG += contrib * lp.color[1] * lp.intensity;
         lB += contrib * lp.color[2] * lp.intensity;
+        const reach = att * maskF * lp.intensity;
+        fR += reach * lp.color[0]; fG += reach * lp.color[1]; fB += reach * lp.color[2];
       }
       let cR = Math.min(1, Math.max(0, baseR * lR)) * ev * wb[0];
       let cG = Math.min(1, Math.max(0, baseG * lG)) * ev * wb[1];
@@ -1193,7 +1244,8 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
       const luma = cR * 0.299 + cG * 0.587 + cB * 0.114;
       cR = luma + (cR - luma) * sat; cG = luma + (cG - luma) * sat; cB = luma + (cB - luma) * sat;
       const hf = hzA * Math.min(1, Math.max(0, (1 - dVal - hzS) * hzInv));
-      cR += (hz[0] - cR) * hf; cG += (hz[1] - cG) * hf; cB += (hz[2] - cB) * hf;
+      const hzR = hz[0] * (1 + (fR - 1) * hzLit), hzG = hz[1] * (1 + (fG - 1) * hzLit), hzB = hz[2] * (1 + (fB - 1) * hzLit);
+      cR += (hzR - cR) * hf; cG += (hzG - cG) * hf; cB += (hzB - cB) * hf;
       const oi = (y * W + x) * 4;
       out[oi]   = Math.min(255, Math.max(0, cR * 255));
       out[oi+1] = Math.min(255, Math.max(0, cG * 255));
@@ -1221,9 +1273,9 @@ function drawPreview() {
     cv.width  = passW;
     cv.height = passH;
 
-    if (glReady) {
+    if (glReady && !gl?.isContextLost()) {
       renderWebGL(ctx, passW, passH);
-    } else if (!glReady && passRgb) {
+    } else if (passRgb) {
       // Try to init WebGL once we have pass dimensions
       if (initWebGL(passW, passH)) {
         renderWebGL(ctx, passW, passH);
@@ -1501,6 +1553,7 @@ function serialise(): string {
     hazeColor: hazeColor.value,
     hazeStart: hazeStart.value,
     hazeEnd: hazeEnd.value,
+    hazeLit: hazeLit.value,
   };
   return JSON.stringify(state);
 }
@@ -1528,6 +1581,7 @@ function deserialise(json: string) {
       hazeColor.value           = parsed.hazeColor           ?? "#c8d0dc";
       hazeStart.value           = parsed.hazeStart           ?? 0.0;
       hazeEnd.value             = parsed.hazeEnd             ?? 1.0;
+      hazeLit.value             = parsed.hazeLit             ?? 0.0;
     }
     nextTick(drawPreview);
   } catch {

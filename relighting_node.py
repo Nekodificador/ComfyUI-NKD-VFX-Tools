@@ -77,6 +77,7 @@ LOOK_DEFAULTS = {
     "hazeStart": 0.0,     # distance (1 - depth) where haze begins to ramp in
     "hazeEnd": 1.0,       # distance where it reaches hazeAmount. End < Start = haze NEAR, fading
                           # out toward Start (signed ramp). Start = End = 0 → uniform haze
+    "hazeLit": 0.0,       # 0..1: how much the haze takes the colour of the lights reaching it
 }
 HAZE_EPS = 1e-4
 
@@ -102,11 +103,16 @@ def _parse_look(state):
     return look
 
 
-def _apply_look(color, depth_s, look):
+def _apply_look(color, depth_s, look, fog=None):
     """Post-process on the lit colour (B,H,W,3), depth (B,H,W) near = white.
     Order: exposure → white balance → saturation → haze. Haze is last so the
     colour you pick is the colour that lands on the plate. Mirrored in the
-    GLSL shader and the JS fallback of RelightingCanvas.vue."""
+    GLSL shader and the JS fallback of RelightingCanvas.vue.
+
+    fog: (B,H,W,3) light reaching the haze itself — ambient plus each light's
+    colour × intensity × attenuation, no normals, no shadows. With hazeLit the
+    haze colour is scaled by it, so a point light leaves a halo of its colour
+    and a directional one tints the whole veil."""
     c = color * (2.0 ** look["exposure"])
     t, g = look["temperature"], look["tint"]
     wb = torch.tensor([1.0 + WB_GAIN * t, 1.0 + WB_GAIN * g, 1.0 - WB_GAIN * t],
@@ -116,6 +122,8 @@ def _apply_look(color, depth_s, look):
     c = luma + (c - luma) * look["saturation"]
     if look["hazeAmount"] > 0.0:
         haze = torch.tensor(_hex_to_rgb(look["hazeColor"]), dtype=c.dtype, device=c.device)
+        if fog is not None and look["hazeLit"] > 0.0:
+            haze = haze * (1.0 + (fog - 1.0) * look["hazeLit"])  # mix(1, fog, lit) per pixel
         dist = 1.0 - depth_s
         start, span = _haze_ramp(look["hazeStart"], look["hazeEnd"])
         ramp = (dist - start) / span
@@ -231,6 +239,9 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
     # Ambient seed
     amb_rgb = torch.tensor(_hex_to_rgb(ambient_color), dtype=torch.float32, device=dev)
     light_accum = (amb_rgb * ambient_intensity).view(1, 1, 1, 3).expand(B, H, W, 3).clone()
+    # Light reaching the haze (see _apply_look). Only built when the Look asks for it.
+    want_fog = look is not None and look["hazeAmount"] > 0.0 and look["hazeLit"] > 0.0
+    fog_accum = light_accum.clone() if want_fog else None
 
     # Screen-space shadows need the per-pixel UV grids too
     shadows_on = bool(shadows and shadows.get("enabled"))
@@ -244,7 +255,7 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
         yc = xc = None
 
     for light in lights:
-        diffuse, specular, sdir = _calc_light_gpu(
+        diffuse, specular, sdir, att = _calc_light_gpu(
             normals_xyz, depth_s, light, roughness_s, H, W, dev, yc, xc
         )
         l_rgb = torch.tensor(
@@ -263,10 +274,15 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
             contrib = contrib * mask_factor
         # contrib: (B,H,W) → (B,H,W,1) * (1,1,1,3) → (B,H,W,3) added in-place
         light_accum.add_(contrib.unsqueeze(-1) * (l_rgb * l_int))
+        if fog_accum is not None:
+            reach = att if att is not None else torch.ones(B, H, W, device=dev)
+            if mask_factor is not None:
+                reach = reach * mask_factor
+            fog_accum.add_(reach.expand(B, H, W).unsqueeze(-1) * (l_rgb * l_int))
 
     result = (effective_base * light_accum).clamp(0.0, 1.0)
     if look is not None and look != LOOK_DEFAULTS:
-        result = _apply_look(result, depth_s, look)
+        result = _apply_look(result, depth_s, look, fog_accum)
     # Preserve alpha channel if present
     if rgb.shape[-1] == 4:
         result = torch.cat([result, rgb_f[..., 3:4]], dim=-1)
@@ -274,7 +290,8 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
 
 
 def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
-    """Returns (diffuse, specular, sdir) as (B,H,W) tensors on device.
+    """Returns (diffuse, specular, sdir, att) as (B,H,W) tensors on device.
+    att is the distance falloff of a point light (None for directional = 1).
 
     sdir is the screen-space marching direction toward the light
     (su, sv, sz) used by the shadow tracer, in image-UV space where
@@ -299,7 +316,7 @@ def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
             normals[..., 0] * ldx + normals[..., 1] * ldy + normals[..., 2] * ldz
         ).clamp(min=0.0)
         if roughness is None:
-            return diffuse, zero, sdir
+            return diffuse, zero, sdir, None
         # Blinn-Phong: H = normalize(L + V), V = (0,0,1) — H is constant for directional
         hx, hy, hz = ldx, ldy, ldz + 1.0
         hlen = max(math.sqrt(hx*hx + hy*hy + hz*hz), 1e-8)
@@ -311,7 +328,7 @@ def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
         smoothness = (1.0 - roughness).clamp(0.0, 1.0)
         shininess = (smoothness.pow(2) * 128.0 + 1.0).clamp(min=1.0)
         specular = torch.pow(ndoth, shininess) * smoothness.pow(2)
-        return diffuse, specular, sdir
+        return diffuse, specular, sdir, None
 
     elif lt == "point":
         lx = float(light.get("x", 0.5))
@@ -348,7 +365,7 @@ def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
         diffuse = (dot_raw + w).clamp(min=0.0) / (1.0 + w) * att
 
         if roughness is None:
-            return diffuse, zero, sdir
+            return diffuse, zero, sdir, att
 
         # Blinn-Phong: H = normalize(L + V), per-pixel since L varies
         hz_t = ldz_t + 1.0
@@ -363,7 +380,7 @@ def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
         # Larger softness → lower effective shininess → broader, softer highlight
         eff_shininess = shininess * (1.0 - softness * 0.95) + 1.0
         specular = torch.pow(ndoth, eff_shininess) * smoothness.pow(2) * att
-        return diffuse, specular, sdir
+        return diffuse, specular, sdir, att
 
     return zero, zero, None
 
@@ -429,10 +446,17 @@ def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, 
     nh = int(H * scale) if scale < 1.0 else H
     nw = int(W * scale) if scale < 1.0 else W
 
-    def prepare(t):
+    def prepare(t, channels=3):
+        """(B,H,W,C) → (h,w,channels) on device. The preview uploads RGB textures,
+        so a 1-channel pass (some depth nodes) is expanded and an RGBA one is
+        cropped — otherwise texImage2D rejects the buffer and the preview goes black."""
         if t is None:
             return None
         s = t[0:1].permute(0, 3, 1, 2).float()  # (1,C,H,W)
+        if s.shape[1] == 1 and channels > 1:
+            s = s.expand(-1, channels, -1, -1)
+        elif s.shape[1] > channels:
+            s = s[:, :channels]
         if scale < 1.0:
             s = F.interpolate(s, size=(nh, nw), mode="bilinear", align_corners=False)
         return s.squeeze(0).permute(1, 2, 0)  # (H,W,C) — still on device
@@ -443,7 +467,7 @@ def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, 
     a  = prepare(albedo)
     ro = prepare(roughness)
     packed, slots = _pack_masks(masks, H, W)
-    mk = prepare(packed)
+    mk = prepare(packed, 4)
 
     def to_b64(t):
         if t is None:
@@ -696,6 +720,47 @@ def demo() -> None:
     assert torch.allclose(rev[W - 1], torch.tensor([0.6, 0.6, 0.6]), atol=1e-6), rev[W - 1]
     rmid = px({"hazeAmount": 1.0, "hazeColor": "#ff0000", "hazeStart": 1.5, "hazeEnd": 0.5}, near_far * 0)
     assert torch.allclose(rmid, torch.tensor([0.8, 0.3, 0.3]), atol=1e-6), rmid
+    # Lit haze: uniform white haze at full amount, ambient 0, one RED point light at
+    # the top-left pixel (z = the flat depth). hazeLit 1 → the haze there IS the light
+    # colour, and outside the light's radius it is black (fog in the dark is dark);
+    # hazeLit 0 → the plain haze colour, whatever the lights (the control).
+    pl = {"lights": [{"type": "point", "x": 0.0, "y": 0.0, "z": 0.0, "radius": 0.5,
+                      "intensity": 1.0, "color": "#ff0000"}],
+          "ambientIntensity": 0.0, "hazeAmount": 1.0, "hazeColor": "#ffffff",
+          "hazeStart": 0.0, "hazeEnd": 0.0}
+    lit = _relight(rgb, facing, flat_depth, None, None, json.dumps({**pl, "hazeLit": 1.0}))[0]
+    assert torch.allclose(lit[0, 0], torch.tensor([1.0, 0.0, 0.0]), atol=1e-6), lit[0, 0]
+    assert torch.allclose(lit[H - 1, W - 1], torch.zeros(3), atol=1e-6), lit[H - 1, W - 1]
+    assert lit[0, W // 8, 0] > lit[0, W // 3, 0] > 0.0, "halo fades with distance"
+    unlit = _relight(rgb, facing, flat_depth, None, None, json.dumps({**pl, "hazeLit": 0.0}))[0]
+    assert torch.allclose(unlit, torch.ones_like(unlit)), "hazeLit 0 ignores the lights"
+    # Directional light tints the whole veil evenly.
+    dl = {**pl, "lights": [{"type": "directional", "azimuth": 0, "elevation": 0,
+                            "intensity": 0.5, "color": "#00ff00"}], "hazeLit": 1.0}
+    dv = _relight(rgb, facing, flat_depth, None, None, json.dumps(dl))[0]
+    assert torch.allclose(dv, torch.tensor([0.0, 0.5, 0.0]).expand_as(dv), atol=1e-6), dv[0, 0]
+
+    # 10. Preview passes always leave with 3 channels (4 for the packed masks), whatever
+    #     came in: a 1-channel depth and an RGBA rgb both broke texImage2D and blacked
+    #     the preview (reported by Neko on v1.9.0).
+    sent = {}
+    class _Srv:
+        class instance:
+            @staticmethod
+            def send_sync(name, payload):
+                sent.update(payload)
+    import sys, types
+    sys.modules["server"] = types.SimpleNamespace(PromptServer=_Srv)
+    try:
+        _send_passes_to_frontend("1", torch.rand(1, H, W, 4), facing, torch.rand(1, H, W, 1),
+                                 None, None, [half, None, None, None])
+    finally:
+        del sys.modules["server"]
+    import base64 as _b64
+    n_bytes = lambda k: len(_b64.b64decode(sent["passes"][k]))
+    assert sent["passes"]["width"] == W and sent["passes"]["height"] == H
+    assert n_bytes("rgb") == H * W * 3 and n_bytes("depth") == H * W * 3, (n_bytes("rgb"), n_bytes("depth"))
+    assert n_bytes("masks") == H * W * 4 and sent["passes"]["maskSlots"] == [True, False, False, False]
 
     print("relighting_node self-check OK")
 

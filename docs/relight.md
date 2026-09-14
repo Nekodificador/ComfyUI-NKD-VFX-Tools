@@ -23,7 +23,11 @@ lights so the scene reads as one.
 white balance (temperature and tint), saturation, and haze. Haze uses the depth pass, so it
 can be atmospheric: *Start* and *End* set where along the depth it fades in. Put *End* below
 *Start* to haze the foreground instead, or set both to zero for an even wash over the whole
-image. Every slider resets on double-click, and Shift makes any drag ten times finer.
+image. *Lit* lets the haze take the colour of the lights reaching it: a point light
+leaves a halo of its colour in the fog, a directional one tints the whole veil, and
+unlit fog goes dark, the way real haze behaves. Every slider resets on double-click, Shift
+makes any drag ten times finer, and *Reset* next to *Clear* puts the whole node back to its
+defaults, lights included.
 
 The point is to settle the lighting before the model gets a say. Relight the plate, then
 send it downstream as your img2img base or ControlNet reference, and the generation

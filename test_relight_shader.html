@@ -105,6 +105,7 @@ const setLook = (o = {}) => {
   gl.uniform3f(u('uHazeColor'), hc[0], hc[1], hc[2])
   const st = o.start ?? 0, span = (o.end ?? 1) - st  // same nudge as hazeRamp() in the .vue
   gl.uniform1f(u('uHazeStart'), Math.abs(span) <= 1e-4 ? st - 1e-4 : st); gl.uniform1f(u('uHazeInvSpan'), 1 / (Math.abs(span) <= 1e-4 ? 1e-4 : span))
+  gl.uniform1f(u('uHazeLit'), o.lit ?? 0)
 }
 setLook()
 
@@ -170,6 +171,33 @@ setLook({ temp: 1, sat: 0 }); const grey = pxRGB(left)
 check(near(grey[0], grey[1], 1) && near(grey[1], grey[2], 1), `saturation 0 is grey: ${grey}`)
 setLook({ ev: -1 }); const dark = pxRGB(left)
 check(near(dark[0], 76), `exposure -1 halves: ${dark[0]} (76)`)
+
+// 6b. Lit haze (Python block 9, last part). Uniform white haze, ambient 0, one RED
+//     point light at the left edge (radius 0.5 → out of reach at the right edge).
+//     lit 1: the haze at the light is red and at the far edge black; lit 0: plain white.
+gl.uniform1f(u('uAmbientIntensity'), 0)
+gl.uniform1i(u('uLType[0]'), 1); gl.uniform1fv(u('uLColorG'), [0,1,1]); gl.uniform1fv(u('uLColorB'), [0,1,1])
+gl.uniform1fv(u('uLX'), [0,0,0]); gl.uniform1fv(u('uLY'), [0.5,0,0]); gl.uniform1fv(u("uLZ"), [0,0,0]); gl.uniform1fv(u("uLRadius"), [0.5,1,1])
+setLook({ haze: 1, hazeColor: [1, 1, 1], start: 0, end: 0, lit: 1 })
+const atLight = pxRGB(left), farOff = pxRGB(right)
+// tolerance 5: the sampled pixel centre sits half a texel off the light, att ≈ 0.985 → 251
+check(near(atLight[0], 255, 5) && near(atLight[1], 0) && near(atLight[2], 0), `lit haze at the light is the light colour ${atLight} (255,0,0)`)
+check(near(farOff[0], 0) && near(farOff[1], 0), `lit haze out of reach is dark ${farOff} (0,0,0)`)
+setLook({ haze: 1, hazeColor: [1, 1, 1], start: 0, end: 0, lit: 0 })
+const plain = pxRGB(left)
+check(near(plain[0], 255) && near(plain[1], 255) && near(plain[2], 255), `lit 0 keeps the plain haze colour ${plain} (255,255,255)`)
+gl.uniform1f(u('uAmbientIntensity'), 0.2); gl.uniform1fv(u('uLColorG'), [1,1,1]); gl.uniform1fv(u('uLColorB'), [1,1,1])
+
+// 7. Row alignment. The widget uploads tightly packed RGB rows; with WebGL's default
+//    UNPACK_ALIGNMENT (4) a 409-wide RGB texture (1227 B rows) is rejected with
+//    INVALID_OPERATION and the preview goes black. The widget sets alignment 1 in
+//    initWebGL — this is the same call, on a texture of that width.
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4)
+tex(6, gl.RGB, new Uint8Array(409 * 4 * 3), 409, 4)
+check(gl.getError() === gl.INVALID_OPERATION, 'control: alignment 4 rejects a 409-wide RGB upload')
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+tex(6, gl.RGB, new Uint8Array(409 * 4 * 3), 409, 4)
+check(gl.getError() === gl.NO_ERROR, 'alignment 1 accepts a 409-wide RGB upload')
 
 log(`\n${failed ? failed + ' FAILED' : 'all checks passed'}`)
 </script>
