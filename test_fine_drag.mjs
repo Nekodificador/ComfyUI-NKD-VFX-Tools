@@ -42,7 +42,7 @@ function makeRoot() {
   return {
     addEventListener(t, f) { (caps[t] ??= []).push(f); },
     removeEventListener(t, f) { caps[t] = (caps[t] ?? []).filter((g) => g !== f); },
-    send(t, ev) { for (const f of [...(caps[t] ?? [])]) f(ev); },
+    emit(t, ev) { for (const f of [...(caps[t] ?? [])]) f(ev); },
   };
 }
 
@@ -53,7 +53,7 @@ const ptr = (target, clientX, shiftKey = false, detail = 1) => ({
 
 /** Press at `from`, move through `xs`, release. Returns the final value. */
 function drag(root, el, from, xs, shiftKey) {
-  root.send("pointerdown", ptr(el, from, shiftKey));
+  root.emit("pointerdown", ptr(el, from, shiftKey));
   for (const x of xs) el._fire("pointermove", ptr(el, x, shiftKey));
   el._fire("pointerup", ptr(el, xs[xs.length - 1] ?? from, shiftKey));
   return parseFloat(el.value);
@@ -100,7 +100,7 @@ function drag(root, el, from, xs, shiftKey) {
   // Shift pressed halfway: the value must carry on from where it was, not snap
   // to wherever the cursor has got to.
   el.value = "50";
-  root.send("pointerdown", ptr(el, 100, false));
+  root.emit("pointerdown", ptr(el, 100, false));
   el._fire("pointermove", ptr(el, 120, false));        // +10 coarse → 60
   const mid = parseFloat(el.value);
   near(mid, 60, 1e-6, "coarse leg");
@@ -157,18 +157,18 @@ function drag(root, el, from, xs, shiftKey) {
   const withDef = makeSlider({ min: 0.25, max: 4, step: 0.01, value: 3.2, dataDefault: 1 });
   let inputs = 0;
   withDef.addEventListener("input", () => inputs++);
-  root.send("dblclick", ptr(withDef, 180));
+  root.emit("dblclick", ptr(withDef, 180));
   near(parseFloat(withDef.value), 1, 1e-9, "double-click should restore the default");
   ok(inputs > 0, "the reset must fire an input event or the framework never sees it");
 
   // No declared default: leave it alone rather than guess.
   const noDef = makeSlider({ min: 0, max: 1, step: 0.01, value: 0.42 });
-  root.send("dblclick", ptr(noDef, 10));
+  root.emit("dblclick", ptr(noDef, 10));
   near(parseFloat(noDef.value), 0.42, 1e-9, "a slider with no default must not move");
 
   // The second press of a double-click must not drag the value to the cursor.
   const guard = makeSlider({ min: 0, max: 1, step: 0.01, value: 0.5, dataDefault: 0.5 });
-  root.send("pointerdown", ptr(guard, 200, false, 2));
+  root.emit("pointerdown", ptr(guard, 200, false, 2));
   near(parseFloat(guard.value), 0.5, 1e-9, "second click of a double-click must not jump");
   detach();
 }
@@ -179,7 +179,7 @@ function drag(root, el, from, xs, shiftKey) {
   const detach = attachFineRange(root);
   detach();
   const el = makeSlider({ min: 0, max: 1, step: 0.1, value: 0.5 });
-  root.send("pointerdown", ptr(el, 200));
+  root.emit("pointerdown", ptr(el, 200));
   near(parseFloat(el.value), 0.5, 1e-9, "detached listener still moved the value");
 }
 

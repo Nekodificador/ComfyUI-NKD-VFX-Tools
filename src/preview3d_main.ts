@@ -322,7 +322,8 @@ comfyApp.registerExtension({
       // Safety net: node.computeSize() never reports less than the widget needs. Call
       // the original with NO args — newer LiteGraph's computeSize(out?) takes an output
       // array, not a width.
-      const origComputeSize = node.computeSize.bind(node)
+      const computeSizeFn = node.computeSize  // captured before it is replaced below
+      const origComputeSize = () => computeSizeFn.call(node)
       node.computeSize = function (): [number, number] {
         const sz: [number, number] = origComputeSize()
         const needed = widgetHeight()

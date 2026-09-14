@@ -26,6 +26,10 @@ from PIL import Image as PILImage
 from typing_extensions import override
 
 import folder_paths
+try:
+    from .nkd_vfx_helpers import _safe_join
+except ImportError:  # `python nkd_preview_3d.py` (self-check) runs it bare
+    from nkd_vfx_helpers import _safe_join
 import nodes
 from comfy_api.latest import ComfyExtension, Types, io
 from comfy_api.latest._io import ComfyTypeIO, comfytype
@@ -92,10 +96,16 @@ def _string_to_model_ref(path: str) -> dict:
     """
     path = path.replace("\\", "/")
     subfolder, _, name = path.rpartition("/")
-    ftype = "input"
-    if (not os.path.isfile(os.path.join(folder_paths.get_input_directory(), subfolder, name))
-            and os.path.isfile(os.path.join(folder_paths.get_output_directory(), subfolder, name))):
+    in_p = _safe_join(folder_paths.get_input_directory(), subfolder, name)
+    out_p = _safe_join(folder_paths.get_output_directory(), subfolder, name)
+    if in_p and os.path.isfile(in_p):
+        ftype = "input"
+    elif out_p and os.path.isfile(out_p):
         ftype = "output"
+    elif in_p is None and out_p is None:
+        raise ValueError("model_file must point inside the input or output folder")
+    else:
+        ftype = "input"  # not there (yet): historical default, the viewer reports the 404
     return {"filename": name, "type": ftype, "subfolder": subfolder}
 
 

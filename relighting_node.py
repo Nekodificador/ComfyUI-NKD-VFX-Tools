@@ -156,9 +156,9 @@ def _light_mask(light, masks, xc=None, yc=None, depth_s=None, sdir=None):
     m = masks[idx - 1]
     k = float(light.get("maskProject", 0.0) or 0.0)
     if k > 0.0 and sdir is not None and depth_s is not None:
-        su, sv = sdir[0], sdir[1]
-        u = xc - su * depth_s * k                      # (B,H,W)
-        v = yc - sv * depth_s * k
+        dir_u, dir_v = sdir[0], sdir[1]
+        u = xc - dir_u * depth_s * k                      # (B,H,W)
+        v = yc - dir_v * depth_s * k
         grid = torch.stack([u * 2.0 - 1.0, v * 2.0 - 1.0], dim=-1)
         B = depth_s.shape[0]
         m_in = m.unsqueeze(1).expand(B, 1, *m.shape[1:]) if m.shape[0] == 1 else m.unsqueeze(1)
@@ -306,7 +306,7 @@ def _calc_light_gpu(normals, depth, light, roughness, H, W, dev, yc, xc):
     att is the distance falloff of a point light (None for directional = 1).
 
     sdir is the screen-space marching direction toward the light
-    (su, sv, sz) used by the shadow tracer, in image-UV space where
+    (dir_u, dir_v, sz) used by the shadow tracer, in image-UV space where
     v increases downward and +z points toward the camera.
     """
     B = normals.shape[0]
@@ -404,7 +404,7 @@ def _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev):
     surface "pokes above" the ray on its way to the light, the point is
     occluded. Returns a (B,H,W) factor in [0,1] (1 = fully lit).
 
-    sdir = (su, sv, sz): screen-space marching direction. su/sv may be
+    sdir = (dir_u, dir_v, sz): screen-space marching direction. dir_u/dir_v may be
     scalars (directional) or (B,H,W) tensors (point); sz likewise.
     """
     B, H, W = depth_s.shape
@@ -415,7 +415,7 @@ def _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev):
     if strength <= 0.0:
         return torch.ones(B, H, W, device=dev, dtype=torch.float32)
 
-    su, sv, sz = sdir
+    dir_u, dir_v, sz = sdir
     depth_in = depth_s.unsqueeze(1)            # (B,1,H,W) for grid_sample
     d0 = depth_s                               # (B,H,W) ray origin depth
     occ = torch.zeros(B, H, W, device=dev, dtype=torch.float32)
@@ -423,8 +423,8 @@ def _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev):
 
     for i in range(1, steps + 1):
         t = (i / steps) * rng
-        u = (xc + su * t).expand(B, H, W)      # (B,H,W) image-UV in [0,1]
-        v = (yc + sv * t).expand(B, H, W)
+        u = (xc + dir_u * t).expand(B, H, W)      # (B,H,W) image-UV in [0,1]
+        v = (yc + dir_v * t).expand(B, H, W)
         ray_z = d0 + sz * t                    # depth of the ray at this step
         grid = torch.stack([u * 2.0 - 1.0, v * 2.0 - 1.0], dim=-1)  # (B,H,W,2)
         scene_z = F.grid_sample(

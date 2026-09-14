@@ -4,6 +4,7 @@ Self-contained mask/resize/blend utilities used by the perspective dewarp nodes,
 kept here so the pack has no external imports beyond numpy/torch.
 """
 from typing import Optional, Tuple
+import re
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -300,3 +301,31 @@ def _work_device(x: torch.Tensor) -> torch.device:
         return mm.get_torch_device()
     except Exception:
         return torch.device("cuda") if torch.cuda.is_available() else x.device
+
+
+# ---------------------------------------------------------------------------
+# File paths that come from a request or a widget
+# ---------------------------------------------------------------------------
+def _safe_join(base: str, *parts: str):
+    """Join `parts` under `base` and return the real path, or None when the
+    result would land outside `base` (`..`, absolute parts, symlinks out)."""
+    import os
+    root = os.path.realpath(base)
+    p = os.path.realpath(os.path.join(root, *[str(x) for x in parts if x]))
+    return p if p == root or p.startswith(root + os.sep) else None
+
+
+def _safe_name(name: str, default: str) -> str:
+    """A bare file name from user text: no directories, only plain characters."""
+    import os
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(str(name or ""))).strip("._")
+    return cleaned or default
+
+
+if __name__ == "__main__":
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        assert _safe_join(td, "sub", "a.glb").startswith(os.path.realpath(td))
+        assert _safe_join(td, "..", "x") is None and _safe_join(td, "a/../../x") is None
+    assert _safe_name("../x y", "d") == "x_y" and _safe_name("", "d") == "d"
+    print("nkd_vfx_helpers self-check OK")
