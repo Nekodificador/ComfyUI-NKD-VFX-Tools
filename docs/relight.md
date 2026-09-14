@@ -15,6 +15,11 @@ or light a silhouette only. *Invert* flips the mask, so one subject mask serves 
 on the subject and another on everything else. *Mask amount* lets some of the light leak
 outside. Feather the mask upstream with your usual mask nodes; white means lit.
 
+**Gobos.** A mask can also act as a gobo, the cut-out a real light shines through: wire a
+window pattern, blinds, or foliage and raise *Project* on that light. The pattern then
+slides with depth along the light, so it bends over the nose and drifts across the shoulder
+instead of sitting flat on the screen. At zero it is the plain mask.
+
 **Shadows per light.** Every light has its own *Shadow* switch. The *Shadows* section stays
 the master switch and holds the tracer settings (strength, softness, range), shared by all
 lights so the scene reads as one.

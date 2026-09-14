@@ -245,3 +245,58 @@ def _post_blend(orig: torch.Tensor, composite: torch.Tensor, mask: torch.Tensor,
         out[i, :, :, :3] = torch.from_numpy(np.ascontiguousarray(res)).to(
             device=composite.device, dtype=composite.dtype)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Shared by the passes nodes (Normal Detail). Ported from Basic Tools so the
+# packs stay independent.
+# ---------------------------------------------------------------------------
+_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)  # Rec.709
+_PREVIEW_FRAMES = 8
+
+
+def _luminance(image: torch.Tensor) -> torch.Tensor:
+    """Rec.709 luminance of an image [..., C] → [...], usable as a MASK."""
+    rgb = image[..., :3]
+    w = torch.tensor(_LUMA_WEIGHTS, device=rgb.device, dtype=rgb.dtype)
+    return (rgb * w).sum(-1)
+
+
+def _gaussian(x: torch.Tensor, r: int) -> torch.Tensor:
+    if r < 1:
+        return x
+    sigma = max(r / 2.0, 0.5)
+    k = 2 * r + 1
+    t = torch.arange(k, device=x.device, dtype=x.dtype) - r
+    g = torch.exp(-(t * t) / (2 * sigma * sigma))
+    g = g / g.sum()
+    c = x.shape[1]
+    kh = g.view(1, 1, 1, k).repeat(c, 1, 1, 1)
+    kv = kh.transpose(2, 3)
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), kh, groups=c)
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), kv, groups=c)
+    return x
+
+
+def preview_frames(x: torch.Tensor, count: int = _PREVIEW_FRAMES) -> torch.Tensor:
+    """Evenly spaced frames of a batch, at full resolution.
+
+    A long clip only previews a handful of frames, because writing 81 PNGs to
+    temp on every run is the cost actually worth avoiding. Resolution is *not*:
+    downscaling throws away the mask edge and the blur falloff, which is the
+    only thing anyone is looking at the preview to judge.
+    """
+    if x.shape[0] <= count:
+        return x
+    idx = torch.linspace(0, x.shape[0] - 1, count).round().long()
+    return x[idx]
+
+
+def _work_device(x: torch.Tensor) -> torch.device:
+    if x.device.type != "cpu":
+        return x.device
+    try:
+        import comfy.model_management as mm
+        return mm.get_torch_device()
+    except Exception:
+        return torch.device("cuda") if torch.cuda.is_available() else x.device

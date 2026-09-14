@@ -87,6 +87,7 @@ const setLight = (o) => {
   gl.uniform4fv(u('uLMaskSel'), sel)
   gl.uniform1fv(u('uLMaskInv'), [o.inv ? 1 : 0, 0, 0]); gl.uniform1fv(u('uLMaskAmt'), [o.amt ?? 1, 1, 1])
   gl.uniform1fv(u('uLShadow'), [o.cast === false ? 0 : 1, 1, 1])
+  gl.uniform1fv(u('uLProject'), [o.proj ?? 0, 0, 0])
 }
 gl.uniform1f(u('uAmbR'), 1); gl.uniform1f(u('uAmbG'), 1); gl.uniform1f(u('uAmbB'), 1)
 gl.uniform1f(u('uAmbientIntensity'), 0.2); gl.uniform1f(u('uDelitMix'), 0); gl.uniform1f(u('uRoughnessStrength'), 1)
@@ -144,6 +145,18 @@ setShadows(true);  setLight({ az: 90 }); const cast = px(wallPx)
 setLight({ az: 90, cast: false }); const noCast = px(wallPx)
 check(cast < off - 10, `shadow cast darkens next to the wall: ${cast} < ${off}`)
 check(near(noCast, off, 1), `castShadow off under the master = shadows off: ${noCast} vs ${off}`)
+
+// 5b. Gobo (Python block 6b). Tilted normals, light from the right (sdir = +x), flat
+//     depth 0.5, mask 2 = right half. project 0.4 slides the mask 0.2 to the right:
+//     x=10 (u 0.66, lit before) goes dark, x=13 (u 0.84) stays lit; project 0 = plain.
+gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, flat)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, fill(3, () => [128,128,128]))
+setShadows(false); setLight({ az: 90, mask: 2 }); const gLit = px(13), gDark = px(0), g10plain = px(10)
+setLight({ az: 90, mask: 2, proj: 0.4 }); const g10 = px(10), g13 = px(13)
+check(gLit > gDark + 40 && near(g10plain, gLit), `gobo control: plain mask lights x=10 (${g10plain}) like x=13 (${gLit})`)
+check(near(g10, gDark) && near(g13, gLit), `gobo slides the mask with depth: x=10 ${g10} (${gDark}), x=13 ${g13} (${gLit})`)
+// put block 5's depth (wall on the right) back: block 6 reads it
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, fill(3, x => x >= W / 2 ? [255,255,255] : [0,0,0]))
 
 // 6. Look post-process (Python block 9). Same depth as block 5: LEFT is far (black),
 //    RIGHT is near (white). Facing normals, light from the front -> 0.6 (153) everywhere.

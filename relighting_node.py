@@ -135,13 +135,18 @@ def _apply_look(color, depth_s, look, fog=None):
 MASK_SLOTS = 4  # mask_1..mask_4 — one per RGBA channel of the preview's packed texture
 
 
-def _light_mask(light, masks):
+def _light_mask(light, masks, xc=None, yc=None, depth_s=None, sdir=None):
     """Per-light occlusion factor from the mask the light selected, or None.
 
     `masks` is the MASK_SLOTS-long list of (B,H,W) tensors (None = slot not
     wired). An unwired slot is "no mask": the light is unaffected whatever
     Invert says — mirrored by the preview, which zeroes the selector for
     unwired slots.
+
+    maskProject > 0 turns the mask into a gobo: it is read displaced along the
+    light's screen direction by the pixel's depth, so the pattern slides over
+    near surfaces relative to far ones (parallax) instead of sitting glued to
+    the screen. 0 = the plain screen-space mask, bit for bit.
     """
     if not masks:
         return None
@@ -149,6 +154,16 @@ def _light_mask(light, masks):
     if idx < 1 or idx > len(masks) or masks[idx - 1] is None:
         return None
     m = masks[idx - 1]
+    k = float(light.get("maskProject", 0.0) or 0.0)
+    if k > 0.0 and sdir is not None and depth_s is not None:
+        su, sv = sdir[0], sdir[1]
+        u = xc - su * depth_s * k                      # (B,H,W)
+        v = yc - sv * depth_s * k
+        grid = torch.stack([u * 2.0 - 1.0, v * 2.0 - 1.0], dim=-1)
+        B = depth_s.shape[0]
+        m_in = m.unsqueeze(1).expand(B, 1, *m.shape[1:]) if m.shape[0] == 1 else m.unsqueeze(1)
+        m = F.grid_sample(m_in, grid, mode="bilinear", padding_mode="border",
+                          align_corners=False).squeeze(1)  # same sampler as the shadow tracer
     if light.get("maskInvert", False):
         m = 1.0 - m
     amt = max(0.0, min(1.0, float(light.get("maskAmount", 1.0))))
@@ -246,13 +261,10 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
     # Screen-space shadows need the per-pixel UV grids too
     shadows_on = bool(shadows and shadows.get("enabled"))
 
-    # UV grids for point lights / shadows — computed once, shared across lights
-    has_point = any(l.get("type", "point") == "point" for l in lights)
-    if has_point or shadows_on:
-        yc = torch.linspace(0, 1, H, device=dev).view(H, 1).expand(H, W).unsqueeze(0)  # (1,H,W)
-        xc = torch.linspace(0, 1, W, device=dev).view(1, W).expand(H, W).unsqueeze(0)  # (1,H,W)
-    else:
-        yc = xc = None
+    # UV grids for point lights / shadows / projected masks — computed once, shared
+    # across lights (two linspaces; not worth gating on who needs them)
+    yc = torch.linspace(0, 1, H, device=dev).view(H, 1).expand(H, W).unsqueeze(0)  # (1,H,W)
+    xc = torch.linspace(0, 1, W, device=dev).view(1, W).expand(H, W).unsqueeze(0)  # (1,H,W)
 
     for light in lights:
         diffuse, specular, sdir, att = _calc_light_gpu(
@@ -269,7 +281,7 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
             shadow_factor = _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev)
             contrib = contrib * shadow_factor
         # Per-light mask: confines this light (and its shadow) to a region
-        mask_factor = _light_mask(light, masks)
+        mask_factor = _light_mask(light, masks, xc, yc, depth_s, sdir)
         if mask_factor is not None:
             contrib = contrib * mask_factor
         # contrib: (B,H,W) → (B,H,W,1) * (1,1,1,3) → (B,H,W,3) added in-place
@@ -664,6 +676,25 @@ def demo() -> None:
     o = _relight(rgb.repeat(2, 1, 1, 1), facing.repeat(2, 1, 1, 1), flat_depth.repeat(2, 1, 1, 1),
                  None, None, json.dumps({"lights": [dict(L, mask=1)]}), masks={"mask_1": small_half})
     assert o.shape[0] == 2 and float(o[1, 0, 0, 0]) < 0.15 and float(o[1, 0, W - 1, 0]) > 0.55
+
+    # 6b. Gobo: maskProject reads the mask displaced by depth along the light's screen
+    #     direction. Light from the right (sdir = +x), flat depth 0.5, project 0.4 → the
+    #     mask slides 0.2 to the RIGHT: u=0.66 (lit before) goes dark, u=0.84 stays lit.
+    #     Controls: project 0 is bit-identical to the plain mask, and a flat depth of 0
+    #     gives no slide whatever the amount (parallax needs depth).
+    tilted = enc((1, 0, 1)).view(1, 1, 1, 3).expand(1, H, W, 3).clone()
+    gobo = lambda k, d: _relight(rgb, tilted, d, None, None, json.dumps({"lights": [
+        {"type": "directional", "azimuth": 90, "elevation": 0, "intensity": 1.0,
+         "color": "#ffffff", "mask": 1, "maskProject": k}]}), masks={"mask_1": half})[0, 0]
+    mid_depth = torch.full((1, H, W, 3), 0.5)
+    plain = gobo(0.0, mid_depth)
+    assert torch.equal(plain, gobo(0.0, flat_depth)), "project 0 ignores depth"
+    slid = gobo(0.4, mid_depth)
+    lit_v, dark_v = float(plain[W - 1, 0]), float(plain[0, 0])
+    assert lit_v > dark_v + 0.3, (lit_v, dark_v)
+    assert abs(float(plain[10, 0]) - lit_v) < 1e-6 and abs(float(slid[10, 0]) - dark_v) < 1e-6, "u=0.66 goes dark"
+    assert abs(float(slid[13, 0]) - lit_v) < 1e-6, "u=0.84 stays lit"
+    assert torch.equal(gobo(0.4, flat_depth), gobo(0.0, flat_depth)), "no depth, no parallax"
 
     # 7. Per-light shadow toggle: castShadow=false under the global switch equals shadows
     #    off (block 4's setup). castShadow absent keeps the old behaviour (shadow cast).

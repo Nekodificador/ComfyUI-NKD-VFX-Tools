@@ -100,6 +100,12 @@
                    title="1 = the light is fully confined to the mask; lower values let some of it leak outside." />
             <span class="rl-fval">{{ light.maskAmount.toFixed(2) }}</span>
           </div>
+          <div class="rl-field" v-if="light.mask > 0">
+            <span class="rl-flabel">Project</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(light.maskProject, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskProject" @input="emit" @click.stop
+                   title="Gobo: read the mask displaced by depth along the light, so the pattern slides over near surfaces and bends over relief like a window shadow. 0 = flat screen-space mask." />
+            <span class="rl-fval">{{ light.maskProject.toFixed(2) }}</span>
+          </div>
           <div class="rl-field">
             <span class="rl-flabel">Shadow</span>
             <label class="rl-switch" @click.stop title="Cast screen-space shadows from this light. The Shadows section is the master switch and holds the tracer settings.">
@@ -249,6 +255,7 @@ interface Light {
   mask: number;         // 0 = none, 1..MASK_SLOTS = mask_N input
   maskInvert: boolean;
   maskAmount: number;   // mix(1, mask, amount)
+  maskProject: number;  // gobo parallax: mask read at uv - sdir.xy * depth * amount
   castShadow: boolean;  // under the global Shadows master switch
 }
 
@@ -256,7 +263,7 @@ const MASK_SLOTS = 4;
 
 // Lights saved before masks / per-light shadows existed lack these fields.
 function normLight(l: Partial<Light>): Light {
-  return { mask: 0, maskInvert: false, maskAmount: 1, castShadow: true, ...(l as Light) };
+  return { mask: 0, maskInvert: false, maskAmount: 1, maskProject: 0, castShadow: true, ...(l as Light) };
 }
 
 interface State {
@@ -532,7 +539,10 @@ function onCanvasClick(e: MouseEvent) {
 // ── Light management ────────────────────────────────────────────────────────
 function addLight(type: "point" | "directional") {
   if (lights.value.length >= 3) return;
-  const light: Light = {
+  // Mask/shadow fields come from normLight — the ONE list of per-light defaults. A
+  // field missing here (maskProject, once) crashed the render the moment its row
+  // appeared, and Vue tore the whole widget out of the node.
+  const light: Light = normLight({
     id: Date.now(),
     type,
     color: "#ffffff",
@@ -544,11 +554,7 @@ function addLight(type: "point" | "directional") {
     elevation: 45,
     radius: 0.5,
     falloff: 2.0,
-    mask: 0,
-    maskInvert: false,
-    maskAmount: 1,
-    castShadow: true,
-  };
+  });
   lights.value.push(light);
   selectedId.value = light.id;
   emit();
@@ -685,6 +691,7 @@ uniform sampler2D uMasks;
 uniform vec4  uLMaskSel[3];
 uniform float uLMaskInv[3];
 uniform float uLMaskAmt[3];
+uniform float uLProject[3];
 // Per-light shadow opt-out (uShadowOn stays the master)
 uniform float uLShadow[3];
 
@@ -822,7 +829,9 @@ void main() {
     vec4 sel = uLMaskSel[i];
     float maskF = 1.0;
     if (dot(sel, sel) > 0.5) {
-      float m = dot(texture2D(uMasks, vec2(imgUv.x, 1.0 - imgUv.y)), sel);
+      // Gobo: read the mask displaced by depth along the light (parity with _light_mask)
+      vec2 muv = imgUv - sdir.xy * dVal * uLProject[i];
+      float m = dot(texture2D(uMasks, vec2(muv.x, 1.0 - muv.y)), sel);
       m = mix(m, 1.0 - m, uLMaskInv[i]);
       maskF = mix(1.0, m, uLMaskAmt[i]);
     }
@@ -935,7 +944,7 @@ function initWebGL(w: number, h: number): boolean {
       uLX: u("uLX"), uLY: u("uLY"), uLZ: u("uLZ"), uLRadius: u("uLRadius"),
       uLAzimuth: u("uLAzimuth"), uLElevation: u("uLElevation"),
       uMasks: u("uMasks"), uLMaskSel: u("uLMaskSel"), uLMaskInv: u("uLMaskInv"),
-      uLMaskAmt: u("uLMaskAmt"), uLShadow: u("uLShadow"),
+      uLMaskAmt: u("uLMaskAmt"), uLShadow: u("uLShadow"), uLProject: u("uLProject"),
     };
 
     // Bind texture units once
@@ -1058,6 +1067,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   const lAz: number[] = [0, 0, 0], lEl: number[] = [0, 0, 0];
   const lSel = new Float32Array(12);  // 3 lights × vec4 one-hot
   const lInv: number[] = [0, 0, 0], lAmt: number[] = [1, 1, 1], lSh: number[] = [1, 1, 1];
+  const lProj: number[] = [0, 0, 0];
 
   for (let i = 0; i < count; i++) {
     const l = ls[i];
@@ -1065,6 +1075,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
     if (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1]) lSel[i * 4 + l.mask - 1] = 1;
     lInv[i] = l.maskInvert ? 1 : 0;
     lAmt[i] = l.maskAmount;
+    lProj[i] = l.maskProject ?? 0;
     lSh[i]  = l.castShadow ? 1 : 0;
     lType[i] = l.type === "directional" ? 0 : 1;
     const [r, g, b] = hexToRgb(l.color);
@@ -1093,6 +1104,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   gl.uniform4fv(glLocs.uLMaskSel, lSel);
   gl.uniform1fv(glLocs.uLMaskInv, lInv);
   gl.uniform1fv(glLocs.uLMaskAmt, lAmt);
+  gl.uniform1fv(glLocs.uLProject, lProj);
   gl.uniform1fv(glLocs.uLShadow, lSh);
 
   // Draw full-screen quad
@@ -1133,6 +1145,7 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
     // channel index into passMasks, or -1 (none / unwired slot — parity with Python)
     maskCh: (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1] && passMasks) ? l.mask - 1 : -1,
     maskInvert: l.maskInvert, maskAmount: l.maskAmount, castShadow: l.castShadow,
+    maskProject: l.maskProject ?? 0,
   }));
   const masks = passMasks;
 
@@ -1227,7 +1240,11 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
         }
         let maskF = 1;
         if (lp.maskCh >= 0 && masks) {
-          let m = masks[(sy * pw + sx) * 4 + lp.maskCh] / 255;
+          // Gobo: read the mask displaced by depth along the light (parity with Python / GLSL)
+          const mu = Math.min(1, Math.max(0, pu - sdx * dVal * lp.maskProject));
+          const mv = Math.min(1, Math.max(0, pv - sdy * dVal * lp.maskProject));
+          const mx = Math.min(pw - 1, Math.round(mu * pw)), my = Math.min(ph - 1, Math.round(mv * ph));
+          let m = masks[(my * pw + mx) * 4 + lp.maskCh] / 255;
           if (lp.maskInvert) m = 1 - m;
           maskF = 1 - lp.maskAmount + lp.maskAmount * m;
         }

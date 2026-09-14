@@ -12,6 +12,7 @@ from .nkd_preview_3d     import NKDPreview3D
 from .nkd_perspective_dewarp import NKDPerspectiveUnwarp, NKDPerspectiveRewarp
 from .nkd_lens_distort    import NKDLensDistort
 from .nkd_camera_delta    import NKDCameraDeltaPrompt
+from .nkd_normal_detail   import NKDNormalDetail
 
 NODE_CLASS_MAPPINGS = {
     "RelightingNode":         RelightingNode,
@@ -23,6 +24,7 @@ NODE_CLASS_MAPPINGS = {
     "NKDPerspectiveRewarp":   NKDPerspectiveRewarp,
     "NKDLensDistort":         NKDLensDistort,
     "NKDCameraDeltaPrompt":   NKDCameraDeltaPrompt,
+    "NKDNormalDetail":        NKDNormalDetail,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -35,6 +37,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NKDPerspectiveRewarp":   "😺NKD Perspective Rewarp",
     "NKDLensDistort":         "😺NKD Lens Distort",
     "NKDCameraDeltaPrompt":   "😺NKD Camera Delta Prompt",
+    "NKDNormalDetail":        "😺NKD Normal Detail",
 }
 
 WEB_DIRECTORY = "./web/js"
