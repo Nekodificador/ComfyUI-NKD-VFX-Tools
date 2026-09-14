@@ -19,6 +19,12 @@ outside. Feather the mask upstream with your usual mask nodes; white means lit.
 the master switch and holds the tracer settings (strength, softness, range), shared by all
 lights so the scene reads as one.
 
+**Look.** A last section for matching a reference plate once the lights are set: exposure,
+white balance (temperature and tint), saturation, and haze. Haze uses the depth pass, so it
+can be atmospheric: *Start* and *End* set where along the depth it fades in. Put *End* below
+*Start* to haze the foreground instead, or set both to zero for an even wash over the whole
+image. Every slider resets on double-click, and Shift makes any drag ten times finer.
+
 The point is to settle the lighting before the model gets a say. Relight the plate, then
 send it downstream as your img2img base or ControlNet reference, and the generation
 inherits your key light instead of inventing one.

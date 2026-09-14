@@ -1,5 +1,5 @@
 <template>
-  <div class="rl-root">
+  <div class="rl-root" ref="rootEl">
     <!-- Preview canvas area -->
     <div class="rl-canvas-wrap" ref="canvasWrap" :style="{ aspectRatio: canvasAspectRatio }">
       <canvas ref="canvas" class="rl-canvas" @mousedown="onCanvasMouseDown" @click="onCanvasClick" @mousemove="onCanvasMove" @mouseup="onMouseUp" />
@@ -53,30 +53,30 @@
         <div class="rl-sec-body" v-if="light.id === selectedId">
           <div class="rl-field">
             <span class="rl-flabel">Intensity</span>
-            <input class="rl-range" :style="rangeStyle(light.intensity, 0, 2)" type="range" min="0" max="2" step="0.05" v-model.number="light.intensity" @input="emit" @click.stop />
+            <input class="rl-range" data-default="1" :style="rangeStyle(light.intensity, 0, 2)" type="range" min="0" max="2" step="0.05" v-model.number="light.intensity" @input="emit" @click.stop />
             <span class="rl-fval">{{ light.intensity.toFixed(2) }}</span>
           </div>
           <template v-if="light.type === 'point'">
             <div class="rl-field">
               <span class="rl-flabel">Depth</span>
-              <input class="rl-range" :style="rangeStyle(light.z, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="light.z" @input="emit" @click.stop />
+              <input class="rl-range" data-default="0.5" :style="rangeStyle(light.z, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="light.z" @input="emit" @click.stop />
               <span class="rl-fval">{{ light.z.toFixed(2) }}</span>
             </div>
             <div class="rl-field">
               <span class="rl-flabel">Radius</span>
-              <input class="rl-range" :style="rangeStyle(light.radius, 0.05, 2)" type="range" min="0.05" max="2" step="0.05" v-model.number="light.radius" @input="emit" @click.stop />
+              <input class="rl-range" data-default="0.5" :style="rangeStyle(light.radius, 0.05, 2)" type="range" min="0.05" max="2" step="0.05" v-model.number="light.radius" @input="emit" @click.stop />
               <span class="rl-fval">{{ light.radius.toFixed(2) }}</span>
             </div>
           </template>
           <template v-else>
             <div class="rl-field">
               <span class="rl-flabel">Horizontal</span>
-              <input class="rl-range" :style="rangeStyle(light.azimuth, -180, 180)" type="range" min="-180" max="180" step="1" v-model.number="light.azimuth" @input="emit" @click.stop />
+              <input class="rl-range" data-default="0" :style="rangeStyle(light.azimuth, -180, 180)" type="range" min="-180" max="180" step="1" v-model.number="light.azimuth" @input="emit" @click.stop />
               <span class="rl-fval">{{ Math.round(light.azimuth) }}°</span>
             </div>
             <div class="rl-field">
               <span class="rl-flabel">Vertical</span>
-              <input class="rl-range" :style="rangeStyle(light.elevation, -90, 90)" type="range" min="-90" max="90" step="1" v-model.number="light.elevation" @input="emit" @click.stop />
+              <input class="rl-range" data-default="45" :style="rangeStyle(light.elevation, -90, 90)" type="range" min="-90" max="90" step="1" v-model.number="light.elevation" @input="emit" @click.stop />
               <span class="rl-fval">{{ Math.round(light.elevation) }}°</span>
             </div>
           </template>
@@ -95,7 +95,7 @@
           </div>
           <div class="rl-field" v-if="light.mask > 0">
             <span class="rl-flabel">Mask amount</span>
-            <input class="rl-range" :style="rangeStyle(light.maskAmount, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskAmount" @input="emit" @click.stop
+            <input class="rl-range" data-default="1" :style="rangeStyle(light.maskAmount, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskAmount" @input="emit" @click.stop
                    title="1 = the light is fully confined to the mask; lower values let some of it leak outside." />
             <span class="rl-fval">{{ light.maskAmount.toFixed(2) }}</span>
           </div>
@@ -120,7 +120,7 @@
         <div class="rl-sec-body" v-if="openSections.ambient">
           <div class="rl-field">
             <span class="rl-flabel">Intensity</span>
-            <input class="rl-range" :style="rangeStyle(ambientIntensity, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="ambientIntensity" @input="emit" />
+            <input class="rl-range" data-default="0.2" :style="rangeStyle(ambientIntensity, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="ambientIntensity" @input="emit" />
             <span class="rl-fval">{{ ambientIntensity.toFixed(2) }}</span>
           </div>
         </div>
@@ -135,12 +135,12 @@
         <div class="rl-sec-body" v-if="openSections.material">
           <div class="rl-field" v-if="hasAlbedo">
             <span class="rl-flabel">Delight</span>
-            <input class="rl-range" :style="rangeStyle(delitMix, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="delitMix" @input="emit" />
+            <input class="rl-range" data-default="0" :style="rangeStyle(delitMix, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="delitMix" @input="emit" />
             <span class="rl-fval">{{ delitMix.toFixed(2) }}</span>
           </div>
           <div class="rl-field" v-if="hasRoughness">
             <span class="rl-flabel">Roughness</span>
-            <input class="rl-range" :style="rangeStyle(roughnessStrength, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="roughnessStrength" @input="emit" />
+            <input class="rl-range" data-default="1" :style="rangeStyle(roughnessStrength, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="roughnessStrength" @input="emit" />
             <span class="rl-fval">{{ roughnessStrength.toFixed(2) }}</span>
           </div>
         </div>
@@ -159,18 +159,64 @@
         <div class="rl-sec-body" v-if="openSections.shadows" :class="{ disabled: !shadowsEnabled }">
           <div class="rl-field">
             <span class="rl-flabel">Strength</span>
-            <input class="rl-range" :style="rangeStyle(shadowStrength, 0, 1)" :disabled="!shadowsEnabled" type="range" min="0" max="1" step="0.01" v-model.number="shadowStrength" @input="emit" />
+            <input class="rl-range" data-default="0.6" :style="rangeStyle(shadowStrength, 0, 1)" :disabled="!shadowsEnabled" type="range" min="0" max="1" step="0.01" v-model.number="shadowStrength" @input="emit" />
             <span class="rl-fval">{{ shadowStrength.toFixed(2) }}</span>
           </div>
           <div class="rl-field">
             <span class="rl-flabel">Softness</span>
-            <input class="rl-range" :style="rangeStyle(shadowSoftness, 0, 1)" :disabled="!shadowsEnabled" type="range" min="0" max="1" step="0.01" v-model.number="shadowSoftness" @input="emit" />
+            <input class="rl-range" data-default="0.3" :style="rangeStyle(shadowSoftness, 0, 1)" :disabled="!shadowsEnabled" type="range" min="0" max="1" step="0.01" v-model.number="shadowSoftness" @input="emit" />
             <span class="rl-fval">{{ shadowSoftness.toFixed(2) }}</span>
           </div>
           <div class="rl-field">
             <span class="rl-flabel">Range</span>
-            <input class="rl-range" :style="rangeStyle(shadowRange, 0.01, 0.5)" :disabled="!shadowsEnabled" type="range" min="0.01" max="0.5" step="0.01" v-model.number="shadowRange" @input="emit" />
+            <input class="rl-range" data-default="0.15" :style="rangeStyle(shadowRange, 0.01, 0.5)" :disabled="!shadowsEnabled" type="range" min="0.01" max="0.5" step="0.01" v-model.number="shadowRange" @input="emit" />
             <span class="rl-fval">{{ shadowRange.toFixed(2) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Look section: post-process on the lit image (exposure, white balance, saturation, haze) -->
+      <div class="rl-section">
+        <div class="rl-sec-head" @click="toggleSection('look')">
+          <span class="rl-chev" :class="{ open: openSections.look }">▸</span>
+          <span class="rl-sec-title">Look</span>
+          <input class="rl-swatch" type="color" v-model="hazeColor" @input="emit" @click.stop title="Haze colour" />
+        </div>
+        <div class="rl-sec-body" v-if="openSections.look">
+          <div class="rl-field" title="Stops. Applied after the lights, so it scales ambient too.">
+            <span class="rl-flabel">Exposure</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(lookExposure, -3, 3)" type="range" min="-3" max="3" step="0.05" v-model.number="lookExposure" @input="emit" />
+            <span class="rl-fval">{{ lookExposure.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" title="White balance: cool (blue) to warm (orange).">
+            <span class="rl-flabel">Temp</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(lookTemperature, -1, 1)" type="range" min="-1" max="1" step="0.01" v-model.number="lookTemperature" @input="emit" />
+            <span class="rl-fval">{{ lookTemperature.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" title="White balance: magenta to green.">
+            <span class="rl-flabel">Tint</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(lookTint, -1, 1)" type="range" min="-1" max="1" step="0.01" v-model.number="lookTint" @input="emit" />
+            <span class="rl-fval">{{ lookTint.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field">
+            <span class="rl-flabel">Saturation</span>
+            <input class="rl-range" data-default="1" :style="rangeStyle(lookSaturation, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="lookSaturation" @input="emit" />
+            <span class="rl-fval">{{ lookSaturation.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" title="Atmospheric haze from the depth pass: the further the pixel, the more of the haze colour it gets.">
+            <span class="rl-flabel">Haze</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(hazeAmount, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="hazeAmount" @input="emit" />
+            <span class="rl-fval">{{ hazeAmount.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" title="Distance (0 near, 1 far) where the haze begins. Put End below Start to haze the near side instead, fading out toward Start. Start = End = 0 hazes the whole image evenly.">
+            <span class="rl-flabel">Start</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(hazeStart, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="hazeStart" @input="emit" />
+            <span class="rl-fval">{{ hazeStart.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" title="Distance where the haze reaches its full amount.">
+            <span class="rl-flabel">End</span>
+            <input class="rl-range" data-default="1" :style="rangeStyle(hazeEnd, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="hazeEnd" @input="emit" />
+            <span class="rl-fval">{{ hazeEnd.toFixed(2) }}</span>
           </div>
         </div>
       </div>
@@ -180,6 +226,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { attachFineRange } from "../fine_drag";
 
 interface Light {
   id: number;
@@ -216,6 +263,14 @@ interface State {
   shadowStrength: number;
   shadowSoftness: number;
   shadowRange: number;
+  exposure: number;
+  temperature: number;
+  tint: number;
+  saturation: number;
+  hazeAmount: number;
+  hazeColor: string;
+  hazeStart: number;
+  hazeEnd: number;
 }
 
 interface PassData {
@@ -242,6 +297,17 @@ const shadowsEnabled      = ref(false);
 const shadowStrength      = ref(0.6);
 const shadowSoftness      = ref(0.3);
 const shadowRange         = ref(0.15);
+// Look post-process — defaults are the identity (parity with LOOK_DEFAULTS in Python)
+const lookExposure        = ref(0.0);
+const lookTemperature     = ref(0.0);
+const lookTint            = ref(0.0);
+const lookSaturation      = ref(1.0);
+const hazeAmount          = ref(0.0);
+const hazeColor           = ref("#c8d0dc");
+const hazeStart           = ref(0.0);
+const hazeEnd             = ref(1.0);
+const WB_GAIN = 0.25;   // kept in sync with Python
+const HAZE_EPS = 1e-4;  // idem
 
 // Tracer constants — kept in sync with the Python backend tracer.
 const SHADOW_STEPS  = 24;
@@ -249,6 +315,11 @@ const SHADOW_BIAS   = 0.012;
 const SHADOW_SLOPE  = 0.030;
 
 const canvas            = ref<HTMLCanvasElement | null>(null);
+// Sliders: Shift = tenth-speed drag, double-click = reset to data-default (fine_drag.ts,
+// same as Preview 3D / Lens Distort). Delegated on the root, so sliders inside panels
+// that mount later (per-light sections) are covered too.
+const rootEl            = ref<HTMLElement | null>(null);
+let detachFine: (() => void) | null = null;
 const canvasWrap        = ref<HTMLDivElement | null>(null);
 const canvasAspectRatio = ref("16 / 9");
 
@@ -269,12 +340,13 @@ const isProcessing = ref(false);
 const pointLights = computed(() => lights.value.filter((l: Light) => l.type === "point"));
 
 // ── Collapsible section state (UI only, not serialised into lights_config) ────
-const openSections = ref<{ ambient: boolean; material: boolean; shadows: boolean }>({
+const openSections = ref<{ ambient: boolean; material: boolean; shadows: boolean; look: boolean }>({
   ambient: false,
   material: false,
   shadows: false,
+  look: false,
 });
-function toggleSection(key: "ambient" | "material" | "shadows") {
+function toggleSection(key: "ambient" | "material" | "shadows" | "look") {
   openSections.value[key] = !openSections.value[key];
 }
 
@@ -493,6 +565,19 @@ function selectLight(id: number) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+// (start, span) of the haze ramp — parity with _haze_ramp in Python: Start = End is a
+// step that includes dist == Start, so only then the start is nudged back by HAZE_EPS.
+function hazeRamp(): [number, number] {
+  const st = hazeStart.value, span = hazeEnd.value - st;
+  return Math.abs(span) <= HAZE_EPS ? [st - HAZE_EPS, HAZE_EPS] : [st, span];  // span signed
+}
+
+// White-balance RGB gains from the Temp/Tint sliders (parity with _apply_look).
+function wbGain(): [number, number, number] {
+  const t = lookTemperature.value, g = lookTint.value;
+  return [1 + WB_GAIN * t, 1 + WB_GAIN * g, 1 - WB_GAIN * t];
+}
+
 function hexToRgb(hex: string): [number, number, number] {
   let h = hex.replace("#", "");
   if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
@@ -555,6 +640,15 @@ uniform int   uShadowOn;
 uniform float uShadowStrength;
 uniform float uShadowSoftness;
 uniform float uShadowRange;
+
+// Look post-process (parity with _apply_look in Python)
+uniform float uExposure;   // already 2^ev
+uniform vec3  uWbGain;
+uniform float uSaturation;
+uniform float uHazeAmount;
+uniform vec3  uHazeColor;
+uniform float uHazeStart;
+uniform float uHazeInvSpan;  // 1 / span, signed (End < Start = reversed ramp)
 
 // Flat light arrays (max 3) — avoids struct array issues in GLSL ES 1.00
 uniform int   uLType[3];
@@ -715,7 +809,14 @@ void main() {
     lightAccum += contrib * vec3(uLColorR[i], uLColorG[i], uLColorB[i]) * uLIntensity[i];
   }
 
-  gl_FragColor = vec4(clamp(base * lightAccum, 0.0, 1.0), 1.0);
+  vec3 c = clamp(base * lightAccum, 0.0, 1.0);
+  // Look: exposure -> white balance -> saturation -> haze (haze last: the colour you
+  // pick is the colour that lands on the plate). Depth: near = white.
+  c = c * uExposure * uWbGain;
+  float luma = dot(c, vec3(0.299, 0.587, 0.114));
+  c = luma + (c - luma) * uSaturation;
+  c = mix(c, uHazeColor, uHazeAmount * clamp((1.0 - dVal - uHazeStart) * uHazeInvSpan, 0.0, 1.0));
+  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
 function compileShader(g: WebGLRenderingContext, type: number, src: string): WebGLShader | null {
@@ -785,6 +886,9 @@ function initWebGL(w: number, h: number): boolean {
       uDelitMix: u("uDelitMix"), uRoughnessStrength: u("uRoughnessStrength"),
       uShadowOn: u("uShadowOn"), uShadowStrength: u("uShadowStrength"),
       uShadowSoftness: u("uShadowSoftness"), uShadowRange: u("uShadowRange"),
+      uExposure: u("uExposure"), uWbGain: u("uWbGain"), uSaturation: u("uSaturation"),
+      uHazeAmount: u("uHazeAmount"), uHazeColor: u("uHazeColor"),
+      uHazeStart: u("uHazeStart"), uHazeInvSpan: u("uHazeInvSpan"),
       uLightCount: u("uLightCount"),
       uLType0: u("uLType[0]"), uLType1: u("uLType[1]"), uLType2: u("uLType[2]"),
       uLColorR: u("uLColorR"), uLColorG: u("uLColorG"), uLColorB: u("uLColorB"),
@@ -884,6 +988,16 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   gl.uniform1f(glLocs.uShadowStrength, shadowStrength.value);
   gl.uniform1f(glLocs.uShadowSoftness, shadowSoftness.value);
   gl.uniform1f(glLocs.uShadowRange,    shadowRange.value);
+  const wb = wbGain();
+  gl.uniform1f(glLocs.uExposure,   Math.pow(2, lookExposure.value));
+  gl.uniform3f(glLocs.uWbGain,     wb[0], wb[1], wb[2]);
+  gl.uniform1f(glLocs.uSaturation, lookSaturation.value);
+  gl.uniform1f(glLocs.uHazeAmount, hazeAmount.value);
+  const hc = hexToRgb(hazeColor.value);
+  gl.uniform3f(glLocs.uHazeColor,  hc[0], hc[1], hc[2]);
+  const [hzStart, hzSpan] = hazeRamp();
+  gl.uniform1f(glLocs.uHazeStart,   hzStart);
+  gl.uniform1f(glLocs.uHazeInvSpan, 1 / hzSpan);
 
   // Per-light uniforms — padded to 3 elements
   const ls = lights.value;
@@ -981,6 +1095,10 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
   const shStr  = shadowStrength.value;
   const shWin  = shadowSoftness.value * 0.5 + 1e-3;
   const shRng  = shadowRange.value;
+  // Look post-process (parity with Python / GLSL)
+  const ev = Math.pow(2, lookExposure.value), wb = wbGain(), sat = lookSaturation.value;
+  const hzA = hazeAmount.value, hz = hexToRgb(hazeColor.value);
+  const [hzS, hzSpan] = hazeRamp(); const hzInv = 1 / hzSpan;
   const sampleDepth = (u: number, v: number): number => {
     const ix = Math.max(0, Math.min(pw - 1, Math.round(u * pw)));
     const iy = Math.max(0, Math.min(ph - 1, Math.round(v * ph)));
@@ -1069,10 +1187,17 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
         lG += contrib * lp.color[1] * lp.intensity;
         lB += contrib * lp.color[2] * lp.intensity;
       }
+      let cR = Math.min(1, Math.max(0, baseR * lR)) * ev * wb[0];
+      let cG = Math.min(1, Math.max(0, baseG * lG)) * ev * wb[1];
+      let cB = Math.min(1, Math.max(0, baseB * lB)) * ev * wb[2];
+      const luma = cR * 0.299 + cG * 0.587 + cB * 0.114;
+      cR = luma + (cR - luma) * sat; cG = luma + (cG - luma) * sat; cB = luma + (cB - luma) * sat;
+      const hf = hzA * Math.min(1, Math.max(0, (1 - dVal - hzS) * hzInv));
+      cR += (hz[0] - cR) * hf; cG += (hz[1] - cG) * hf; cB += (hz[2] - cB) * hf;
       const oi = (y * W + x) * 4;
-      out[oi]   = Math.min(255, Math.max(0, baseR * lR * 255));
-      out[oi+1] = Math.min(255, Math.max(0, baseG * lG * 255));
-      out[oi+2] = Math.min(255, Math.max(0, baseB * lB * 255));
+      out[oi]   = Math.min(255, Math.max(0, cR * 255));
+      out[oi+1] = Math.min(255, Math.max(0, cG * 255));
+      out[oi+2] = Math.min(255, Math.max(0, cB * 255));
       out[oi+3] = 255;
     }
   }
@@ -1368,6 +1493,14 @@ function serialise(): string {
     shadowStrength: shadowStrength.value,
     shadowSoftness: shadowSoftness.value,
     shadowRange: shadowRange.value,
+    exposure: lookExposure.value,
+    temperature: lookTemperature.value,
+    tint: lookTint.value,
+    saturation: lookSaturation.value,
+    hazeAmount: hazeAmount.value,
+    hazeColor: hazeColor.value,
+    hazeStart: hazeStart.value,
+    hazeEnd: hazeEnd.value,
   };
   return JSON.stringify(state);
 }
@@ -1387,6 +1520,14 @@ function deserialise(json: string) {
       shadowStrength.value      = parsed.shadowStrength      ?? 0.6;
       shadowSoftness.value      = parsed.shadowSoftness      ?? 0.3;
       shadowRange.value         = parsed.shadowRange         ?? 0.15;
+      lookExposure.value        = parsed.exposure            ?? 0.0;
+      lookTemperature.value     = parsed.temperature         ?? 0.0;
+      lookTint.value            = parsed.tint                ?? 0.0;
+      lookSaturation.value      = parsed.saturation          ?? 1.0;
+      hazeAmount.value          = parsed.hazeAmount          ?? 0.0;
+      hazeColor.value           = parsed.hazeColor           ?? "#c8d0dc";
+      hazeStart.value           = parsed.hazeStart           ?? 0.0;
+      hazeEnd.value             = parsed.hazeEnd             ?? 1.0;
     }
     nextTick(drawPreview);
   } catch {
@@ -1423,10 +1564,12 @@ function setProcessing(val: boolean) {
 defineExpose({ serialise, deserialise, setPasses, setProcessing });
 
 onMounted(() => {
+  if (rootEl.value) detachFine = attachFineRange(rootEl.value);
   nextTick(drawPreview);
 });
 
 onUnmounted(() => {
+  detachFine?.();
   destroyWebGL();
   if (rafId !== null) cancelAnimationFrame(rafId);
 });

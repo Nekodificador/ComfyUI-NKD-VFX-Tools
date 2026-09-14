@@ -4,7 +4,7 @@
 <!--
   Self-check for the WebGL preview shader in src/components/RelightingCanvas.vue:
   per-light masks (select / invert / amount) and the per-light shadow opt-out must
-  match what the Python pipeline does (python relighting_node.py, blocks 6 and 7).
+  match what the Python pipeline does (python relighting_node.py, blocks 6, 7 and 9).
   The shader source is pulled straight out of the .vue so this can't drift from it.
 
   Needs a real GL context, so it can't live in a .mjs.
@@ -93,6 +93,20 @@ gl.uniform1f(u('uAmbientIntensity'), 0.2); gl.uniform1f(u('uDelitMix'), 0); gl.u
 gl.uniform1i(u('uHasAlbedo'), 0); gl.uniform1i(u('uHasRoughness'), 0)
 const setShadows = on => { gl.uniform1i(u('uShadowOn'), on ? 1 : 0); gl.uniform1f(u('uShadowStrength'), 0.6); gl.uniform1f(u('uShadowSoftness'), 0.3); gl.uniform1f(u('uShadowRange'), 0.15) }
 setShadows(false)
+// Look post-process uniforms. Identity by default: without this every earlier block
+// would read black (an unset float uniform is 0, and uExposure multiplies).
+const setLook = (o = {}) => {
+  gl.uniform1f(u('uExposure'), Math.pow(2, o.ev ?? 0))
+  const t = o.temp ?? 0, g = o.tint ?? 0
+  gl.uniform3f(u('uWbGain'), 1 + 0.25 * t, 1 + 0.25 * g, 1 - 0.25 * t)
+  gl.uniform1f(u('uSaturation'), o.sat ?? 1)
+  gl.uniform1f(u('uHazeAmount'), o.haze ?? 0)
+  const hc = o.hazeColor ?? [0.784, 0.816, 0.863]
+  gl.uniform3f(u('uHazeColor'), hc[0], hc[1], hc[2])
+  const st = o.start ?? 0, span = (o.end ?? 1) - st  // same nudge as hazeRamp() in the .vue
+  gl.uniform1f(u('uHazeStart'), Math.abs(span) <= 1e-4 ? st - 1e-4 : st); gl.uniform1f(u('uHazeInvSpan'), 1 / (Math.abs(span) <= 1e-4 ? 1e-4 : span))
+}
+setLook()
 
 const px = (x) => { gl.viewport(0, 0, W, H); gl.drawArrays(gl.TRIANGLES, 0, 6); const p = new Uint8Array(4); gl.readPixels(x, H / 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return p[0] }
 const near = (a, b, tol = 2) => Math.abs(a - b) <= tol
@@ -129,6 +143,33 @@ setShadows(true);  setLight({ az: 90 }); const cast = px(wallPx)
 setLight({ az: 90, cast: false }); const noCast = px(wallPx)
 check(cast < off - 10, `shadow cast darkens next to the wall: ${cast} < ${off}`)
 check(near(noCast, off, 1), `castShadow off under the master = shadows off: ${noCast} vs ${off}`)
+
+// 6. Look post-process (Python block 9). Same depth as block 5: LEFT is far (black),
+//    RIGHT is near (white). Facing normals, light from the front -> 0.6 (153) everywhere.
+gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, facing)
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, fill(3, () => enc(0, 0, 1)))
+const pxRGB = (x) => { gl.viewport(0, 0, W, H); gl.drawArrays(gl.TRIANGLES, 0, 6); const p = new Uint8Array(4); gl.readPixels(x, H / 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return [p[0], p[1], p[2]] }
+setShadows(false); setLight({ az: 0 }); setLook()
+const base = pxRGB(left)
+check(near(base[0], 153) && near(base[1], 153) && near(base[2], 153), `look identity: ${base} (153)`)
+setLook({ haze: 1, hazeColor: [1, 0, 0] })
+const far = pxRGB(left), nearPx = pxRGB(right)
+check(near(far[0], 255) && near(far[1], 0) && near(far[2], 0), `haze: far pixel is the haze colour ${far} (255,0,0)`)
+check(near(nearPx[0], 153) && near(nearPx[1], 153), `haze: near pixel untouched ${nearPx} (153)`)
+setLook({ haze: 1, hazeColor: [1, 0, 0], start: 0, end: 0 }); const uniNear = pxRGB(right)
+check(near(uniNear[0], 255) && near(uniNear[1], 0), `haze Start=End=0 is uniform: near pixel ${uniNear} (255,0,0)`)
+setLook({ haze: 1, hazeColor: [1, 0, 0], start: 0.5, end: 1.5 }); const mid = pxRGB(left)
+check(near(mid[0], 204) && near(mid[1], 77), `haze mid-ramp: far pixel ${mid} (204,77,77)`)
+setLook({ haze: 1, hazeColor: [1, 0, 0], start: 1, end: 0 }); const revNear = pxRGB(right), revFar = pxRGB(left)
+check(near(revNear[0], 255) && near(revNear[1], 0) && near(revFar[0], 153), `haze End<Start reverses: near ${revNear} (255,0,0) far ${revFar} (153)`)
+setLook({ haze: 1, hazeColor: [1, 0, 0], start: 1.5, end: 0.5 }); const rmid = pxRGB(left)
+check(near(rmid[0], 204) && near(rmid[1], 77), `reversed mid-ramp is gradual: far pixel ${rmid} (204,77,77)`)
+setLook({ temp: 1 }); const warm = pxRGB(left)
+check(warm[0] > warm[1] && warm[1] > warm[2], `temp +1 is warm: ${warm}`)
+setLook({ temp: 1, sat: 0 }); const grey = pxRGB(left)
+check(near(grey[0], grey[1], 1) && near(grey[1], grey[2], 1), `saturation 0 is grey: ${grey}`)
+setLook({ ev: -1 }); const dark = pxRGB(left)
+check(near(dark[0], 76), `exposure -1 halves: ${dark[0]} (76)`)
 
 log(`\n${failed ? failed + ' FAILED' : 'all checks passed'}`)
 </script>

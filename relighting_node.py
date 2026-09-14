@@ -61,7 +61,67 @@ def _parse_state(lights_config):
         "softness": float(state.get("shadowSoftness", 0.3)) if isinstance(state, dict) else 0.3,
         "range": float(state.get("shadowRange", 0.15)) if isinstance(state, dict) else 0.15,
     }
-    return lights, ambient_intensity, ambient_color, delit_mix, roughness_strength, shadows
+    look = _parse_look(state if isinstance(state, dict) else {})
+    return lights, ambient_intensity, ambient_color, delit_mix, roughness_strength, shadows, look
+
+
+# "Look" post-process defaults. All neutral: the identity, so workflows saved
+# before the section existed render bit-identical.
+LOOK_DEFAULTS = {
+    "exposure": 0.0,      # stops, colour *= 2^ev
+    "temperature": 0.0,   # -1 cool .. +1 warm
+    "tint": 0.0,          # -1 magenta .. +1 green
+    "saturation": 1.0,    # 0 grey .. 2 boosted
+    "hazeAmount": 0.0,    # 0..1, scaled by distance (depth: near = white)
+    "hazeColor": "#c8d0dc",
+    "hazeStart": 0.0,     # distance (1 - depth) where haze begins to ramp in
+    "hazeEnd": 1.0,       # distance where it reaches hazeAmount. End < Start = haze NEAR, fading
+                          # out toward Start (signed ramp). Start = End = 0 → uniform haze
+}
+HAZE_EPS = 1e-4
+
+
+def _haze_ramp(start, end):
+    """(start, span) for the haze ramp, span SIGNED: End < Start runs the ramp the
+    other way (full haze at dist <= End, none at dist >= Start, gradual between).
+    Start = End is a hard step that must INCLUDE dist == Start (Start = End = 0 →
+    every pixel hazed), so only then the start is nudged back by HAZE_EPS; a real
+    span stays exact. Mirrored by hazeRamp() in the Vue widget."""
+    span = end - start
+    if abs(span) <= HAZE_EPS:
+        return start - HAZE_EPS, HAZE_EPS
+    return start, span
+WB_GAIN = 0.25  # ponytail: linear RGB gains, not Kelvin; enough to match a plate by eye
+
+
+def _parse_look(state):
+    look = {}
+    for k, d in LOOK_DEFAULTS.items():
+        v = state.get(k, d)
+        look[k] = v if k == "hazeColor" else float(v)
+    return look
+
+
+def _apply_look(color, depth_s, look):
+    """Post-process on the lit colour (B,H,W,3), depth (B,H,W) near = white.
+    Order: exposure → white balance → saturation → haze. Haze is last so the
+    colour you pick is the colour that lands on the plate. Mirrored in the
+    GLSL shader and the JS fallback of RelightingCanvas.vue."""
+    c = color * (2.0 ** look["exposure"])
+    t, g = look["temperature"], look["tint"]
+    wb = torch.tensor([1.0 + WB_GAIN * t, 1.0 + WB_GAIN * g, 1.0 - WB_GAIN * t],
+                      dtype=c.dtype, device=c.device)
+    c = c * wb
+    luma = (c[..., 0] * 0.299 + c[..., 1] * 0.587 + c[..., 2] * 0.114).unsqueeze(-1)
+    c = luma + (c - luma) * look["saturation"]
+    if look["hazeAmount"] > 0.0:
+        haze = torch.tensor(_hex_to_rgb(look["hazeColor"]), dtype=c.dtype, device=c.device)
+        dist = 1.0 - depth_s
+        start, span = _haze_ramp(look["hazeStart"], look["hazeEnd"])
+        ramp = (dist - start) / span
+        f = (look["hazeAmount"] * ramp.clamp(0.0, 1.0)).unsqueeze(-1)
+        c = c + (haze - c) * f
+    return c.clamp(0.0, 1.0)
 
 
 MASK_SLOTS = 4  # mask_1..mask_4 — one per RGBA channel of the preview's packed texture
@@ -109,7 +169,7 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     masks: dict {"mask_1": MASK, ...} from the Autogrow input (unwired slots absent).
     """
     (lights, ambient_intensity, ambient_color, delit_mix,
-     roughness_strength, shadows) = _parse_state(lights_config)
+     roughness_strength, shadows, look) = _parse_state(lights_config)
 
     # Resize all passes to match rgb resolution (stays on device)
     target_h, target_w = rgb.shape[1], rgb.shape[2]
@@ -137,13 +197,13 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     return _relight_gpu(
         rgb, normals, depth, albedo, roughness,
         lights, ambient_intensity, ambient_color, delit_mix, roughness_strength,
-        shadows, mask_list
+        shadows, mask_list, look
     )
 
 
 def _relight_gpu(rgb, normals, depth, albedo, roughness,
                  lights, ambient_intensity, ambient_color, delit_mix, roughness_strength,
-                 shadows=None, masks=None):
+                 shadows=None, masks=None, look=None):
     """Batched Lambertian + Blinn-Phong relighting, all ops on device."""
     B, H, W, _ = rgb.shape
     dev = rgb.device
@@ -205,6 +265,8 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
         light_accum.add_(contrib.unsqueeze(-1) * (l_rgb * l_int))
 
     result = (effective_base * light_accum).clamp(0.0, 1.0)
+    if look is not None and look != LOOK_DEFAULTS:
+        result = _apply_look(result, depth_s, look)
     # Preserve alpha channel if present
     if rgb.shape[-1] == 4:
         result = torch.cat([result, rgb_f[..., 3:4]], dim=-1)
@@ -592,6 +654,48 @@ def demo() -> None:
     assert float(packed[0, 0, W - 1, 1]) == 1.0 and float(packed[0, 0, 0, 3]) == 1.0
     assert float(packed[..., 0].abs().sum()) == 0.0 and float(packed[..., 2].abs().sum()) == 0.0
     assert _pack_masks([None] * 4, H, W) == (None, [False] * 4)
+
+    # 9. Look post-process. Defaults are the exact identity (old workflows unchanged);
+    #    each control moves the pixel the way its label says; haze follows distance
+    #    with the depth convention near = white (far pixel hazes, near pixel does not).
+    base_cfg = {"lights": [{"type": "directional", "azimuth": 0, "elevation": 0,
+                            "intensity": 1.0, "color": "#ffffff"}]}
+    ref = _relight(rgb, facing, flat_depth, None, None, json.dumps(base_cfg))
+    same = _relight(rgb, facing, flat_depth, None, None, json.dumps({**base_cfg, **LOOK_DEFAULTS}))
+    assert torch.equal(ref, same)
+    px = lambda cfg, d=flat_depth: _relight(rgb, facing, d, None, None, json.dumps({**base_cfg, **cfg}))[0, 0, 0]
+    assert torch.allclose(px({"exposure": 1.0}), torch.full((3,), 1.0)), "1 stop over 0.6 clamps to 1"
+    assert torch.allclose(px({"exposure": -1.0}), torch.full((3,), 0.3), atol=1e-6)
+    warm = px({"temperature": 1.0}); assert warm[0] > warm[1] > warm[2], warm
+    cool = px({"temperature": -1.0}); assert cool[2] > cool[1] > cool[0], cool
+    grn = px({"tint": 1.0}); assert grn[1] > grn[0] and grn[1] > grn[2], grn
+    tinted = px({"temperature": 1.0, "saturation": 0.0})
+    assert torch.allclose(tinted, tinted[0].expand(3), atol=1e-6), "saturation 0 is grey"
+    # Haze: depth 1 (near, white) on the left half, 0 (far) on the right.
+    near_far = torch.zeros(1, H, W, 3); near_far[:, :, : W // 2] = 1.0
+    hz = _relight(rgb, facing, near_far, None, None,
+                  json.dumps({**base_cfg, "hazeAmount": 1.0, "hazeColor": "#ff0000"}))[0, 0]
+    assert torch.allclose(hz[0], torch.tensor([0.6, 0.6, 0.6]), atol=1e-6), "near: untouched"
+    assert torch.allclose(hz[W - 1], torch.tensor([1.0, 0.0, 0.0]), atol=1e-6), "far: full haze colour"
+    assert torch.allclose(px({"hazeAmount": 0.5}, near_far), torch.tensor([0.6, 0.6, 0.6]), atol=1e-6)
+    # Haze range: Start = End = 0 hazes the NEAR pixel too (uniform haze, Neko's case);
+    # a range that starts beyond the far pixel's distance hazes nothing.
+    uni = _relight(rgb, facing, near_far, None, None,
+                   json.dumps({**base_cfg, "hazeAmount": 1.0, "hazeColor": "#ff0000",
+                               "hazeStart": 0.0, "hazeEnd": 0.0}))[0, 0]
+    assert torch.allclose(uni[0], uni[W - 1]) and torch.allclose(uni[0], torch.tensor([1.0, 0.0, 0.0]), atol=1e-6)
+    # Mid-ramp: far pixel (dist 1) with Start 0.5 / End 1.5 → ramp 0.5 → 50/50 mix.
+    mid = px({"hazeAmount": 1.0, "hazeColor": "#ff0000", "hazeStart": 0.5, "hazeEnd": 1.5}, near_far * 0)
+    assert torch.allclose(mid, torch.tensor([0.8, 0.3, 0.3]), atol=1e-6), mid
+    # Reversed range (End < Start): haze on the NEAR pixel, far pixel clean, and the
+    # ramp between is gradual (Neko's report: it used to be a solid cut).
+    rev = _relight(rgb, facing, near_far, None, None,
+                   json.dumps({**base_cfg, "hazeAmount": 1.0, "hazeColor": "#ff0000",
+                               "hazeStart": 1.0, "hazeEnd": 0.0}))[0, 0]
+    assert torch.allclose(rev[0], torch.tensor([1.0, 0.0, 0.0]), atol=1e-6), rev[0]
+    assert torch.allclose(rev[W - 1], torch.tensor([0.6, 0.6, 0.6]), atol=1e-6), rev[W - 1]
+    rmid = px({"hazeAmount": 1.0, "hazeColor": "#ff0000", "hazeStart": 1.5, "hazeEnd": 0.5}, near_far * 0)
+    assert torch.allclose(rmid, torch.tensor([0.8, 0.3, 0.3]), atol=1e-6), rmid
 
     print("relighting_node self-check OK")
 
