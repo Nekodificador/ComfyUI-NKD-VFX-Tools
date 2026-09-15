@@ -1636,6 +1636,19 @@ function applyRoll(v = roll.value) {
   else camera.lookAt(0, 0, 0)
 }
 
+/** Signed roll baked into camera.quaternion: the angle about the view axis from the
+ *  world-up reference to the camera's own up. Degenerate looking straight up or down —
+ *  no horizon to tilt — so the current value is kept. */
+function rollFromCamera(): number {
+  const dir = camera.getWorldDirection(new THREE.Vector3())
+  const ref = new THREE.Vector3(0, 1, 0).addScaledVector(dir, -dir.y)
+  if (ref.lengthSq() < 1e-8) return roll.value
+  ref.normalize()
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion)
+  const sin = new THREE.Vector3().crossVectors(ref, up).dot(dir)
+  return THREE.MathUtils.radToDeg(Math.atan2(sin, ref.dot(up)))
+}
+
 function applyCameraInfo(info: any) {
   if (!info?.position) return
   camera.position.set(info.position.x, info.position.y, info.position.z)
@@ -1647,8 +1660,11 @@ function applyCameraInfo(info: any) {
   camera.updateProjectionMatrix()
   if (controls && info.target) {
     controls.target.set(info.target.x, info.target.y, info.target.z)
-    controls.update()
   }
+  // A dutch angle in the injected quaternion would be wiped by the lookAt() inside
+  // controls.update(), which rebuilds the orientation from camera.up. Read the roll back
+  // out of the quaternion and let the same up-vector path carry it (applyRoll updates too).
+  applyRoll(info.quaternion ? rollFromCamera() : roll.value)
   applyLighting() // the camera-relative key light must follow the injected yaw
 }
 
