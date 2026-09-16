@@ -52,6 +52,7 @@ Restart ComfyUI. Nothing to download, no extra setup.
 | [😺NKD Normal Detail](docs/normal-detail.md) | Puts the pores, stubble and hair back into a model's normal map, read from the photo and blended the way normals should be. |
 | [😺NKD Lens Blur](docs/lens-blur.md) | Depth of field driven by a depth map. Click where focus lands, set the aperture, and the blur falls off either side of that plane. |
 | [😺NKD Preview 3D](docs/preview-3d.md) | A 3D viewport inside a node, for GLB/GLTF models, gaussian splats and meshes straight off a mesh builder. |
+| [😺NKD Projection Pass / Bake Projection](docs/projection-painting.md) | Inpaint views of a 3D model and project them back onto its texture. Each view is one cable; they all merge in a single bake. |
 | [😺NKD fSpy Camera](docs/fspy-camera.md) | Drag two pairs of vanishing lines over a photo and it solves the camera that took it. |
 | [😺NKD Camera Delta Prompt](docs/camera-delta-prompt.md) | Writes the move between two cameras as the JSON a camera-move LoRA expects, dropped into your prompt. |
 | [😺NKD Perspective Unwarp / Rewarp](docs/perspective-unwarp-rewarp.md) | Flatten anything you are seeing at an angle, edit it head-on, then put it back at the same angle. |
