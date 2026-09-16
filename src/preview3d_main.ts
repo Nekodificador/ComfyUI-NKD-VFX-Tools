@@ -17,6 +17,8 @@ import { openNkdModal, type NkdModal } from './nkd_modal'
 const NODE_NAME = 'NKDPreview3D'
 const EXT_NAME = 'NKD.Preview3D.Vue'
 const EVENT_SCENE = 'nkd-preview3d-scene'
+// The node blocks on this until the viewport has rendered the model it just pushed.
+const CAPTURE_ROUTE = '/nkd/vfx/preview3d/capture'
 
 // Version stamp: printed once at load so a cached stale bundle is immediately visible.
 const REV = 'rev 2026-07-31 (pop-out viewer; auto-smooth normals; depth controls in the viewport)'
@@ -72,6 +74,15 @@ function hashStr(s: string): string {
   let h = 5381
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
   return `${s.length}:${h >>> 0}`
+}
+
+async function uploadShot(shot: any) {
+  const [image, object, depth] = await Promise.all([
+    uploadTempImage(shot.scene, 'scene'),
+    uploadTempImage(shot.object, 'scene_object'),
+    uploadTempImage(shot.depth, 'scene_depth'),
+  ])
+  return JSON.stringify({ image, object, depth, camera_info: shot.camera_info })
 }
 
 async function uploadTempImage(dataUrl: string, prefix: string) {
@@ -243,8 +254,6 @@ comfyApp.registerExtension({
         // everything downstream — a seed-locked sampler included) re-runs for nothing. We
         // hash the rendered pixels + camera + size; an identical render returns the SAME
         // paths, so ComfyUI sees unchanged inputs and caches instead of re-executing.
-        let lastRenderHash = ''
-        let lastValue = ''
         viewportWidget.serializeValue = async () => {
           const api_ = vp()
           if (!api_) return lastValue
@@ -252,20 +261,12 @@ comfyApp.registerExtension({
           const height = node.widgets?.find((w: any) => w.name === 'height')?.value ?? 1024
           try {
             const shot = await api_.capture(width, height)
-            const hash = hashStr(
-              `${width}x${height}|${JSON.stringify(shot.camera_info)}|` +
-              `${shot.scene}${shot.object}${shot.depth}`
-            )
+            const hash = shotHash(shot, width, height)
             // Nothing moved since the last capture → reuse the already-uploaded paths so the
             // widget value is byte-identical and the node stays cached.
             if (hash === lastRenderHash && lastValue) return lastValue
-            const [image, object, depth] = await Promise.all([
-              uploadTempImage(shot.scene, 'scene'),
-              uploadTempImage(shot.object, 'scene_object'),
-              uploadTempImage(shot.depth, 'scene_depth'),
-            ])
+            lastValue = await uploadShot(shot)
             lastRenderHash = hash
-            lastValue = JSON.stringify({ image, object, depth, camera_info: shot.camera_info })
             return lastValue
           } catch (e) {
             console.error('[NKD Preview 3D] capture failed:', e)
@@ -344,7 +345,10 @@ comfyApp.registerExtension({
         if (modal) return
         const bar = container.querySelector('.nkd-bar') as HTMLElement | null
         const panel = container.querySelector('.nkd-panel') as HTMLElement | null
-        const measured = (bar?.offsetHeight ?? 0) + (panel?.offsetHeight ?? 0) + 2
+        // The view tools are a row of their own now, not an overlay: they take height.
+        const tools = container.querySelector('.nkd-tools') as HTMLElement | null
+        const measured = (bar?.offsetHeight ?? 0) + (panel?.offsetHeight ?? 0)
+          + (tools?.offsetHeight ?? 0) + 2
         if (bar && measured > 2 && measured !== chromeH) {
           chromeH = measured
           node.setSize([node.size[0], node.computeSize()[1]])
@@ -368,10 +372,24 @@ comfyApp.registerExtension({
       })
       // The backend pushes the resolved scene on execute. node.id is -1 until the graph
       // assigns it, so it must be read at event time, never captured now.
-      const onScene = (e: any) => {
+      // Shared by the two things that capture: the prompt serialiser and the post-load
+      // capture the backend waits on. One cache, so an unchanged render yields the SAME
+      // uploaded paths whichever of them ran last, and the node stays cached instead of
+      // re-executing on every queue.
+      let lastRenderHash = ''
+      let lastValue = ''
+
+      const shotHash = (shot: any, width: number, height: number) => hashStr(
+        `${width}x${height}|${JSON.stringify(shot.camera_info)}|` +
+        `${shot.scene}${shot.object}${shot.depth}`
+      )
+
+      const onScene = async (e: any) => {
         const d = e?.detail
         if (!d || String(d.node_id) !== String(node.id)) return
-        void vp()?.loadScene(d)
+        // AWAIT the load: the node is blocked waiting for a capture of THIS model, and
+        // capturing before setModel resolves would send back the previous one.
+        await vp()?.loadScene(d)
         // width/height may arrive over a link, which the viewport cannot resolve before
         // execution — fold back what the backend actually ran with.
         const setW = (name: string, value: number) => {
@@ -383,6 +401,41 @@ comfyApp.registerExtension({
         // Assigning .value fires no callback, and onDrawBackground never runs under Vue
         // nodes — so a linked width/height would never reach the viewport. Read it here.
         readAspect()
+
+        if (!d.capture_token) return
+        // Size comes from the payload, not the widgets: it is what the backend actually
+        // ran with, links resolved, and it is what the export has to match.
+        let viewport = ''
+        try {
+          const api_ = vp()
+          if (api_) {
+            const shot = await api_.capture(d.width, d.height)
+            const hash = shotHash(shot, d.width, d.height)
+            // Loading the scene changed nothing visible (the usual case once a model is
+            // in): hand back the paths already uploaded rather than a second copy of the
+            // same pixels under a new name.
+            if (hash === lastRenderHash && lastValue) {
+              viewport = lastValue
+            } else {
+              viewport = await uploadShot(shot)
+              lastRenderHash = hash
+              lastValue = viewport
+            }
+          }
+        } catch (err) {
+          console.error('[NKD Preview 3D] post-load capture failed:', err)
+        }
+        // Always answer, even empty: the node is waiting, and a silent failure would
+        // cost it the whole timeout before falling back.
+        try {
+          await api.fetchApi(CAPTURE_ROUTE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: d.capture_token, viewport }),
+          })
+        } catch (err) {
+          console.error('[NKD Preview 3D] could not return the capture:', err)
+        }
       }
       api.addEventListener(EVENT_SCENE, onScene)
 

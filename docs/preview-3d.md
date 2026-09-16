@@ -51,6 +51,26 @@ the two distances land.
 With no depth map connected it fits to the object itself, so the depth output stays usable
 even when the model is all there is.
 
+## Mirror guide
+
+The Object panel can draw the model's symmetry plane as a dotted outline, X, Y or
+Z, where that plane cuts the model's box. It is the plane the
+[bake node's `mirror` option](projection-painting.md) reflects across, and it is
+there so you can see whether the model really is symmetric before painting one
+side and trusting the other. It follows the model's placement and never reaches
+the export.
+
+## When the render is taken
+
+The picture is made by WebGL in your browser, not by Python, so the node hands the
+resolved scene to the viewport, waits for it to render, and exports that. Queue once and
+you get the model you queued, even the very first time you run it and even if the mesh
+upstream just changed.
+
+Running headless, over the API or with no browser attached, there is nothing to wait for.
+The node uses whatever the viewport captured last instead, which is the best it can do
+without a renderer.
+
 <!-- video: preview 3d -->
 
 ---

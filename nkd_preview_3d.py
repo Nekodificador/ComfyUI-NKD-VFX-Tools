@@ -16,6 +16,8 @@ local -Z), so camera_info interoperates with 😺NKD fSpy Camera, Load3D and any
 future core camera node.
 """
 
+import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -39,6 +41,64 @@ from server import PromptServer
 # Pushed to the widget on execute; the JS listens for this event.
 _EVENT_SCENE = "nkd-preview3d-scene"
 
+# The viewport renders in the browser, so the model only reaches it when this node
+# pushes the scene DURING execution, while the capture rides in on `viewport`,
+# taken when the prompt was serialised. That ordering means the capture is always
+# one run behind the model: empty on the first run with a given model, and stale
+# (a plausible render of the PREVIOUS geometry) whenever the mesh changes. So
+# after pushing the scene we ask for a fresh capture and wait for it.
+_CAPTURE_ROUTE = "/nkd/vfx/preview3d/capture"
+_CAPTURE_TIMEOUT = 60.0     # a heavy GLB has to download and parse first
+# token -> (loop, future). The LOOP has to ride along: ComfyUI runs the graph in a
+# worker thread under its own asyncio.run (execution.py), so the future is created
+# on a different loop from the aiohttp server's. Calling set_result straight from
+# the route marks the future done on a loop that is never woken, and the waiter
+# sits there until it times out.
+_PENDING_CAPTURES: dict = {}
+
+
+def _resolve_capture(loop, fut, value) -> None:
+    loop.call_soon_threadsafe(lambda: None if fut.done() else fut.set_result(value))
+
+try:
+    from aiohttp import web as _web
+
+    @PromptServer.instance.routes.post(_CAPTURE_ROUTE)
+    async def _nkd_preview3d_capture(request):
+        data = await request.json()
+        entry = _PENDING_CAPTURES.get(str(data.get("token", "")))
+        if entry is None or entry[1].done():
+            return _web.json_response({"ok": False})   # timed out, or a stale reply
+        _resolve_capture(entry[0], entry[1], data.get("viewport") or "")
+        return _web.json_response({"ok": True})
+except Exception:  # not inside ComfyUI (standalone tests import this module bare)
+    pass
+
+
+async def _fresh_capture(payload: dict) -> str:
+    """Push the scene, then wait for the viewport to render it and send back a capture.
+
+    Returns "" when nobody answers, which is the honest outcome for a headless run:
+    the caller keeps whatever was serialised. Waiting on a browser that is not there
+    would stall every API run for the whole timeout, so a missing client skips the
+    wait instead of discovering it by timing out.
+    """
+    if not getattr(PromptServer.instance, "sockets", None):
+        PromptServer.instance.send_sync(_EVENT_SCENE, payload)
+        return ""
+
+    token = uuid.uuid4().hex
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _PENDING_CAPTURES[token] = (loop, fut)
+    try:
+        PromptServer.instance.send_sync(_EVENT_SCENE, dict(payload, capture_token=token))
+        return await asyncio.wait_for(fut, timeout=_CAPTURE_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        return ""
+    finally:
+        _PENDING_CAPTURES.pop(token, None)
+
 
 @comfytype(io_type="TRIMESH")
 class TrimeshIO(ComfyTypeIO):
@@ -58,6 +118,25 @@ def _tensor_to_temp_png(image, prefix: str) -> str:
     filename = f"{prefix}_{uuid.uuid4().hex}.png"
     PILImage.fromarray(array).save(os.path.join(temp_dir, filename), compress_level=1)
     return filename
+
+
+def _stable_temp_name(path: str, ext: str) -> str:
+    """Rename a freshly written temp file to one derived from its CONTENT.
+
+    The viewport reloads whenever the URL changes, and a uuid name changes on every
+    single run, so identical geometry was being re-downloaded and re-parsed on each
+    queue: a visible flash, and a pile of temp files. Same bytes now means the same
+    name, which the browser and the widget can both skip.
+    """
+    with open(path, "rb") as f:
+        digest = hashlib.sha1(f.read()).hexdigest()[:16]
+    name = f"nkd_preview3d_{digest}{ext}"
+    target = os.path.join(os.path.dirname(path), name)
+    if os.path.exists(target):
+        os.remove(path)          # already written by an earlier run, byte for byte
+    else:
+        os.replace(path, target)
+    return name
 
 
 def _mesh_to_temp_glb(mesh) -> str:
@@ -84,7 +163,7 @@ def _mesh_to_temp_glb(mesh) -> str:
     save_glb(vertices, faces, os.path.join(temp_dir, filename),
              uvs=uvs, vertex_colors=colors, texture_image=tex_img,
              normals=normals, unlit=getattr(mesh, "unlit", False))
-    return filename
+    return _stable_temp_name(os.path.join(temp_dir, filename), ".glb")
 
 
 def _string_to_model_ref(path: str) -> dict:
@@ -137,7 +216,7 @@ def _trimesh_to_temp_glb(mesh) -> str:
     finally:
         if promoted:
             attrs["color"] = colour
-    return filename
+    return _stable_temp_name(path, ".glb")
 
 
 def _outputs_are_consumed(prompt, unique_id) -> bool:
@@ -239,7 +318,7 @@ class NKDPreview3D(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model_file, width, height, viewport="", **kwargs) -> io.NodeOutput:
+    async def execute(cls, model_file, width, height, viewport="", **kwargs) -> io.NodeOutput:
         camera_info = kwargs.get("camera_info", None)
         bg_image = kwargs.get("bg_image", None)
         model_3d_info = kwargs.get("model_3d_info", None)
@@ -249,8 +328,10 @@ class NKDPreview3D(io.ComfyNode):
             model_ref = {"filename": _mesh_to_temp_glb(model_file), "type": "temp", "subfolder": ""}
         elif isinstance(model_file, Types.File3D):
             filename = f"nkd_preview3d_{uuid.uuid4().hex}.{model_file.format}"
-            model_file.save_to(os.path.join(folder_paths.get_temp_directory(), filename))
-            model_ref = {"filename": filename, "type": "temp", "subfolder": ""}
+            written = os.path.join(folder_paths.get_temp_directory(), filename)
+            model_file.save_to(written)
+            model_ref = {"filename": _stable_temp_name(written, f".{model_file.format}"),
+                         "type": "temp", "subfolder": ""}
         elif not isinstance(model_file, str) and hasattr(model_file, "export"):
             # TRIMESH (Hunyuan3D wrapper): a live trimesh.Trimesh, exported by its own writer.
             model_ref = {"filename": _trimesh_to_temp_glb(model_file),
@@ -273,7 +354,7 @@ class NKDPreview3D(io.ComfyNode):
 
         # The viewport cannot learn a linked width/height/camera on its own — it renders
         # before execution. Hand over what we actually ran with so it can catch up.
-        PromptServer.instance.send_sync(_EVENT_SCENE, {
+        fresh = await _fresh_capture({
             "node_id": str(cls.hidden.unique_id),
             "model": model_ref,
             "bg_image": bg_ref,
@@ -287,6 +368,10 @@ class NKDPreview3D(io.ComfyNode):
             "width": width,
             "height": height,
         })
+        # The viewport just rendered THIS model; prefer that over the serialised
+        # capture, which was taken before the model existed in the browser.
+        if fresh:
+            viewport = fresh
 
         capture = None
         if viewport:
@@ -409,6 +494,79 @@ def demo():
         kept = tm.visual.vertex_attributes["color"]
         assert kept.shape == rgb.shape and kept.dtype == rgb.dtype, \
             "the caller's mesh must be restored, not left promoted to RGBA"
+
+    # Content-addressed temp names: the viewport reloads whenever the ref changes, so
+    # identical geometry has to keep the same name or it re-downloads every queue.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        def write(data, tag):
+            path = os.path.join(td, f"scratch_{tag}.glb")
+            with open(path, "wb") as f:
+                f.write(data)
+            return _stable_temp_name(path, ".glb")
+
+        a = write(b"glTF-same-bytes", "a")
+        b = write(b"glTF-same-bytes", "b")
+        c = write(b"glTF-other-bytes", "c")
+        assert a == b, f"same bytes must give the same name: {a} vs {b}"
+        assert a != c, "different bytes must not collide"
+        assert os.path.isfile(os.path.join(td, a)), "the named file is missing"
+        # The second write finds its target already there; it must clean up after
+        # itself rather than leave the scratch file behind on every run.
+        left = sorted(n for n in os.listdir(td) if n.startswith("scratch_"))
+        assert left == [], f"temp scratch files were left behind: {left}"
+        assert len(os.listdir(td)) == 2, f"expected exactly two named files: {os.listdir(td)}"
+
+    # The capture hand-off crosses two event loops in two threads: ComfyUI runs the
+    # graph under its own asyncio.run (execution.py) while aiohttp answers on the
+    # server's loop. Reproduced with two real loops, because one loop hides it.
+    #
+    # The symptom is NOT a hang. A future resolved from the wrong loop schedules its
+    # callbacks without waking that loop's selector, so the waiter sleeps until its
+    # next timer fires, which is the wait_for timeout itself. That is why the node
+    # took exactly 60 seconds and then fell back: the answer had arrived in
+    # milliseconds and nobody was woken to read it. So measure the DELAY.
+    import threading
+    import time
+
+    def _time_handoff(resolve, timeout):
+        """Wait on a private loop in its own thread, like the executor does, and
+        return how long the hand-off actually took."""
+        ready, box, out = threading.Event(), {}, {}
+
+        def run():
+            async def main():
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                box["loop"], box["fut"] = loop, fut
+                ready.set()
+                t0 = time.perf_counter()
+                try:
+                    out["value"] = await asyncio.wait_for(fut, timeout)
+                except asyncio.TimeoutError:
+                    out["value"] = "TIMEOUT"
+                out["elapsed"] = time.perf_counter() - t0
+            asyncio.run(main())
+
+        t = threading.Thread(target=run)
+        t.start()
+        ready.wait(5)
+
+        async def server():
+            await asyncio.sleep(0.05)      # let the waiter reach its await
+            resolve(box["loop"], box["fut"])
+        asyncio.run(server())
+        t.join()
+        return out
+
+    fixed = _time_handoff(lambda loop, fut: _resolve_capture(loop, fut, "fresh"), 2.0)
+    assert fixed["value"] == "fresh", f"the hand-off lost the capture: {fixed}"
+    assert fixed["elapsed"] < 0.5, f"call_soon_threadsafe did not wake the waiter promptly: {fixed}"
+
+    # CONTROL: set_result straight from the other loop. It must arrive LATE, or the
+    # assertion above proves nothing about why call_soon_threadsafe is there.
+    naive = _time_handoff(lambda loop, fut: fut.set_result("naive"), 1.0)
+    assert naive["elapsed"] > 0.9,         f"control: a cross-loop set_result was expected to stall until the timeout, got {naive}"
 
     print("nkd_preview_3d demo OK")
 

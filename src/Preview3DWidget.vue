@@ -133,6 +133,7 @@ const viewWrap = ref<HTMLDivElement | null>(null)
 // viewport-shaped box would frame something other than what the node actually outputs.
 const fitW = ref(0)
 const fitH = ref(0)
+const toolsRow = ref<HTMLElement | null>(null)
 const showGrid = ref(true)
 const status = ref('')
 // Camera lock. A solved camera (fSpy) is a match to the plate — one stray orbit
@@ -243,6 +244,13 @@ const gizmoMode = ref<'off' | 'translate' | 'rotate' | 'scale'>('off')
 // 'world'. NOTE it has no say over Scale — TransformControls hard-codes `space = 'local'` for
 // scale mode ("scale always oriented to local rotation"), so this only moves Move and Rotate.
 const gizmoSpace = ref<'world' | 'local'>('world')
+// Mirror guide: the model's symmetry plane, drawn as a dotted rectangle where the plane
+// cuts the model's box. A guide for the bake node's `mirror` option (which is where the
+// choice actually lives): it lets you see whether the model IS symmetric about that axis
+// before painting one side and trusting the other. Pure viewport state, nothing exported.
+type MirrorAxis = 'none' | 'X' | 'Y' | 'Z'
+const mirrorGuide = ref<MirrorAxis>('none')
+let mirrorLine: THREE.LineLoop | null = null
 // Splat→mesh converters (Tripo & co.) often ship the texture baked into an UNLIT material or the
 // emissive channel, so the object self-lights and ignores shadows. Unbake rebuilds a lit
 // MeshStandard using that texture as albedo, so lights and shadows land on it.
@@ -480,6 +488,11 @@ let model: THREE.Object3D | null = null
 let modelIsSplat = false
 let sparkRenderer: THREE.Object3D | null = null // Spark's draw pass; nothing paints splats without it
 let loadGeneration = 0
+// Which file is actually in the scene. viewUrl() appends a random cache-buster so it
+// can never be compared; the REF is what identifies the file. The backend now names
+// temp models after their contents, so unchanged geometry keeps the same ref and this
+// skips a download, a parse and a visible flash on every queue.
+let loadedModelKey = ''
 let raf = 0
 let ro: ResizeObserver | null = null
 
@@ -1249,7 +1262,9 @@ function resize() {
   // the renderer needs the number NOW — reading it back off the element would race Vue's
   // style flush, and the fitted size is what we just decided anyway.
   if (popped.value && viewWrap.value) {
-    const bw = viewWrap.value.clientWidth, bh = viewWrap.value.clientHeight
+    // The tools row shares the wrapper with the picture; the picture gets what is left.
+    const bw = viewWrap.value.clientWidth
+    const bh = viewWrap.value.clientHeight - (toolsRow.value?.offsetHeight ?? 0)
     if (bw > 1 && bh > 1) {
       const s = Math.min(bw / props.aspect.w, bh / props.aspect.h)
       fitW.value = Math.floor(props.aspect.w * s)
@@ -1538,6 +1553,8 @@ function applySmoothNormals() {
 async function setModel(ref: { filename: string; type: string; subfolder: string } | null) {
   const generation = ++loadGeneration
   if (!ref) return
+  const key = `${ref.type}|${ref.subfolder || ''}|${ref.filename}`
+  if (model && key === loadedModelKey) return
   status.value = 'Loading model…'
   try {
     let loaded: THREE.Object3D
@@ -1591,6 +1608,8 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     ;(modelHolder ?? scene).add(model)
     recomputePivot()
     applyObjectTransform()
+    loadedModelKey = key
+    buildMirrorGuide()
     status.value = ''
   } catch (e: any) {
     if (generation === loadGeneration) status.value = `Model failed: ${e?.message ?? e}`
@@ -2047,7 +2066,52 @@ function gizmoLightTarget(id: number) {
   pivotEdit.value = false
 }
 
+/** Rebuild the mirror guide for the current model and axis. A child of `model`, so it
+ *  inherits the Load3D placement and the pivot transform for free; the box is measured
+ *  in the model's OWN space for the same reason (world matrices would fold the placement
+ *  in twice). Drawn without depth test so it reads through the surface. */
+function buildMirrorGuide() {
+  if (mirrorLine) { mirrorLine.removeFromParent(); mirrorLine.geometry.dispose(); mirrorLine = null }
+  const axis = mirrorGuide.value
+  if (axis === 'none' || !model || modelIsSplat) return
+  const inv = new THREE.Matrix4().copy(model.matrixWorld).invert()
+  const box = new THREE.Box3()
+  const tmp = new THREE.Box3()
+  model.updateMatrixWorld(true)
+  model.traverse((child) => {
+    if (!(child instanceof THREE.Mesh) || !child.geometry) return
+    if (!child.geometry.boundingBox) child.geometry.computeBoundingBox()
+    const rel = new THREE.Matrix4().multiplyMatrices(inv, child.matrixWorld)
+    tmp.copy(child.geometry.boundingBox!).applyMatrix4(rel)
+    box.union(tmp)
+  })
+  if (box.isEmpty()) return
+  // The rectangle: the plane axis = 0 clipped to the box on the other two axes.
+  const a = { X: 0, Y: 1, Z: 2 }[axis]
+  const [u, v] = [0, 1, 2].filter((i) => i !== a)
+  const lo = [box.min.x, box.min.y, box.min.z], hi = [box.max.x, box.max.y, box.max.z]
+  const corner = (cu: number, cv: number) => { const c = [0, 0, 0]; c[a] = 0; c[u] = cu; c[v] = cv; return new THREE.Vector3(c[0], c[1], c[2]) }
+  const pts = [corner(lo[u], lo[v]), corner(hi[u], lo[v]), corner(hi[u], hi[v]), corner(lo[u], hi[v])]
+  const geo = new THREE.BufferGeometry().setFromPoints(pts)
+  const size = Math.max(hi[u] - lo[u], hi[v] - lo[v], 1e-3)
+  const mat = new THREE.LineDashedMaterial({
+    color: 0x4ab4ff, dashSize: size * 0.012, gapSize: size * 0.012, depthTest: false, transparent: true, opacity: 0.9,
+  })
+  mirrorLine = new THREE.LineLoop(geo, mat)
+  mirrorLine.computeLineDistances()
+  mirrorLine.renderOrder = 999
+  mirrorLine.name = 'NKDMirrorGuide'
+  mirrorLine.visible = helpersVisible()
+  model.add(mirrorLine)
+}
+function setMirrorGuide(axis: MirrorAxis) {
+  mirrorGuide.value = mirrorGuide.value === axis ? 'none' : axis
+  buildMirrorGuide()
+  emit()
+}
+
 function setHelpersVisible(v: boolean) {
+  if (mirrorLine) mirrorLine.visible = v
   for (const e of lightObjs.values()) if (e.helper) e.helper.visible = v
 }
 /** They are only ever toggled as a group, so one of them speaks for all. Needed because
@@ -2055,6 +2119,7 @@ function setHelpersVisible(v: boolean) {
  *  found — restoring them to `true` there would bake the helpers into the exported frame. */
 function helpersVisible() {
   for (const e of lightObjs.values()) if (e.helper) return e.helper.visible
+  if (mirrorLine) return mirrorLine.visible
   return true
 }
 
@@ -2546,6 +2611,7 @@ function serialise(): string {
       pivot: pivotMode.value,
       pivotC: { x: pivotCustom.x, y: pivotCustom.y, z: pivotCustom.z },
       gizmoSpace: gizmoSpace.value,
+      mirrorGuide: mirrorGuide.value,
     },
   })
 }
@@ -2640,6 +2706,7 @@ function deserialise(json: string) {
       if (o.pivot === 'bottom' || o.pivot === 'center' || o.pivot === 'origin' || o.pivot === 'custom') pivotMode.value = o.pivot
       // Absent in workflows saved before the toggle existed: those keep three's default, world.
       if (o.gizmoSpace === 'world' || o.gizmoSpace === 'local') setGizmoSpace(o.gizmoSpace)
+      if (['none', 'X', 'Y', 'Z'].includes(o.mirrorGuide)) { mirrorGuide.value = o.mirrorGuide; buildMirrorGuide() }
       // The model may not be loaded yet — setModel recomputes the pivot and re-applies.
       recomputePivot()
       applyObjectTransform()
@@ -2901,6 +2968,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <span class="nkd-obj-hint" v-if="gizmoMode === 'scale'">Scale is always local</span>
         </div>
         <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Mirror</span>
+          <button v-for="ax in (['X', 'Y', 'Z'] as const)" :key="ax" class="nkd-gizmo"
+                  :class="{ on: mirrorGuide === ax }" @click="setMirrorGuide(ax)"
+                  :title="`Show the model's ${ax} = 0 plane as a dotted outline: the plane the bake node's mirror option reflects across. Click again to hide.`">{{ ax }}</button>
+        </div>
+        <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Pivot</span>
           <select :value="pivotMode" @change="setPivotMode(($event.target as HTMLSelectElement).value as any)">
             <option value="bottom">Bottom</option>
@@ -3061,16 +3134,10 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
     </div>
     </div>
     <div class="nkd-viewwrap" ref="viewWrap">
-    <div
-      ref="host"
-      class="nkd-view"
-      :style="popped && fitW
-        ? { aspectRatio: `${aspect.w} / ${aspect.h}`, width: fitW + 'px', height: fitH + 'px' }
-        : { aspectRatio: `${aspect.w} / ${aspect.h}` }"
-      @contextmenu.prevent
-      @pointerenter="onViewEnter"
-      @pointerleave="onViewLeave"
-    >
+    <!-- The view controls used to float over the canvas. Framing a shot with a strip of
+         buttons across the top of the picture is confusing, so they sit on their own
+         solid row: what the camera sees is the whole box below. -->
+    <div class="nkd-tools" ref="toolsRow">
       <div class="nkd-overlay" @pointerdown.stop>
         <!-- PrimeIcons, not emoji: ComfyUI already ships the font, so these are
              monochrome, inherit the button colour and match the host UI. A colour
@@ -3134,6 +3201,17 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <i class="pi pi-window-maximize" />
         </button>
       </div>
+    </div>
+    <div
+      ref="host"
+      class="nkd-view"
+      :style="popped && fitW
+        ? { aspectRatio: `${aspect.w} / ${aspect.h}`, width: fitW + 'px', height: fitH + 'px' }
+        : { aspectRatio: `${aspect.w} / ${aspect.h}` }"
+      @contextmenu.prevent
+      @pointerenter="onViewEnter"
+      @pointerleave="onViewLeave"
+    >
     </div>
     </div>
   </div>
@@ -3266,8 +3344,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 }
 .nkd-popped .nkd-viewwrap {
   grid-column: 1; grid-row: 1 / span 2; min-width: 0; min-height: 0;
-  display: flex; align-items: center; justify-content: center;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
 }
+.nkd-popped .nkd-tools { align-self: stretch; }
 /* The status has no room to push to the far edge in a 300px column. */
 .nkd-popped .nkd-status { margin-left: 0; flex: 1 1 100%; }
 /* The panels are dividers in a column now, not a strip above the canvas. */
@@ -3275,9 +3354,13 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-popped .nkd-side .nkd-panel:last-child { border-bottom: none; }
 .nkd-view :deep(canvas) { width: 100%; height: 100%; display: block; }
 /* In-viewer controls: grid toggle + frame, kept out of the tab bar so it stays panel-only. */
-.nkd-overlay { position: absolute; top: 6px; left: 6px; display: flex; gap: 4px; z-index: 5; }
+.nkd-tools {
+  display: flex; align-items: center; gap: 4px; padding: 4px 6px; flex: 0 0 auto;
+  background: #1a1c22; border-bottom: 1px solid #3a3d46;
+}
+.nkd-overlay { display: flex; gap: 4px; }
 /* Pop-out sits opposite the view controls: it acts on the WINDOW, not on the scene. */
-.nkd-overlay-r { left: auto; right: 6px; }
+.nkd-overlay-r { margin-left: auto; }
 .nkd-ovsep { width: 1px; align-self: stretch; background: #3a3d46; margin: 0 2px; flex: 0 0 auto; }
 .nkd-overlay button {
   width: 24px; height: 24px; padding: 0; font-size: 13px; line-height: 1;
