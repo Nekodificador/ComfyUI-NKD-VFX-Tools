@@ -62,8 +62,21 @@ That mask leaves the node twice. `paint_mask` is the mask of the current view,
 pixel-aligned with `image`, so every angle gets its own inpaint mask from the one
 you painted. `mask3d` is the whole thing, for the
 [😺NKD Projection Pass](projection-painting.md), which then paints only that
-geometry wherever its pixels land. The mask lives in the viewport, not in
-the workflow file: it survives reloading the page, not restarting ComfyUI.
+geometry wherever its pixels land. The mask is saved with the workflow, packed
+small, so it comes back after a reload or a restart and travels with the file;
+it only applies to the model it was painted on.
+
+## Chaining viewers
+
+`model` and `model_3d_info` come back out, so a second Preview 3D can hang off the
+first for another angle, and the bake can take the model from the viewer that
+framed the view. `model` is the file the viewport loaded, whatever fed it, so it
+plugs into anything that takes a 3D file.
+
+The painted mask travels too: wire one viewer's `mask3d` into the next one's
+`mask3d` input and it shows up on the model there, comes out of that viewer's
+`paint_mask` from its own camera, and can be painted on further. Paint once,
+frame as many views as you like.
 
 ## Mirror guide
 

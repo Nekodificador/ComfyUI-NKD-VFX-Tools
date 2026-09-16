@@ -18,6 +18,7 @@ import { groundHit, viewZSpan } from './depth_range'
 import { smoothNormalsByPosition } from './smooth_normals'
 import { objectBase, objPosition, pivotFromGroup, type Quat, type V3 } from './pivot'
 import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
+import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
@@ -274,6 +275,8 @@ let stroke: { erase: boolean } | null = null
 // The brush, shown where it would paint: a dotted ring the size of the sphere, on the
 // surface under the cursor, facing the camera. Without it you are guessing the radius.
 let brushRing: THREE.LineLoop | null = null
+// A mask restored from the workflow, waiting for its model to load.
+let pendingMask3d: MaskBlob | null = null
 const MASK_VERT = `attribute float nkdMask; varying float vM;
 void main(){ vM = nkdMask; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`
 // In paint mode the whole model goes under a dark veil and the mask reads bright purple
@@ -1660,6 +1663,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     loadedModelKey = key
     buildMirrorGuide()
     if (maskPaint.value) ensureMaskAttributes()
+    applyPendingMask3d()
     status.value = ''
   } catch (e: any) {
     if (generation === loadGeneration) status.value = `Model failed: ${e?.message ?? e}`
@@ -2151,7 +2155,7 @@ function clearMask() {
     ;(a.array as Float32Array).fill(0); a.needsUpdate = true
   }
   maskHasPaint.value = false
-  emit()
+  notifyStateChanged()
 }
 function toggleMaskPaint() {
   maskPaint.value = !maskPaint.value
@@ -2306,16 +2310,26 @@ function dabAt(e: PointerEvent) {
     })
   }
 }
+/** A brush stroke changes what this node will export, but it is not a graph edit the
+ *  frontend can see: nothing marks the workflow modified, so its session draft keeps
+ *  the state from BEFORE the stroke and a restart restores a model with no mask.
+ *  Measured: after a real stroke the serialised state carried the mask and the draft
+ *  did not, until checkState() ran. The host relays this to the change tracker. */
+function notifyStateChanged() {
+  host.value?.dispatchEvent(new CustomEvent('nkd-state-changed', { bubbles: true }))
+}
 function endStroke() {
   if (!stroke) return
   stroke = null
-  emit()   // the paint is part of what the node exports: let the widget re-serialise
+  notifyStateChanged()
 }
 function onBrushDown(e: PointerEvent) {
   if (!maskPaint.value) return
   if (e.button !== 0 && !(e.button === 2 && e.altKey)) return   // right button orbits
   e.stopPropagation(); e.preventDefault()
-  ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
+  // Capture keeps the stroke alive when the pointer leaves the canvas. A synthetic
+  // event has no real pointer to capture and throws; the stroke must not die with it.
+  try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId) } catch { /* no live pointer */ }
   beginStroke(e)
 }
 function onBrushMove(e: PointerEvent) {
@@ -2340,6 +2354,53 @@ function packMask3d(): { data: string; count: number } | null {
   }
   ctx.putImageData(img, 0, 0)
   return { data: cv.toDataURL('image/png'), count }
+}
+
+/** Put a mask painted in another viewer onto this model's vertices: the packed grey
+ *  image, one pixel per vertex, read back in traversal order. Replaces what was here,
+ *  which is the point of wiring it; painting on top of it still works. */
+async function applyMask3d(ref: { filename: string; type: string; subfolder: string; count: number } | null) {
+  if (!ref || !model || modelIsSplat) return
+  ensureMaskAttributes()
+  if (!maskPairs.length) return
+  const arrays = maskPairs.map(({ src }) => (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask').array as Float32Array)
+  const total = arrays.reduce((a, b) => a + b.length, 0)
+  if (total !== ref.count) {
+    console.warn(`[NKD Preview 3D] mask3d has ${ref.count} vertices, this model has ${total}: ignored`)
+    return
+  }
+  const bmp = await createImageBitmap(await (await fetch(viewUrl(ref))).blob())
+  const cv = document.createElement('canvas'); cv.width = bmp.width; cv.height = bmp.height
+  const ctx = cv.getContext('2d')!
+  ctx.drawImage(bmp, 0, 0)
+  const px = ctx.getImageData(0, 0, bmp.width, bmp.height).data
+  let k = 0, any = false
+  for (const a of arrays) {
+    for (let i = 0; i < a.length; i++, k++) { a[i] = px[k * 4] / 255; if (a[i] > 0) any = true }
+  }
+  for (const { src } of maskPairs) ((src.geometry as THREE.BufferGeometry).getAttribute('nkdMask') as THREE.BufferAttribute).needsUpdate = true
+  maskHasPaint.value = any
+}
+
+/** The mask as it goes into the workflow file: see mask_codec.ts. */
+function encodeMask3d(): MaskBlob | null {
+  if (!maskHasPaint.value || !maskPairs.length) return null
+  return encodeMaskBits(maskPairs.map(({ src }) => (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask').array as Float32Array))
+}
+/** Put a workflow-saved mask on the model, if it is the model it was painted on. */
+function applyPendingMask3d() {
+  if (!pendingMask3d || !model || modelIsSplat) return
+  ensureMaskAttributes()
+  const arrays = maskPairs.map(({ src }) => (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask').array as Float32Array)
+  const total = arrays.reduce((a, b) => a + b.length, 0)
+  if (total !== pendingMask3d.count) return       // another model: keep waiting, it may still come
+  const bits = decodeMaskBits(pendingMask3d)
+  if (!bits) { pendingMask3d = null; return }
+  let k = 0, any = false
+  for (const a of arrays) for (let i = 0; i < a.length; i++, k++) { a[i] = bits[k]; if (a[i]) any = true }
+  for (const { src } of maskPairs) ((src.geometry as THREE.BufferGeometry).getAttribute('nkdMask') as THREE.BufferAttribute).needsUpdate = true
+  maskHasPaint.value = any
+  pendingMask3d = null
 }
 
 /** Rebuild the mirror guide for the current model and axis. A child of `model`, so it
@@ -2383,7 +2444,7 @@ function buildMirrorGuide() {
 function setMirrorGuide(axis: MirrorAxis) {
   mirrorGuide.value = mirrorGuide.value === axis ? 'none' : axis
   buildMirrorGuide()
-  emit()
+  notifyStateChanged()   // serialised state, not a graph edit: same persistence gap as the brush
 }
 
 function setHelpersVisible(v: boolean) {
@@ -2707,6 +2768,7 @@ function setOccTo(v: number) { occTo.value = v; bgDepthMaterial.uniforms.occTo.v
 /** Payload pushed by the backend on execute. */
 async function loadScene(payload: any) {
   await setModel(payload.model ?? null)
+  if (payload.mask3d) await applyMask3d(payload.mask3d)
   await setBackground(payload.bg_image ?? null)
   await setSceneDepth(payload.scene_depth ?? null)
   bgDepthMaterial.uniforms.invert.value = payload.scene_depth_invert ? 1 : 0
@@ -2903,6 +2965,9 @@ function serialise(): string {
       gizmoSpace: gizmoSpace.value,
       mirrorGuide: mirrorGuide.value,
     },
+    // Absent when nothing is painted. A mask still waiting for its model is kept as it
+    // came, so a save before the model loads does not lose it.
+    mask3d: encodeMask3d() ?? (pendingMask3d || undefined),
   })
 }
 
@@ -2988,6 +3053,11 @@ function deserialise(json: string) {
     }
     if (contactGroup) contactGroup.visible = contact.value
     if (s.object) {
+      const m3 = s.mask3d
+      if (m3 && typeof m3.count === 'number' && typeof m3.rle === 'string') {
+        pendingMask3d = { count: m3.count, rle: m3.rle }
+        applyPendingMask3d()   // the model may already be there, else setModel picks it up
+      }
       const o = s.object
       if (o.pos) Object.assign(objPos, o.pos)
       if (o.rot) Object.assign(objRot, o.rot)

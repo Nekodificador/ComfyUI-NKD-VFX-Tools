@@ -383,6 +383,9 @@ comfyApp.registerExtension({
       // re-executing on every queue.
       let lastRenderHash = ''
       let lastValue = ''
+      // The backend's session id. A new one means it restarted and temp was wiped, so
+      // every path in the cache points at a file that no longer exists.
+      let lastSession = ''
 
       // The painted mask is part of the export: a brush stroke has to re-run the node.
       const shotHash = (shot: any, width: number, height: number) => hashStr(
@@ -393,6 +396,11 @@ comfyApp.registerExtension({
       const onScene = async (e: any) => {
         const d = e?.detail
         if (!d || String(d.node_id) !== String(node.id)) return
+        if (d.session && d.session !== lastSession) {
+          lastSession = d.session
+          lastRenderHash = ''
+          lastValue = ''
+        }
         // AWAIT the load: the node is blocked waiting for a capture of THIS model, and
         // capturing before setModel resolves would send back the previous one.
         await vp()?.loadScene(d)
@@ -412,8 +420,10 @@ comfyApp.registerExtension({
         // Size comes from the payload, not the widgets: it is what the backend actually
         // ran with, links resolved, and it is what the export has to match.
         let viewport = ''
+        let error = ''
         try {
           const api_ = vp()
+          if (!api_) error = 'viewport not mounted'
           if (api_) {
             const shot = await api_.capture(d.width, d.height)
             const hash = shotHash(shot, d.width, d.height)
@@ -428,22 +438,32 @@ comfyApp.registerExtension({
               lastValue = viewport
             }
           }
-        } catch (err) {
+        } catch (err: any) {
+          error = String(err?.stack || err)
           console.error('[NKD Preview 3D] post-load capture failed:', err)
         }
         // Always answer, even empty: the node is waiting, and a silent failure would
-        // cost it the whole timeout before falling back.
+        // cost it the whole timeout before falling back. The error rides along so the
+        // server log says WHY a capture came back empty, without opening the console.
         try {
           await api.fetchApi(CAPTURE_ROUTE, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: d.capture_token, viewport }),
+            body: JSON.stringify({ token: d.capture_token, viewport, error }),
           })
         } catch (err) {
           console.error('[NKD Preview 3D] could not return the capture:', err)
         }
       }
       api.addEventListener(EVENT_SCENE, onScene)
+      // The viewport changed something the node exports (a brush stroke) without a graph
+      // edit. Tell the change tracker, or the session draft that a restart restores keeps
+      // the state from before it.
+      container.addEventListener('nkd-state-changed', () => {
+        node.setDirtyCanvas(true, true)
+        const tracker = (comfyApp as any).extensionManager?.workflow?.activeWorkflow?.changeTracker
+        tracker?.checkState?.()
+      })
 
       // Primary: the widget's own callback, for edits made on the node.
       for (const name of ['width', 'height']) {

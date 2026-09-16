@@ -19,6 +19,7 @@ future core camera node.
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import uuid
 
@@ -47,6 +48,11 @@ _EVENT_SCENE = "nkd-preview3d-scene"
 # one run behind the model: empty on the first run with a given model, and stale
 # (a plausible render of the PREVIOUS geometry) whenever the mesh changes. So
 # after pushing the scene we ask for a fresh capture and wait for it.
+# New on every backend start. The viewport reuses already-uploaded render paths while
+# the render is unchanged, and those live in temp, which a restart wipes. Restarting
+# only the backend leaves the page open with a cache full of paths to deleted files;
+# seeing a new session id is what tells it to forget them.
+_SESSION = uuid.uuid4().hex
 _CAPTURE_ROUTE = "/nkd/vfx/preview3d/capture"
 _CAPTURE_TIMEOUT = 60.0     # a heavy GLB has to download and parse first
 # token -> (loop, future). The LOOP has to ride along: ComfyUI runs the graph in a
@@ -67,24 +73,42 @@ try:
     async def _nkd_preview3d_capture(request):
         data = await request.json()
         entry = _PENDING_CAPTURES.get(str(data.get("token", "")))
+        viewport = data.get("viewport") or ""
+        if data.get("error") or not viewport:
+            logging.warning("[NKD Preview 3D] the viewport answered with %s capture%s",
+                            "an empty" if not viewport else "a",
+                            f": {data.get('error')}" if data.get("error") else "")
         if entry is None or entry[1].done():
+            logging.warning("[NKD Preview 3D] capture reply arrived late or unmatched (token %s)",
+                            str(data.get("token", ""))[:8])
             return _web.json_response({"ok": False})   # timed out, or a stale reply
-        _resolve_capture(entry[0], entry[1], data.get("viewport") or "")
+        _resolve_capture(entry[0], entry[1], viewport)
         return _web.json_response({"ok": True})
 except Exception:  # not inside ComfyUI (standalone tests import this module bare)
     pass
 
 
 async def _fresh_capture(payload: dict) -> str:
-    """Push the scene, then wait for the viewport to render it and send back a capture.
+    """Push the scene to the client that queued the prompt, then wait for its viewport
+    to render it and send back a capture.
 
-    Returns "" when nobody answers, which is the honest outcome for a headless run:
+    ONLY that client. A broadcast reaches every open tab with this node in it (a second
+    browser, another monitor, a colleague's session) and the first to answer wins the
+    token: a tab without the model loaded answers in milliseconds with an empty capture
+    and the real one arrives late and unmatched. Measured, with two tabs on the same
+    workflow: the node failed 75 ms in, on the stale serialised paths.
+
+    Returns "" when nobody can answer, which is the honest outcome for a headless run:
     the caller keeps whatever was serialised. Waiting on a browser that is not there
     would stall every API run for the whole timeout, so a missing client skips the
     wait instead of discovering it by timing out.
     """
-    if not getattr(PromptServer.instance, "sockets", None):
-        PromptServer.instance.send_sync(_EVENT_SCENE, payload)
+    server = PromptServer.instance
+    sid = getattr(server, "client_id", None)
+    if not sid or sid not in (getattr(server, "sockets", None) or {}):
+        logging.info("[NKD Preview 3D] the queuing client has no viewport connected: "
+                     "using the serialised capture")
+        server.send_sync(_EVENT_SCENE, payload, sid)
         return ""
 
     token = uuid.uuid4().hex
@@ -92,9 +116,11 @@ async def _fresh_capture(payload: dict) -> str:
     fut = loop.create_future()
     _PENDING_CAPTURES[token] = (loop, fut)
     try:
-        PromptServer.instance.send_sync(_EVENT_SCENE, dict(payload, capture_token=token))
+        server.send_sync(_EVENT_SCENE, dict(payload, capture_token=token), sid)
         return await asyncio.wait_for(fut, timeout=_CAPTURE_TIMEOUT)
     except (asyncio.TimeoutError, asyncio.CancelledError):
+        logging.warning("[NKD Preview 3D] the viewport did not answer within %.0fs: using the "
+                        "serialised capture", _CAPTURE_TIMEOUT)
         return ""
     finally:
         _PENDING_CAPTURES.pop(token, None)
@@ -117,6 +143,17 @@ class NKDMask3D:
 @comfytype(io_type="NKD_MASK3D")
 class NKDMask3DType(ComfyTypeIO):
     Type = NKDMask3D
+
+
+def _pack_mask3d(values: torch.Tensor) -> torch.Tensor:
+    """Per-vertex values -> the grey image the viewport packs them as: one pixel per
+    vertex, 1024 to a row, last row padded. (1, H, 1024, 3) in 0..1."""
+    v = values.reshape(-1).float().clamp(0.0, 1.0).cpu()
+    width = 1024
+    rows = max(1, -(-v.numel() // width))
+    flat = torch.zeros(rows * width)
+    flat[:v.numel()] = v
+    return flat.view(1, rows, width, 1).expand(1, rows, width, 3).contiguous()
 
 
 def _unpack_mask3d(image: torch.Tensor, count: int) -> NKDMask3D:
@@ -246,6 +283,21 @@ def _trimesh_to_temp_glb(mesh) -> str:
     return _stable_temp_name(path, ".glb")
 
 
+def _ref_to_file3d(ref):
+    """The resolved model as a FILE_3D, so viewers can be chained: whatever came in
+    (a mesh in memory, a live trimesh, a path) has already become a real file by the
+    time the browser needs it, and that file is what the next node gets."""
+    if not ref:
+        return None
+    root = {"temp": folder_paths.get_temp_directory(),
+            "input": folder_paths.get_input_directory(),
+            "output": folder_paths.get_output_directory()}.get(ref.get("type"), None)
+    if root is None:
+        return None
+    path = _safe_join(root, ref.get("subfolder") or "", ref["filename"])
+    return Types.File3D(path) if path else None
+
+
 def _outputs_are_consumed(prompt, unique_id) -> bool:
     """Whether any node in the prompt reads an output of node `unique_id`.
 
@@ -293,6 +345,11 @@ class NKDPreview3D(io.ComfyNode):
                                        "into the exported image."),
                 io.Load3DModelInfo.Input("model_3d_info", optional=True,
                                          tooltip="Position/rotation/scale to place the model."),
+                NKDMask3DType.Input("mask3d", optional=True,
+                                    tooltip="A 3D mask painted in another 😺NKD Preview 3D on the "
+                                            "same mesh. This viewport shows it, renders it from its "
+                                            "own camera as paint_mask, and lets you keep painting "
+                                            "on top of it."),
                 io.Image.Input("scene_depth", optional=True,
                                tooltip="Depth of the backdrop photo (Depth Anything, Marigold...). "
                                        "Composited into the depth output as its base layer, so the "
@@ -346,6 +403,14 @@ class NKDPreview3D(io.ComfyNode):
                                      tooltip="The same painted mask, whole, for 😺NKD Bake "
                                              "Projection: it then paints only inside it, "
                                              "whichever view the paint came from."),
+                io.File3DAny.Output(display_name="model",
+                                    tooltip="The model this viewport shows, as a 3D file. Chain "
+                                            "it into another 😺NKD Preview 3D for a second view, "
+                                            "or into 😺NKD Bake Projection."),
+                io.Load3DModelInfo.Output(display_name="model_3d_info",
+                                          tooltip="The placement passed in, unchanged, so a "
+                                                  "chained viewer or bake sits the model in the "
+                                                  "same place."),
             ],
             # unique_id targets this node's viewport; prompt tells whether anything reads
             # the outputs. Without declaring them here both read back None, silently.
@@ -357,6 +422,7 @@ class NKDPreview3D(io.ComfyNode):
         camera_info = kwargs.get("camera_info", None)
         bg_image = kwargs.get("bg_image", None)
         model_3d_info = kwargs.get("model_3d_info", None)
+        mask3d_in = kwargs.get("mask3d", None)
 
         # An upstream node hands over geometry in memory; save it where the browser can fetch it.
         if isinstance(model_file, Types.MESH):
@@ -389,8 +455,18 @@ class NKDPreview3D(io.ComfyNode):
 
         # The viewport cannot learn a linked width/height/camera on its own — it renders
         # before execution. Hand over what we actually ran with so it can catch up.
+        mask3d_ref = None
+        if mask3d_in is not None and getattr(mask3d_in, "count", 0) > 0:
+            # Packed the way the viewport packs its own, and named by content, so the
+            # same mask sent twice is the same file.
+            fn = _tensor_to_temp_png(_pack_mask3d(mask3d_in.values), "nkd_mask3d")
+            fn = _stable_temp_name(os.path.join(folder_paths.get_temp_directory(), fn), ".png")
+            mask3d_ref = {"filename": fn, "type": "temp", "subfolder": "", "count": mask3d_in.count}
+
         fresh = await _fresh_capture({
             "node_id": str(cls.hidden.unique_id),
+            "session": _SESSION,
+            "mask3d": mask3d_ref,
             "model": model_ref,
             "bg_image": bg_ref,
             "camera_info": camera_info,
@@ -423,8 +499,16 @@ class NKDPreview3D(io.ComfyNode):
                     "the prompt is queued, so run it once with the model loaded. If this "
                     "persists, the viewport failed to initialise — check the browser console."
                 )
-            return io.NodeOutput(None, None, None, None, camera_info, None, None)
+            return io.NodeOutput(None, None, None, None, camera_info, None, mask3d_in,
+                                 _ref_to_file3d(model_ref), model_3d_info)
 
+        for key in ("image", "object", "depth"):
+            ref = capture.get(key, "")
+            path = folder_paths.get_annotated_filepath(ref) if ref else None
+            if not path or not os.path.isfile(path):
+                raise RuntimeError(
+                    f"😺NKD Preview 3D: the render file for '{key}' is gone ({ref!r}). ComfyUI's "
+                    "temp folder is cleared on restart; reload the page and queue again.")
         load_image = nodes.LoadImage()
         output_image, _ = load_image.load_image(image=capture["image"])
         # One render gives both the isolated model and its silhouette. LoadImage hands back
@@ -438,7 +522,7 @@ class NKDPreview3D(io.ComfyNode):
         depth_image, _ = load_image.load_image(image=capture["depth"])
         # The painted 3D mask, if any. Absent means nothing painted: a black mask, no 3D mask.
         paint_mask = torch.zeros_like(output_mask)
-        mask3d = None
+        mask3d = mask3d_in          # a stale capture still hands on what was wired in
         if capture.get("paint_mask"):
             pm, _ = load_image.load_image(image=capture["paint_mask"])
             paint_mask = pm[..., 0]
@@ -448,7 +532,8 @@ class NKDPreview3D(io.ComfyNode):
             mask3d = _unpack_mask3d(packed, int(m3.get("count", 0)))
         # The viewport's live camera wins: the user may have orbited since the solve.
         return io.NodeOutput(output_image, object_rgba, output_mask, depth_image,
-                             capture.get("camera_info") or camera_info, paint_mask, mask3d)
+                             capture.get("camera_info") or camera_info, paint_mask, mask3d,
+                             _ref_to_file3d(model_ref), model_3d_info)
 
 
 class NKDPreview3DExtension(ComfyExtension):
@@ -540,11 +625,18 @@ def demo():
         assert kept.shape == rgb.shape and kept.dtype == rgb.dtype, \
             "the caller's mesh must be restored, not left promoted to RGBA"
 
+    # A resolved model ref becomes a FILE_3D on the file it points at, inside the
+    # folder its type names, and nothing else.
+    f = _ref_to_file3d({"filename": "x.glb", "type": "temp", "subfolder": ""})
+    assert isinstance(f, Types.File3D) and f.get_source().startswith(folder_paths.get_temp_directory()), f
+    assert _ref_to_file3d({"filename": "x.glb", "type": "elsewhere"}) is None
+    assert _ref_to_file3d(None) is None
+
     # The 3D mask rides as a grey image, one pixel per vertex, 1024 to a row. The last
-    # row is padding; only `count` values are real.
+    # row is padding; only `count` values are real. Pack and unpack are inverses.
     vals = torch.rand(2500)
-    img = torch.zeros(1, 3, 1024, 3)
-    img[0, ..., 0].reshape(-1)[:2500] = vals
+    img = _pack_mask3d(vals)
+    assert tuple(img.shape) == (1, 3, 1024, 3), img.shape
     m3 = _unpack_mask3d(img, 2500)
     assert m3.count == 2500 and torch.allclose(m3.values, vals), "mask3d did not survive packing"
     try:
