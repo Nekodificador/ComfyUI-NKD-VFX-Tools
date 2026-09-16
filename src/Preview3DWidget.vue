@@ -251,6 +251,52 @@ const gizmoSpace = ref<'world' | 'local'>('world')
 type MirrorAxis = 'none' | 'X' | 'Y' | 'Z'
 const mirrorGuide = ref<MirrorAxis>('none')
 let mirrorLine: THREE.LineLoop | null = null
+
+// ── 3D mask brush ─────────────────────────────────────────────────────────
+// Paint, on the model itself, the region an inpaint may touch. The mask lives on the
+// VERTICES (a float attribute `nkdMask`), which works the same for a UV-mapped mesh and
+// for a vertex-coloured one, has no seams, and on a generated mesh is dense enough to
+// say "this part". It leaves the viewport two ways: rendered from the current camera as
+// `paint_mask` (the 2D mask of THIS view, pixel-aligned with `image`), and packed whole
+// as `mask3d` for the bake, which then paints only inside it whatever view the paint
+// came from. It lives in memory, not in the workflow: 700k floats do not belong in JSON.
+const maskPaint = ref(false)
+const brushRadius = ref(40)          // viewport pixels
+const maskHasPaint = ref(false)
+let maskOverlay: THREE.Group | null = null
+let maskPairs: { src: THREE.Mesh; tint: THREE.Mesh }[] = []
+type ProjMesh = { attr: THREE.BufferAttribute; sx: Float32Array; sy: Float32Array; z: Float32Array; ok: Uint8Array }
+// Every vertex projected to the viewport, reused by the hover ring and by the stroke.
+// Rebuilt only when the camera or the model moved (their matrices are the key), because
+// at 700k vertices it costs tens of milliseconds and a pointermove cannot pay that.
+let proj: { key: string; meshes: ProjMesh[]; tanHalf: number; width: number; height: number } | null = null
+let stroke: { erase: boolean } | null = null
+// The brush, shown where it would paint: a dotted ring the size of the sphere, on the
+// surface under the cursor, facing the camera. Without it you are guessing the radius.
+let brushRing: THREE.LineLoop | null = null
+const MASK_VERT = `attribute float nkdMask; varying float vM;
+void main(){ vM = nkdMask; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`
+// In paint mode the whole model goes under a dark veil and the mask reads bright purple
+// on top of it: judging a mask against a busy texture is guesswork. Out of paint mode the
+// veil lifts and the painted region stays, quieter, so you still see what you did.
+const maskTintMat = new THREE.ShaderMaterial({
+  vertexShader: MASK_VERT,
+  fragmentShader: `varying float vM; uniform float uPaint;
+void main(){
+  float veil = uPaint * 0.7 * (1.0 - vM);
+  float mask = vM * mix(0.4, 0.9, uPaint);
+  float a = max(veil, mask);
+  if (a < 0.01) discard;
+  vec3 purple = vec3(0.78, 0.32, 1.0);
+  gl_FragColor = vec4(mix(vec3(0.0), purple, vM), a);
+}`,
+  uniforms: { uPaint: { value: 0.0 } },
+  transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+})
+const maskExportMat = new THREE.ShaderMaterial({
+  vertexShader: MASK_VERT,
+  fragmentShader: `varying float vM; void main(){ gl_FragColor = vec4(vec3(vM), 1.0); }`,
+})
 // Splat→mesh converters (Tripo & co.) often ship the texture baked into an UNLIT material or the
 // emissive channel, so the object self-lights and ignores shadows. Unbake rebuilds a lit
 // MeshStandard using that texture as albedo, so lights and shadows land on it.
@@ -1048,6 +1094,7 @@ function setOrthoView(on: boolean) {
 }
 
 function renderFrame(drawBackdrop = true) {
+  syncMaskOverlay()
   const r = renderer.value
   if (!r) return
   r.autoClear = false
@@ -1588,6 +1635,8 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
       model.removeFromParent()
       model = null
     }
+    disposeMaskOverlay()   // the attribute lived on the old geometry
+    proj = null
     model = loaded
     modelIsSplat = loadedIsSplat
     model.name = 'NKDModel'
@@ -1610,6 +1659,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     applyObjectTransform()
     loadedModelKey = key
     buildMirrorGuide()
+    if (maskPaint.value) ensureMaskAttributes()
     status.value = ''
   } catch (e: any) {
     if (generation === loadGeneration) status.value = `Model failed: ${e?.message ?? e}`
@@ -2066,6 +2116,232 @@ function gizmoLightTarget(id: number) {
   pivotEdit.value = false
 }
 
+/** Give every mesh of the model a `nkdMask` attribute and a tinted twin that shows it.
+ *  The twins share the geometry and live at the scene root, matrices copied each frame,
+ *  so Unbake/Smooth/auto-normals, which walk the model swapping materials, never see them. */
+function ensureMaskAttributes() {
+  if (!model || modelIsSplat) return
+  if (!maskOverlay) { maskOverlay = new THREE.Group(); maskOverlay.name = 'NKDMaskOverlay'; scene.add(maskOverlay) }
+  model.traverse((child) => {
+    if (!(child instanceof THREE.Mesh) || !child.geometry || maskPairs.some((q) => q.src === child)) return
+    const g = child.geometry as THREE.BufferGeometry
+    if (!g.getAttribute('nkdMask')) {
+      const n = g.getAttribute('position').count
+      g.setAttribute('nkdMask', new THREE.BufferAttribute(new Float32Array(n), 1))
+    }
+    const tint = new THREE.Mesh(g, maskTintMat)
+    tint.matrixAutoUpdate = false
+    tint.renderOrder = 998
+    tint.frustumCulled = false
+    maskOverlay!.add(tint)
+    maskPairs.push({ src: child, tint })
+  })
+}
+function syncMaskOverlay() {
+  for (const { src, tint } of maskPairs) tint.matrix.copy(src.matrixWorld)
+}
+function disposeMaskOverlay() {
+  if (maskOverlay) { maskOverlay.removeFromParent(); maskOverlay = null }
+  maskPairs = []
+  maskHasPaint.value = false
+}
+function clearMask() {
+  for (const { src } of maskPairs) {
+    const a = (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask') as THREE.BufferAttribute
+    ;(a.array as Float32Array).fill(0); a.needsUpdate = true
+  }
+  maskHasPaint.value = false
+  emit()
+}
+function toggleMaskPaint() {
+  maskPaint.value = !maskPaint.value
+  maskTintMat.uniforms.uPaint.value = maskPaint.value ? 1.0 : 0.0
+  if (maskPaint.value) { ensureMaskAttributes(); setGizmoMode('off') }
+  else if (brushRing) brushRing.visible = false
+  applyBrushControls()
+}
+/** In paint mode the left button paints, so the camera moves with the right one. */
+function applyBrushControls() {
+  if (!controls) return
+  controls.mouseButtons = maskPaint.value
+    ? { LEFT: -1 as any, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
+    : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }
+}
+/** Pointer position in viewport CSS pixels, LiteGraph's canvas zoom undone. */
+function brushPoint(e: PointerEvent) {
+  const el = host.value!
+  const rect = el.getBoundingClientRect()
+  const c = unzoomedClient(rect, el.offsetWidth, e.clientX, e.clientY)
+  return { x: c.clientX - rect.left, y: c.clientY - rect.top, w: el.offsetWidth, h: el.offsetHeight }
+}
+/** Project every vertex to viewport pixels, once per camera/model pose. Each brush
+ *  move is then a distance test over typed arrays, fast even at 700k vertices, with no
+ *  raycast against the triangle soup at all. */
+function ensureProjection(w: number, h: number) {
+  if (!model || !host.value) return null
+  ensureMaskAttributes()
+  camera.updateMatrixWorld(true)
+  model.updateMatrixWorld(true)
+  const key = `${w}x${h}|${camera.matrixWorldInverse.elements.join(',')}|${camera.projectionMatrix.elements.join(',')}|${model.matrixWorld.elements.join(',')}`
+  if (proj && proj.key === key) return proj
+  const view = camera.matrixWorldInverse, projM = camera.projectionMatrix
+  const camPos = camera.position
+  const meshes = maskPairs.map(({ src }) => {
+    const g = src.geometry as THREE.BufferGeometry
+    const pos = g.getAttribute('position'), nrm = g.getAttribute('normal')
+    const n = pos.count
+    const sx = new Float32Array(n), sy = new Float32Array(n), z = new Float32Array(n), ok = new Uint8Array(n)
+    const mv = new THREE.Matrix4().multiplyMatrices(view, src.matrixWorld)
+    const mvp = new THREE.Matrix4().multiplyMatrices(projM, mv)
+    const nm = new THREE.Matrix3().getNormalMatrix(src.matrixWorld)
+    const M = mvp.elements, V = mv.elements, W = src.matrixWorld.elements, N = nm.elements
+    for (let i = 0; i < n; i++) {
+      const x = pos.getX(i), y = pos.getY(i), zz = pos.getZ(i)
+      const cw = M[3] * x + M[7] * y + M[11] * zz + M[15]
+      const cx = (M[0] * x + M[4] * y + M[8] * zz + M[12]) / cw
+      const cy = (M[1] * x + M[5] * y + M[9] * zz + M[13]) / cw
+      sx[i] = (cx + 1) * 0.5 * w
+      sy[i] = (1 - cy) * 0.5 * h
+      z[i] = -(V[2] * x + V[6] * y + V[10] * zz + V[14])
+      // facing: world normal against the direction to the camera
+      const wx = W[0] * x + W[4] * y + W[8] * zz + W[12]
+      const wy = W[1] * x + W[5] * y + W[9] * zz + W[13]
+      const wz = W[2] * x + W[6] * y + W[10] * zz + W[14]
+      let f = 1
+      if (nrm) {
+        const nx0 = nrm.getX(i), ny0 = nrm.getY(i), nz0 = nrm.getZ(i)
+        const nx = N[0] * nx0 + N[3] * ny0 + N[6] * nz0
+        const ny = N[1] * nx0 + N[4] * ny0 + N[7] * nz0
+        const nz = N[2] * nx0 + N[5] * ny0 + N[8] * nz0
+        f = nx * (camPos.x - wx) + ny * (camPos.y - wy) + nz * (camPos.z - wz) > 0 ? 1 : 0
+      }
+      ok[i] = cw > 0 && f ? 1 : 0
+    }
+    return { attr: g.getAttribute('nkdMask') as THREE.BufferAttribute, sx, sy, z, ok }
+  })
+  proj = { key, meshes, tanHalf: Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)), width: w, height: h }
+  return proj
+}
+/** Nearest surface depth under a viewport point, or null off the model. */
+function surfaceDepth(x: number, y: number, core2: number) {
+  if (!proj) return null
+  let hitZ = Infinity
+  for (const m of proj.meshes) {
+    for (let i = 0; i < m.z.length; i++) {
+      if (!m.ok[i]) continue
+      const dx = m.sx[i] - x, dy = m.sy[i] - y
+      if (dx * dx + dy * dy <= core2 && m.z[i] < hitZ) hitZ = m.z[i]
+    }
+  }
+  return isFinite(hitZ) ? hitZ : null
+}
+function worldRadiusAt(hitZ: number) {
+  return brushRadius.value * (2 * hitZ * proj!.tanHalf) / proj!.height
+}
+/** Place the dotted ring on the surface under the cursor, or hide it. */
+function updateBrushRing(e: PointerEvent) {
+  if (!maskPaint.value || !host.value) { if (brushRing) brushRing.visible = false; return }
+  const { x, y, w, h } = brushPoint(e)
+  if (!ensureProjection(w, h)) return
+  const r = brushRadius.value
+  const hitZ = surfaceDepth(x, y, (r / 3) * (r / 3))
+  if (!brushRing) {
+    const pts: THREE.Vector3[] = []
+    for (let i = 0; i < 64; i++) pts.push(new THREE.Vector3(Math.cos(i / 64 * Math.PI * 2), Math.sin(i / 64 * Math.PI * 2), 0))
+    const geo = new THREE.BufferGeometry().setFromPoints(pts)
+    brushRing = new THREE.LineLoop(geo, new THREE.LineDashedMaterial({
+      color: 0xffffff, dashSize: 0.09, gapSize: 0.07, depthTest: false, transparent: true, opacity: 0.9,
+    }))
+    brushRing.computeLineDistances()
+    brushRing.renderOrder = 1000
+    brushRing.name = 'NKDBrushRing'
+    scene.add(brushRing)
+  }
+  if (hitZ === null) { brushRing.visible = false; return }
+  // The point on the cursor's ray at that view depth.
+  const ndc = new THREE.Vector3((x / w) * 2 - 1, 1 - (y / h) * 2, 0.5).unproject(camera)
+  const dir = ndc.sub(camera.position).normalize()
+  const fwd = camera.getWorldDirection(new THREE.Vector3())
+  const t = hitZ / Math.max(dir.dot(fwd), 1e-6)
+  brushRing.position.copy(camera.position).addScaledVector(dir, t)
+  brushRing.quaternion.copy(camera.quaternion)          // billboard: the circle you see is the radius you set
+  const wr = worldRadiusAt(hitZ)
+  brushRing.scale.setScalar(wr)
+  brushRing.visible = true
+}
+function beginStroke(e: PointerEvent) {
+  const { w, h } = brushPoint(e)
+  if (!ensureProjection(w, h)) return
+  stroke = { erase: e.altKey || e.button === 2 }
+  dabAt(e)
+}
+/** Sphere brush: the vertices inside the screen circle that are also within the sphere
+ *  around the nearest surface point under it, so the paint does not go through the
+ *  model. The sphere radius is the circle radius carried to that depth. */
+function dabAt(e: PointerEvent) {
+  if (!stroke || !proj) return
+  const { x, y } = brushPoint(e)
+  const r = brushRadius.value, r2 = r * r
+  const hitZ = surfaceDepth(x, y, (r / 3) * (r / 3))
+  if (hitZ === null) return
+  const zMax = hitZ + worldRadiusAt(hitZ)
+  const value = stroke.erase ? 0 : 1
+  let touched = false
+  for (const m of proj.meshes) {
+    const arr = m.attr.array as Float32Array
+    for (let i = 0; i < m.z.length; i++) {
+      if (!m.ok[i] || m.z[i] > zMax) continue
+      const dx = m.sx[i] - x, dy = m.sy[i] - y
+      if (dx * dx + dy * dy > r2) continue
+      if (arr[i] !== value) { arr[i] = value; touched = true }
+    }
+    if (touched) m.attr.needsUpdate = true
+  }
+  if (touched) {
+    if (value) maskHasPaint.value = true
+    else maskHasPaint.value = maskPairs.some(({ src }) => {
+      const a = (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask').array as Float32Array
+      for (let i = 0; i < a.length; i++) if (a[i] > 0) return true
+      return false
+    })
+  }
+}
+function endStroke() {
+  if (!stroke) return
+  stroke = null
+  emit()   // the paint is part of what the node exports: let the widget re-serialise
+}
+function onBrushDown(e: PointerEvent) {
+  if (!maskPaint.value) return
+  if (e.button !== 0 && !(e.button === 2 && e.altKey)) return   // right button orbits
+  e.stopPropagation(); e.preventDefault()
+  ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
+  beginStroke(e)
+}
+function onBrushMove(e: PointerEvent) {
+  if (stroke) { e.stopPropagation(); dabAt(e) }
+  updateBrushRing(e)
+}
+function onBrushUp(e: PointerEvent) { if (stroke) { e.stopPropagation(); endStroke() } }
+/** The per-vertex mask as an image: one grey pixel per vertex, 1024 to a row. It rides
+ *  to the backend like the captures do, and the bake reads it back by vertex count. */
+function packMask3d(): { data: string; count: number } | null {
+  if (!maskHasPaint.value || !maskPairs.length) return null
+  const arrays = maskPairs.map(({ src }) => (src.geometry as THREE.BufferGeometry).getAttribute('nkdMask').array as Float32Array)
+  const count = arrays.reduce((a, b) => a + b.length, 0)
+  const W = 1024, H = Math.ceil(count / W)
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H
+  const ctx = cv.getContext('2d')!
+  const img = ctx.createImageData(W, H)
+  let k = 0
+  for (const a of arrays) for (let i = 0; i < a.length; i++, k++) {
+    const v = Math.round(a[i] * 255); const o = k * 4
+    img.data[o] = v; img.data[o + 1] = v; img.data[o + 2] = v; img.data[o + 3] = 255
+  }
+  ctx.putImageData(img, 0, 0)
+  return { data: cv.toDataURL('image/png'), count }
+}
+
 /** Rebuild the mirror guide for the current model and axis. A child of `model`, so it
  *  inherits the Load3D placement and the pivot transform for free; the box is measured
  *  in the model's OWN space for the same reason (world matrices would fold the placement
@@ -2112,6 +2388,8 @@ function setMirrorGuide(axis: MirrorAxis) {
 
 function setHelpersVisible(v: boolean) {
   if (mirrorLine) mirrorLine.visible = v
+  if (maskOverlay) maskOverlay.visible = v
+  if (brushRing && !v) brushRing.visible = false   // never in an export; hover brings it back
   for (const e of lightObjs.values()) if (e.helper) e.helper.visible = v
 }
 /** They are only ever toggled as a group, so one of them speaks for all. Needed because
@@ -2191,6 +2469,18 @@ async function capture(width: number, height: number) {
   renderDepthPass(true)
   const depth = r.domElement.toDataURL('image/png')
 
+  // 4. The painted 3D mask, seen from this camera: white where painted, black elsewhere.
+  //    Only when there is paint; an all-black mask would just cost an upload.
+  let paintMask: string | undefined
+  let mask3d: { data: string; count: number } | null = null
+  if (maskHasPaint.value) {
+    scene.overrideMaterial = maskExportMat
+    renderFrame(false)
+    scene.overrideMaterial = null
+    paintMask = r.domElement.toDataURL('image/png')
+    mask3d = packMask3d()
+  }
+
   if (shadowCatcher) shadowCatcher.visible = catcherWasVisible
   if (contactGroup) contactGroup.visible = contactWasVisible
   if (grid) grid.visible = gridWasVisible
@@ -2204,7 +2494,7 @@ async function capture(width: number, height: number) {
   camera.updateProjectionMatrix()
   fitBackground()
 
-  return { scene: scene_, object, depth, camera_info: cameraInfo() }
+  return { scene: scene_, object, depth, paintMask, mask3d, camera_info: cameraInfo() }
 }
 
 async function setSceneDepth(ref: { filename: string; type: string; subfolder: string } | null) {
@@ -2744,7 +3034,7 @@ const GIZMO_KEYS: Record<string, 'translate' | 'rotate' | 'scale'> = {
 }
 let pointerInView = false
 function onViewEnter() { pointerInView = true }
-function onViewLeave() { pointerInView = false }
+function onViewLeave() { pointerInView = false; if (brushRing) brushRing.visible = false }
 function onGizmoKey(ev: KeyboardEvent) {
   if (!popped.value && !pointerInView) return
   if (ev.repeat || ev.ctrlKey || ev.altKey || ev.metaKey || ev.shiftKey) return
@@ -2819,6 +3109,7 @@ onMounted(() => {
 
   initScene()
   controls = new OrbitControls(camera, r.domElement)
+  applyBrushControls()
   controls.enableDamping = true
   controls.dampingFactor = 0.12
   // The key light's world position depends on the camera yaw — track it while orbiting.
@@ -3195,6 +3486,20 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <i class="pi pi-arrow-up-right-and-arrow-down-left-from-center" />
         </button>
       </div>
+      <div class="nkd-overlay" @pointerdown.stop>
+        <span class="nkd-ovsep" />
+        <button :class="{ on: maskPaint }" @click="toggleMaskPaint" :disabled="modelIsSplat"
+                title="Paint a 3D mask on the model: where an inpaint may touch. Left drag paints, Alt or right-drag erases, right drag orbits. Exported as paint_mask (this view) and mask3d (for the bake).">
+          <i class="pi pi-pencil" />
+        </button>
+        <template v-if="maskPaint">
+          <input class="nkd-brush" type="range" min="4" max="200" step="1" v-model.number="brushRadius"
+                 :title="`Brush radius: ${brushRadius}px`" />
+          <button :disabled="!maskHasPaint" @click="clearMask" title="Clear the 3D mask">
+            <i class="pi pi-times" />
+          </button>
+        </template>
+      </div>
       <div class="nkd-overlay nkd-overlay-r" @pointerdown.stop>
         <button v-if="!popped" @click="emit('popout')"
                 title="Open in a large viewer — same scene, nothing reloads">
@@ -3211,6 +3516,11 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
       @contextmenu.prevent
       @pointerenter="onViewEnter"
       @pointerleave="onViewLeave"
+      @pointerdown.capture="onBrushDown"
+      @pointermove.capture="onBrushMove"
+      @pointerup.capture="onBrushUp"
+      @pointercancel.capture="onBrushUp"
+      :class="{ 'nkd-painting': maskPaint }"
     >
     </div>
     </div>
@@ -3358,7 +3668,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
   display: flex; align-items: center; gap: 4px; padding: 4px 6px; flex: 0 0 auto;
   background: #1a1c22; border-bottom: 1px solid #3a3d46;
 }
-.nkd-overlay { display: flex; gap: 4px; }
+.nkd-overlay { display: flex; gap: 4px; align-items: center; }
+.nkd-brush { width: 72px; height: 14px; margin: 0 2px; accent-color: #4ab4ff; }
+.nkd-view.nkd-painting { cursor: crosshair; }
 /* Pop-out sits opposite the view controls: it acts on the WINDOW, not on the scene. */
 .nkd-overlay-r { margin-left: auto; }
 .nkd-ovsep { width: 1px; align-self: stretch; background: #3a3d46; margin: 0 2px; flex: 0 0 auto; }

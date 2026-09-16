@@ -48,6 +48,11 @@ one at a time as you work round the model.
 
 Feed the bake's `mesh` output back into a Preview 3D to look at what you have.
 
+To decide exactly which part of the model gets inpainted, paint it once in 3D in
+the Preview 3D (the pencil in its view tools). Its `paint_mask` output is then the
+inpaint mask for whatever angle you frame, and its `mask3d` output goes into the
+Projection Pass so nothing outside that region is ever touched by that view.
+
 ## 😺NKD Projection Pass
 
 Packages one edited view together with the camera that rendered it.
@@ -74,6 +79,11 @@ Packages one edited view together with the camera that rendered it.
   did not paint. Default 8.
 - `weight` is how much say this pass gets in the merge. 0 mutes it without
   unwiring.
+- `mask3d` is the geometry this view may paint: a mask painted on the model in
+  the Preview 3D. The 2D `mask` says where in the picture to project; this one
+  says what receives it, wherever the pixels land. It is what stops the skin of a
+  face landing on the shoulders behind it. Per pass, so each view can have its
+  own container. It has to come from the same mesh you bake.
 - `mirror` also paints this view across the model's symmetry plane, in its own
   space: `X` mirrors left and right. It is per pass on purpose. A frontal view
   already covers both sides, and mirroring it only doubles it up; the side view

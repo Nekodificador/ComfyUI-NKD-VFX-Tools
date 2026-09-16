@@ -100,6 +100,33 @@ async def _fresh_capture(payload: dict) -> str:
         _PENDING_CAPTURES.pop(token, None)
 
 
+class NKDMask3D:
+    """A mask painted on the model in the viewport: one value per vertex, 0..1.
+
+    The viewport ships it as a grey PNG, one pixel per vertex, 1024 to a row; this is
+    the unpacked form the bake reads, matched to the mesh by vertex count.
+    """
+    def __init__(self, values: torch.Tensor):
+        self.values = values.reshape(-1).float().clamp(0.0, 1.0)
+
+    @property
+    def count(self) -> int:
+        return int(self.values.numel())
+
+
+@comfytype(io_type="NKD_MASK3D")
+class NKDMask3DType(ComfyTypeIO):
+    Type = NKDMask3D
+
+
+def _unpack_mask3d(image: torch.Tensor, count: int) -> NKDMask3D:
+    """Grey image (1,H,W,C) packed row-major, one pixel per vertex -> per-vertex values."""
+    flat = image[0, ..., 0].reshape(-1)
+    if flat.numel() < count:
+        raise ValueError(f"mask3d image holds {flat.numel()} values, the model has {count} vertices")
+    return NKDMask3D(flat[:count])
+
+
 @comfytype(io_type="TRIMESH")
 class TrimeshIO(ComfyTypeIO):
     """Hunyuan3DWrapper & co. hand over a live trimesh.Trimesh under this io_type.
@@ -311,6 +338,14 @@ class NKDPreview3D(io.ComfyNode):
                                 tooltip="Depth, near white to far black. The model's depth composited "
                                         "over the scene's depth map (when one is connected)."),
                 io.Load3DCamera.Output(display_name="camera_info"),
+                io.Mask.Output(display_name="paint_mask",
+                               tooltip="The 3D mask you painted on the model, seen from this "
+                                       "camera: white where an inpaint may touch. Pixel-aligned "
+                                       "with `image`. Black when nothing is painted."),
+                NKDMask3DType.Output(display_name="mask3d",
+                                     tooltip="The same painted mask, whole, for 😺NKD Bake "
+                                             "Projection: it then paints only inside it, "
+                                             "whichever view the paint came from."),
             ],
             # unique_id targets this node's viewport; prompt tells whether anything reads
             # the outputs. Without declaring them here both read back None, silently.
@@ -388,7 +423,7 @@ class NKDPreview3D(io.ComfyNode):
                     "the prompt is queued, so run it once with the model loaded. If this "
                     "persists, the viewport failed to initialise — check the browser console."
                 )
-            return io.NodeOutput(None, None, None, None, camera_info)
+            return io.NodeOutput(None, None, None, None, camera_info, None, None)
 
         load_image = nodes.LoadImage()
         output_image, _ = load_image.load_image(image=capture["image"])
@@ -401,9 +436,19 @@ class NKDPreview3D(io.ComfyNode):
         # Already near-white / far-black: three's BasicDepthPacking emits 1.0 - z, and the
         # viewport clears to black so empty space sits at the far end. Nothing to flip.
         depth_image, _ = load_image.load_image(image=capture["depth"])
+        # The painted 3D mask, if any. Absent means nothing painted: a black mask, no 3D mask.
+        paint_mask = torch.zeros_like(output_mask)
+        mask3d = None
+        if capture.get("paint_mask"):
+            pm, _ = load_image.load_image(image=capture["paint_mask"])
+            paint_mask = pm[..., 0]
+        m3 = capture.get("mask3d")
+        if isinstance(m3, dict) and m3.get("image"):
+            packed, _ = load_image.load_image(image=m3["image"])
+            mask3d = _unpack_mask3d(packed, int(m3.get("count", 0)))
         # The viewport's live camera wins: the user may have orbited since the solve.
         return io.NodeOutput(output_image, object_rgba, output_mask, depth_image,
-                             capture.get("camera_info") or camera_info)
+                             capture.get("camera_info") or camera_info, paint_mask, mask3d)
 
 
 class NKDPreview3DExtension(ComfyExtension):
@@ -494,6 +539,19 @@ def demo():
         kept = tm.visual.vertex_attributes["color"]
         assert kept.shape == rgb.shape and kept.dtype == rgb.dtype, \
             "the caller's mesh must be restored, not left promoted to RGBA"
+
+    # The 3D mask rides as a grey image, one pixel per vertex, 1024 to a row. The last
+    # row is padding; only `count` values are real.
+    vals = torch.rand(2500)
+    img = torch.zeros(1, 3, 1024, 3)
+    img[0, ..., 0].reshape(-1)[:2500] = vals
+    m3 = _unpack_mask3d(img, 2500)
+    assert m3.count == 2500 and torch.allclose(m3.values, vals), "mask3d did not survive packing"
+    try:
+        _unpack_mask3d(img, 5000)
+        raise AssertionError("a short image must not unpack to more vertices than it holds")
+    except ValueError:
+        pass
 
     # Content-addressed temp names: the viewport reloads whenever the ref changes, so
     # identical geometry has to keep the same name or it re-downloads every queue.

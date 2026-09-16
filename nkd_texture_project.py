@@ -104,6 +104,8 @@ class NKDProjPass:
     weight: float = 1.0
     label: str = "pass"
     mirror: str = "none"                     # symmetry axis this VIEW also paints across
+    mask3d: object = None                    # NKDMask3D: the geometry this view may paint
+    point_mask: Optional[torch.Tensor] = None  # mask3d resolved to the bake's points (set by the bake)
 
     def to(self, device):
         """Move every tensor this carries onto `device`.
@@ -212,6 +214,9 @@ def bake_projection(points, normals, passes, base=None, angle_threshold=75.0,
                        falloff=6.0, occlusion=True, occlusion_bias=0.02,
                        density=4.0, to_linear=False, mirror=None):
     # `mirror` is a dict {axis: (origin, normal)}; each pass picks its own axis.
+    # A pass's `point_mask` (N,) in 0..1 is its 3D mask resampled to these points: the
+    # geometry that view is allowed to paint, wherever its pixels land. The 2D mask says
+    # where in the picture; this says what receives it.
     """Merge every pass onto a set of points with normals.
 
     The points are mesh vertices or the covered texels of a UV atlas: the
@@ -297,6 +302,8 @@ def bake_projection(points, normals, passes, base=None, angle_threshold=75.0,
             sil = _sample(p.silhouette.unsqueeze(0), ndc, "zeros")[:, 0].clamp(0.0, 1.0)
             w, a = w * sil, a * sil
 
+        if p.point_mask is not None:
+            w, a = w * p.point_mask, a * p.point_mask
         w = w * float(p.weight)
         colour = _sample(img.permute(2, 0, 1), ndc, "border")
         if to_linear:
@@ -402,10 +409,10 @@ if _HAS_COMFY:
     from comfy_extras.nodes_save_3d import get_mesh_batch_item
 
     try:
-        from .nkd_preview_3d import TrimeshIO, _string_to_model_ref
+        from .nkd_preview_3d import NKDMask3DType, TrimeshIO, _string_to_model_ref
         from .nkd_vfx_helpers import _safe_join
     except ImportError:  # pragma: no cover - standalone (pack dir on sys.path)
-        from nkd_preview_3d import TrimeshIO, _string_to_model_ref
+        from nkd_preview_3d import NKDMask3DType, TrimeshIO, _string_to_model_ref
         from nkd_vfx_helpers import _safe_join
 
     # Core already ships the UV-space rasteriser, the gutter fill and the UV
@@ -549,6 +556,9 @@ if _HAS_COMFY:
 
         pos_map = _interp_vertex_attr(verts, faces, face_idx, bary, cov)
         nrm_map = _interp_vertex_attr(normals, faces, face_idx, bary, cov)
+        # Each pass's per-vertex mask becomes a per-texel one through the same
+        # interpolation as position and normal, restricted to the covered texels.
+        vertex_masks = kw.pop("vertex_masks", {})
 
         base = parts["texture"]
         had_texture = base is not None
@@ -564,6 +574,11 @@ if _HAS_COMFY:
 
         idx = cov.reshape(-1).nonzero(as_tuple=True)[0]
         flat = tex.reshape(-1, 3)
+        for p in passes:
+            vm = vertex_masks.get(id(p))
+            p.point_mask = (None if vm is None else
+                            _interp_vertex_attr(vm.to(device).reshape(-1, 1), faces, face_idx,
+                                                bary, cov).reshape(-1)[idx])
         colours, painted, shares = bake_projection(
             pos_map.reshape(-1, 3)[idx], nrm_map.reshape(-1, 3)[idx], passes,
             base=flat[idx], **kw)
@@ -644,6 +659,11 @@ if _HAS_COMFY:
                     io.Float.Input("weight", default=1.0, min=0.0, max=10.0, step=0.05,
                                    tooltip="Multiplies this pass's say in the merge. 0 "
                                            "mutes it without unwiring."),
+                    NKDMask3DType.Input("mask3d", optional=True,
+                                        tooltip="The geometry this view may paint: a mask painted "
+                                                "on the model in 😺NKD Preview 3D. The 2D mask says "
+                                                "where in the picture; this says what receives it, "
+                                                "wherever the pixels land. Same mesh as the bake."),
                     io.Combo.Input("mirror", options=["none", "X", "Y", "Z"], default="none",
                                    optional=True,
                                    tooltip="Also paint across the model's symmetry plane, in "
@@ -661,7 +681,8 @@ if _HAS_COMFY:
 
         @classmethod
         def execute(cls, image, camera_info, weight=1.0, feather=8, mask=None,
-                    silhouette=None, silhouette_erode=4, mirror="none") -> io.NodeOutput:
+                    silhouette=None, silhouette_erode=4, mirror="none",
+                    mask3d=None) -> io.NodeOutput:
             img = image[0, ..., :3].float()
             height, width = img.shape[0], img.shape[1]
 
@@ -696,7 +717,7 @@ if _HAS_COMFY:
 
             return io.NodeOutput(NKDProjPass(image=img, camera=camera_info or {},
                                              mask=m, silhouette=sil, weight=float(weight),
-                                             mirror=str(mirror)))
+                                             mirror=str(mirror), mask3d=mask3d))
 
     class NKDBakeProjection(io.ComfyNode):
         @classmethod
@@ -793,6 +814,20 @@ if _HAS_COMFY:
             knobs = dict(angle_threshold=angle_threshold, falloff=falloff,
                          occlusion=occlusion, occlusion_bias=occlusion_bias,
                          mirror=planes or None)
+            # Each pass's 3D mask, checked against THIS mesh. Per pass, like the 2D mask:
+            # the picture decides where to project, the container decides what receives it.
+            n_v = int(parts["vertices"].shape[0])
+            vertex_masks = {}
+            for p in live:
+                p.point_mask = None
+                m3 = p.mask3d
+                if m3 is None:
+                    continue
+                if getattr(m3, "count", -1) != n_v:
+                    raise ValueError(
+                        f"{p.label}: its mask3d was painted on a mesh with {getattr(m3, 'count', '?')} "
+                        f"vertices, this one has {n_v}: paint it on the same mesh you bake")
+                vertex_masks[id(p)] = m3.values.to(device)
 
             # Placement applies to what we PROJECT against, never to what we return.
             geo = _placed(parts, model_3d_info)
@@ -800,7 +835,7 @@ if _HAS_COMFY:
             why = _no_uv_reason(parts)
             if why is None:
                 tex, hit, total, shares = bake_to_texture(
-                    geo, live, texture_size, device, **knobs)
+                    geo, live, texture_size, device, vertex_masks=vertex_masks, **knobs)
                 out = _rebuild(parts, texture=tex)
                 what = f"texture {tex.shape[1]}x{tex.shape[0]}"
                 was = parts["texture"]
@@ -817,6 +852,9 @@ if _HAS_COMFY:
                 normals = (_vertex_normals(verts, faces) if normals is None
                            else normals.to(device))
                 base = parts["colors"]
+                for p in live:
+                    vm = vertex_masks.get(id(p))
+                    p.point_mask = None if vm is None else vm
                 colours, painted, shares = bake_projection(
                     verts, normals, live, base=None if base is None else base.to(device),
                     to_linear=True, **knobs)
@@ -829,10 +867,16 @@ if _HAS_COMFY:
 
             lines = [f"{len(live)} pass(es) into {what}",
                      f"{hit}/{total} painted ({100.0 * hit / max(total, 1):.1f}%)"]
-            axes = {p.label: str(p.mirror).upper() for p in live}
-            lines += [f"  {name}: {reach} reached"
-                      + (f" (mirrored across {axes[name]})" if axes.get(name) in ("X", "Y", "Z") else "")
-                      for name, reach in shares]
+            tags = {}
+            for p in live:
+                t = []
+                if str(p.mirror).upper() in ("X", "Y", "Z"):
+                    t.append(f"mirrored across {str(p.mirror).upper()}")
+                vm = vertex_masks.get(id(p))
+                if vm is not None:
+                    t.append(f"3D mask on {100.0 * float((vm > 0.5).float().mean()):.1f}% of vertices")
+                tags[p.label] = f" ({', '.join(t)})" if t else ""
+            lines += [f"  {name}: {reach} reached{tags.get(name, '')}" for name, reach in shares]
             return io.NodeOutput(out, _as_image(tex), "\n".join(lines))
 
     def _no_uv_reason(parts):
@@ -1246,6 +1290,51 @@ def demo():
                                                "w": math.cos(math.pi / 4)}}])
     assert torch.allclose(o, torch.tensor([1.0, 2.0, 3.0])) and torch.allclose(n.abs(), torch.tensor([0.0, 1.0, 0.0]), atol=1e-6), (o, n)
     assert _mirror_plane("none") is None
+
+    # 21. The 3D mask gates by POINT, whatever the view: a head-on red pass with a
+    #     point mask that allows only x<0 paints exactly that half, and the mirror
+    #     cannot smuggle paint into the masked-out side either.
+    sheet = _grid(20)
+    sheet_n = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32).expand(len(sheet), 3)
+    pm = (sheet[:, 0] < 0).float()
+    red = NKDProjPass(image=_flat([1.0, 0.0, 0.0]), camera=_cam((0.0, 0.0, 3.0)), mirror="X",
+                      point_mask=pm)
+    _, hit, _ = bake_projection(sheet, sheet_n, [red], occlusion=False, mirror={"X": _mirror_plane("X")})
+    assert hit[sheet[:, 0] < -0.01].all() and not hit[sheet[:, 0] > 0.01].any(), \
+        "the point mask must confine paint to its own points, mirrored or not"
+    # It is PER PASS: a second, unmasked pass still paints the other half.
+    blue = NKDProjPass(image=_flat([0.0, 0.0, 1.0]), camera=_cam((0.0, 0.0, 3.0)))
+    col, hit2, _ = bake_projection(sheet, sheet_n, [red, blue], occlusion=False)
+    assert hit2.all(), "an unmasked pass must not inherit another pass's container"
+    assert (col[sheet[:, 0] > 0.01][:, 2] > 0.99).all(), "the right half must come from the unmasked pass only"
+    # Half strength in the mask is half a blend.
+    grey = torch.full((1, 3), 0.5)
+    axis = torch.zeros((1, 3)); up = torch.tensor([[0.0, 0.0, 1.0]])
+    half = NKDProjPass(image=_flat([1.0, 0.0, 0.0]), camera=_cam((0.0, 0.0, 3.0)), point_mask=torch.tensor([0.5]))
+    c, _, _ = bake_projection(axis, up, [half], base=grey, occlusion=False)
+    assert abs(c[0, 0].item() - 0.75) < 1e-4, f"a 0.5 point mask should give a half blend, got {c[0]}"
+
+    # 22. Texture path: the per-vertex mask reaches the texels through the same
+    #     interpolation as position, so only the masked charts are written.
+    if _HAS_COMFY and _HAS_UV_BAKE:
+        k = 9
+        t9 = torch.linspace(-0.5, 0.5, k)
+        gy, gx = torch.meshgrid(t9, t9, indexing="ij")
+        pv = torch.stack([gx.reshape(-1), gy.reshape(-1), torch.zeros(k * k)], -1)
+        puv = torch.stack([gx.reshape(-1) + 0.5, gy.reshape(-1) + 0.5], -1)
+        quads = [[r * k + c, r * k + c + 1, (r + 1) * k + c,
+                  r * k + c + 1, (r + 1) * k + c + 1, (r + 1) * k + c]
+                 for r in range(k - 1) for c in range(k - 1)]
+        pf = torch.tensor(quads, dtype=torch.int64).reshape(-1, 3)
+        parts = {"vertices": pv, "faces": pf, "uvs": puv, "normals": _vertex_normals(pv, pf),
+                 "colors": None, "texture": torch.zeros(32, 32, 3), "source": None}
+        left_only = (pv[:, 0] < 0).float()
+        red2 = NKDProjPass(image=_flat([1.0, 0.0, 0.0]), camera=_cam_orbit(3.0, 0.0, fov=40.0))
+        tex, hit, total, _ = bake_to_texture(dict(parts), [red2], 32, torch.device("cpu"),
+                                             occlusion=False, vertex_masks={id(red2): left_only})
+        cols_red = (tex[..., 0] > 0.5).any(dim=0)
+        assert cols_red[:12].all() and not cols_red[20:].any(), \
+            f"the 3D mask did not confine the texture bake to the left charts: {cols_red.tolist()}"
 
     print("nkd_texture_project self-check OK")
 

@@ -51,6 +51,20 @@ the two distances land.
 With no depth map connected it fits to the object itself, so the depth output stays usable
 even when the model is all there is.
 
+## Painting a 3D mask
+
+The pencil in the view tools turns the viewport into a brush. Paint on the model
+the region an inpaint may touch: left drag paints, Alt or right drag erases, the
+slider sets the radius, and the right button still orbits. The brush is a sphere
+under the cursor, so it does not paint through to the far side.
+
+That mask leaves the node twice. `paint_mask` is the mask of the current view,
+pixel-aligned with `image`, so every angle gets its own inpaint mask from the one
+you painted. `mask3d` is the whole thing, for the
+[😺NKD Projection Pass](projection-painting.md), which then paints only that
+geometry wherever its pixels land. The mask lives in the viewport, not in
+the workflow file: it survives reloading the page, not restarting ComfyUI.
+
 ## Mirror guide
 
 The Object panel can draw the model's symmetry plane as a dotted outline, X, Y or

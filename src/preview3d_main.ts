@@ -77,12 +77,17 @@ function hashStr(s: string): string {
 }
 
 async function uploadShot(shot: any) {
-  const [image, object, depth] = await Promise.all([
+  const [image, object, depth, paint_mask, mask3dImage] = await Promise.all([
     uploadTempImage(shot.scene, 'scene'),
     uploadTempImage(shot.object, 'scene_object'),
     uploadTempImage(shot.depth, 'scene_depth'),
+    shot.paintMask ? uploadTempImage(shot.paintMask, 'scene_paintmask') : Promise.resolve(undefined),
+    shot.mask3d ? uploadTempImage(shot.mask3d.data, 'scene_mask3d') : Promise.resolve(undefined),
   ])
-  return JSON.stringify({ image, object, depth, camera_info: shot.camera_info })
+  const out: any = { image, object, depth, camera_info: shot.camera_info }
+  if (paint_mask) out.paint_mask = paint_mask
+  if (mask3dImage) out.mask3d = { image: mask3dImage, count: shot.mask3d.count }
+  return JSON.stringify(out)
 }
 
 async function uploadTempImage(dataUrl: string, prefix: string) {
@@ -379,9 +384,10 @@ comfyApp.registerExtension({
       let lastRenderHash = ''
       let lastValue = ''
 
+      // The painted mask is part of the export: a brush stroke has to re-run the node.
       const shotHash = (shot: any, width: number, height: number) => hashStr(
         `${width}x${height}|${JSON.stringify(shot.camera_info)}|` +
-        `${shot.scene}${shot.object}${shot.depth}`
+        `${shot.scene}${shot.object}${shot.depth}${shot.paintMask ?? ''}`
       )
 
       const onScene = async (e: any) => {
