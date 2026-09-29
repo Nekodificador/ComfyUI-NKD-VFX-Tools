@@ -34,6 +34,8 @@ unlit fog goes dark, the way real haze behaves. Every slider resets on double-cl
 makes any drag ten times finer, and *Reset* next to *Clear* puts the whole node back to its
 defaults, lights included.
 
+**Large editor.** The window button on the node opens the same node in a full-size editor: the image on the left, every light and section open at once on the right. Nothing reloads and nothing is duplicated; closing it hands the node back as it was. *Run node* queues it from inside. Hold *Original* (in either view) to see the plate without the relight.
+
 The point is to settle the lighting before the model gets a say. Relight the plate, then
 send it downstream as your img2img base or ControlNet reference, and the generation
 inherits your key light instead of inventing one.

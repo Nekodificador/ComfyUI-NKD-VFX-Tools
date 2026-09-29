@@ -10,17 +10,19 @@ import { app as comfyApp } from "../../scripts/app.js";
 // @ts-ignore – resolved at runtime by ComfyUI
 import { api } from "../../scripts/api.js";
 import RelightingCanvas from "@/components/RelightingCanvas.vue";
+import { openNkdModal, nkdButton, type NkdModal } from "@/nkd_modal";
+import { queueNode } from "@/queueNode";
 
 const NODE_NAME = "RelightingNode";
 const EXT_NAME  = "NKD.Relighting.Vue";
 
-function keepDomWidgetSized(node: any, container: HTMLElement): () => void {
+function keepDomWidgetSized(node: any, container: HTMLElement, active: () => boolean): () => void {
   const MAX_MARGIN = 40;
   let enforcingW = false;
   let goodMargin = 15;
   const vueMode = () => !!(window as any).LiteGraph?.vueNodesMode;
   const clamp = () => {
-    if (enforcingW) return;
+    if (enforcingW || !active()) return;  // popped out: the modal, not the node, sizes it
     if (vueMode()) { if (container.style.width) container.style.width = ""; return; }
     const nodeW = node.size?.[0]; if (!nodeW) return;
     const host = container.parentElement;
@@ -107,7 +109,59 @@ comfyApp.registerExtension({
         nodeRef.setDirtyCanvas(true);
       };
 
-      const vueApp = createApp(RelightingCanvas, { onChange });
+      // ── Pop-out ───────────────────────────────────────────────────────────
+      // ONE live instance, moved: re-parenting the mount container keeps the WebGL
+      // context, the passes and every setting (same pattern as Preview 3D). The node keeps a
+      // placeholder in its reserved row so it does not read as a broken empty box.
+      let modal: NkdModal | null = null;
+      let placeholder: HTMLDivElement | null = null;
+      let nodeSlot: HTMLElement | null = null;
+      const popOut = () => {
+        if (modal) return;
+        modal = openNkdModal({
+          title: "😺 NKD Relight",
+          hint: "same node as the graph — drag lights on the image, tune everything on the right",
+          onClose: () => {
+            if (nodeSlot && container.parentElement !== nodeSlot) nodeSlot.appendChild(container);
+            container.style.height = "";
+            container.style.flex = "";
+            placeholder?.remove();
+            placeholder = null;
+            modal = null;   // cleared before the widget re-measures: the observer ignores popped sizes
+            instance.setPopped(false);
+            requestAnimationFrame(() => nodeRef.setDirtyCanvas(true, true));
+          },
+        });
+        nodeSlot = container.parentElement as HTMLElement | null;
+        if (nodeSlot) {
+          placeholder = document.createElement("div");
+          placeholder.textContent = "Open in the editor";
+          placeholder.style.cssText =
+            "display:flex;align-items:center;justify-content:center;width:100%;height:100%;" +
+            "box-sizing:border-box;color:rgba(255,255,255,0.35);font-size:11px;" +
+            "background:#111318;border:1px dashed #3a3d46;border-radius:4px;";
+          nodeSlot.appendChild(placeholder);
+        }
+        container.style.height = "100%";
+        container.style.flex = "1 1 auto";
+        modal.body.appendChild(container);
+        // The frontend's DOM-widget host re-attaches its element on some re-layouts; if it
+        // takes the container back in the first moments, put it in the modal again.
+        const hold = (n: number) => {
+          if (!modal) return;
+          if (container.parentElement !== modal.body) modal.body.appendChild(container);
+          if (n > 0) requestAnimationFrame(() => hold(n - 1));
+        };
+        hold(90);
+        // Light edits are live in the preview; this re-runs the node so the real output (and
+        // everything downstream) matches what you see. Upstream stays cached.
+        modal.footerLeft.appendChild(nkdButton("Run node", () => { void queueNode(nodeRef, "NKD Relight"); },
+          "Queue this node now — lights are already live in the preview"));
+        modal.addPrimary("Done");
+        instance.setPopped(true);
+      };
+
+      const vueApp = createApp(RelightingCanvas, { onChange, onPopout: popOut });
       const instance = vueApp.mount(container) as InstanceType<
         typeof RelightingCanvas
       >;
@@ -126,7 +180,7 @@ comfyApp.registerExtension({
           serialize: false,
         }
       );
-      const _nkdW = keepDomWidgetSized(this, container);
+      const _nkdW = keepDomWidgetSized(this, container, () => !modal);
 
       const MIN_W = 300;
       // Small margin so the node body reaches past the content — the canvas renderer
@@ -151,6 +205,8 @@ comfyApp.registerExtension({
       const inner = (container.firstElementChild as HTMLElement | null) ?? container;
       let resizeRAF = 0;
       const ro = new ResizeObserver(() => {
+        // Popped out, the content is as tall as the modal — measuring that would inflate the node.
+        if (modal) return;
         const h = inner.offsetHeight;
         if (h > 0 && Math.abs(h - measuredH) > 1) {
           measuredH = h;
@@ -210,6 +266,7 @@ comfyApp.registerExtension({
       // Clean up Vue app and listeners when node is removed
       const origRemoved = this.onRemoved;
       this.onRemoved = function (this: any) {
+        modal?.close();
         _nkdW();
         ro.disconnect();
         if (resizeRAF) cancelAnimationFrame(resizeRAF);

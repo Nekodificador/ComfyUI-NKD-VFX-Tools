@@ -1,7 +1,23 @@
 <template>
-  <div class="rl-root" ref="rootEl">
-    <!-- Preview canvas area -->
-    <div class="rl-canvas-wrap" ref="canvasWrap" :style="{ aspectRatio: canvasAspectRatio }">
+  <div class="rl-root" :class="{ 'rl-popped': popped }" ref="rootEl">
+    <!-- Tool row: compare against the untouched plate, open the large editor -->
+    <div class="rl-tools">
+      <button class="rl-tool" :class="{ on: comparing }" :disabled="!hasPasses"
+              title="Hold to see the original image without the relight"
+              @pointerdown.prevent="setCompare(true, $event)" @pointerup="setCompare(false)"
+              @pointercancel="setCompare(false)" @lostpointercapture="setCompare(false)">
+        <i class="pi pi-eye" /> Original
+      </button>
+      <span class="rl-tools-gap" />
+      <button v-if="!popped && props.onPopout" class="rl-tool" title="Open in a large editor — same node, nothing reloads"
+              @click="props.onPopout()">
+        <i class="pi pi-window-maximize" />
+      </button>
+    </div>
+
+    <!-- Preview canvas area (letterboxed in the stage when popped out) -->
+    <div class="rl-stage" ref="stageEl">
+    <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle">
       <canvas ref="canvas" class="rl-canvas" @mousedown="onCanvasMouseDown" @click="onCanvasClick" @mousemove="onCanvasMove" @mouseup="onMouseUp" />
       <!-- Draggable point-light indicators -->
       <div
@@ -25,6 +41,7 @@
         </div>
       </Transition>
     </div>
+    </div>
 
     <!-- Controls -->
     <div class="rl-controls">
@@ -44,14 +61,14 @@
         :class="{ selected: light.id === selectedId }"
       >
         <div class="rl-sec-head" @click="selectLight(light.id)">
-          <span class="rl-chev" :class="{ open: light.id === selectedId }">▸</span>
+          <span class="rl-chev" :class="{ open: popped || light.id === selectedId }">▸</span>
           <i class="pi rl-light-icon" :class="light.type === 'point' ? 'pi-lightbulb' : 'pi-sun'" />
           <span class="rl-sec-title">{{ light.type === 'point' ? 'Point' : 'Dir' }} {{ (idx as number) + 1 }}</span>
           <input class="rl-swatch" type="color" v-model="light.color" @input="emit" @click.stop />
           <button class="rl-x" @click.stop="removeLight(light.id)">×</button>
         </div>
 
-        <div class="rl-sec-body" v-if="light.id === selectedId">
+        <div class="rl-sec-body" v-if="popped || light.id === selectedId">
           <div class="rl-field">
             <span class="rl-flabel">Intensity</span>
             <input class="rl-range" data-default="1" :style="rangeStyle(light.intensity, 0, 2)" type="range" min="0" max="2" step="0.05" v-model.number="light.intensity" @input="emit" @click.stop />
@@ -120,11 +137,11 @@
       <!-- Ambient section -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('ambient')">
-          <span class="rl-chev" :class="{ open: openSections.ambient }">▸</span>
+          <span class="rl-chev" :class="{ open: secOpen('ambient') }">▸</span>
           <span class="rl-sec-title">Ambient</span>
           <input class="rl-swatch" type="color" v-model="ambientColor" @input="emit" @click.stop />
         </div>
-        <div class="rl-sec-body" v-if="openSections.ambient">
+        <div class="rl-sec-body" v-if="secOpen('ambient')">
           <div class="rl-field">
             <span class="rl-flabel">Intensity</span>
             <input class="rl-range" data-default="0.2" :style="rangeStyle(ambientIntensity, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="ambientIntensity" @input="emit" />
@@ -136,10 +153,10 @@
       <!-- Material section (only when albedo/roughness passes exist) -->
       <div class="rl-section" v-if="hasAlbedo || hasRoughness">
         <div class="rl-sec-head" @click="toggleSection('material')">
-          <span class="rl-chev" :class="{ open: openSections.material }">▸</span>
+          <span class="rl-chev" :class="{ open: secOpen('material') }">▸</span>
           <span class="rl-sec-title">Material</span>
         </div>
-        <div class="rl-sec-body" v-if="openSections.material">
+        <div class="rl-sec-body" v-if="secOpen('material')">
           <div class="rl-field" v-if="hasAlbedo">
             <span class="rl-flabel">Delight</span>
             <input class="rl-range" data-default="0" :style="rangeStyle(delitMix, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="delitMix" @input="emit" />
@@ -156,14 +173,14 @@
       <!-- Shadows section -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('shadows')">
-          <span class="rl-chev" :class="{ open: openSections.shadows }">▸</span>
+          <span class="rl-chev" :class="{ open: secOpen('shadows') }">▸</span>
           <span class="rl-sec-title">Shadows</span>
           <label class="rl-switch" @click.stop>
             <input type="checkbox" v-model="shadowsEnabled" @change="emit" />
             <span class="rl-switch-track"><span class="rl-switch-thumb"></span></span>
           </label>
         </div>
-        <div class="rl-sec-body" v-if="openSections.shadows" :class="{ disabled: !shadowsEnabled }">
+        <div class="rl-sec-body" v-if="secOpen('shadows')" :class="{ disabled: !shadowsEnabled }">
           <div class="rl-field">
             <span class="rl-flabel">Strength</span>
             <input class="rl-range" data-default="0.6" :style="rangeStyle(shadowStrength, 0, 1)" :disabled="!shadowsEnabled" type="range" min="0" max="1" step="0.01" v-model.number="shadowStrength" @input="emit" />
@@ -185,11 +202,11 @@
       <!-- Look section: post-process on the lit image (exposure, white balance, saturation, haze) -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('look')">
-          <span class="rl-chev" :class="{ open: openSections.look }">▸</span>
+          <span class="rl-chev" :class="{ open: secOpen('look') }">▸</span>
           <span class="rl-sec-title">Look</span>
-          <input class="rl-swatch" type="color" v-model="hazeColor" @input="emit" @click.stop title="Haze colour" />
         </div>
-        <div class="rl-sec-body" v-if="openSections.look">
+        <div class="rl-sec-body" v-if="secOpen('look')">
+          <div class="rl-subhead">Grade</div>
           <div class="rl-field" title="Stops. Applied after the lights, so it scales ambient too.">
             <span class="rl-flabel">Exposure</span>
             <input class="rl-range" data-default="0" :style="rangeStyle(lookExposure, -3, 3)" type="range" min="-3" max="3" step="0.05" v-model.number="lookExposure" @input="emit" />
@@ -209,6 +226,9 @@
             <span class="rl-flabel">Saturation</span>
             <input class="rl-range" data-default="1" :style="rangeStyle(lookSaturation, 0, 2)" type="range" min="0" max="2" step="0.01" v-model.number="lookSaturation" @input="emit" />
             <span class="rl-fval">{{ lookSaturation.toFixed(2) }}</span>
+          </div>
+          <div class="rl-subhead">Haze
+            <input class="rl-swatch" type="color" v-model="hazeColor" @input="emit" title="Haze colour" />
           </div>
           <div class="rl-field" title="Atmospheric haze from the depth pass: the further the pixel, the more of the haze colour it gets.">
             <span class="rl-flabel">Haze</span>
@@ -299,7 +319,7 @@ interface PassData {
   height: number;
 }
 
-const props = defineProps<{ onChange: (json: string) => void }>();
+const props = defineProps<{ onChange: (json: string) => void; onPopout?: () => void }>();
 
 const lights              = ref<Light[]>([]);
 const selectedId          = ref<number | null>(null);
@@ -336,7 +356,45 @@ const canvas            = ref<HTMLCanvasElement | null>(null);
 const rootEl            = ref<HTMLElement | null>(null);
 let detachFine: (() => void) | null = null;
 const canvasWrap        = ref<HTMLDivElement | null>(null);
-const canvasAspectRatio = ref("16 / 9");
+const passAspect        = ref(16 / 9);
+const canvasAspectRatio = computed(() => `${passAspect.value}`);
+const stageEl           = ref<HTMLDivElement | null>(null);
+
+// ── Pop-out ─────────────────────────────────────────────────────────────────
+// The node's host moves this whole mount into the shared modal (main.ts). Popped, every
+// section is open at once in a sidebar and the canvas is letterboxed into the stage — the
+// export aspect rules, so the preview is never stretched to the modal's shape.
+const popped = ref(false);
+const fit = ref<{ w: number; h: number } | null>(null);
+const wrapStyle = computed(() =>
+  popped.value && fit.value
+    ? { width: fit.value.w + "px", height: fit.value.h + "px" }
+    : { aspectRatio: canvasAspectRatio.value });
+function measureFit() {
+  const st = stageEl.value;
+  if (!popped.value || !st) { fit.value = null; return; }
+  const availW = st.clientWidth - 24, availH = st.clientHeight - 24;
+  if (availW <= 0 || availH <= 0) return;
+  const a = passAspect.value;
+  const w = Math.min(availW, availH * a);
+  fit.value = { w: Math.floor(w), h: Math.floor(w / a) };
+}
+function setPopped(v: boolean) {
+  popped.value = v;
+  nextTick(() => { measureFit(); scheduleRedraw(); });
+}
+// Sections are independent toggles in the node; popped, they are all open.
+const secOpen = (k: "ambient" | "material" | "shadows" | "look") => popped.value || openSections.value[k];
+
+// ── Compare: hold to see the plate as it came in ───────────────────────────
+const comparing = ref(false);
+const hasPasses = ref(false);
+function setCompare(on: boolean, e?: PointerEvent) {
+  if (on && e) (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+  if (comparing.value === on) return;
+  comparing.value = on;
+  scheduleRedraw();
+}
 
 // Pass data received from backend — kept outside Vue reactivity (large buffers)
 let passRgb:       Uint8Array | null = null;
@@ -362,6 +420,7 @@ const openSections = ref<{ ambient: boolean; material: boolean; shadows: boolean
   look: false,
 });
 function toggleSection(key: "ambient" | "material" | "shadows" | "look") {
+  if (popped.value) return;  // all open in the sidebar
   openSections.value[key] = !openSections.value[key];
 }
 
@@ -584,7 +643,8 @@ function resetAll() {
 }
 
 function selectLight(id: number) {
-  selectedId.value = selectedId.value === id ? null : id;
+  // Popped, every light is expanded, so a second click has nothing to collapse.
+  selectedId.value = !popped.value && selectedId.value === id ? null : id;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1273,6 +1333,19 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
   ctx.putImageData(imgData, 0, 0);
 }
 
+// The plate as received (RGB pass, no lights) — the "Original" compare.
+function renderOriginal(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  if (!passRgb) return;
+  const im = ctx.createImageData(W, H);
+  for (let i = 0, j = 0, n = W * H; i < n; i++) {
+    im.data[j++] = passRgb[i * 3];
+    im.data[j++] = passRgb[i * 3 + 1];
+    im.data[j++] = passRgb[i * 3 + 2];
+    im.data[j++] = 255;
+  }
+  ctx.putImageData(im, 0, 0);
+}
+
 // ── Canvas preview ───────────────────────────────────────────────────────────
 function drawPreview() {
   const cv = canvas.value;
@@ -1290,7 +1363,9 @@ function drawPreview() {
     cv.width  = passW;
     cv.height = passH;
 
-    if (glReady && !gl?.isContextLost()) {
+    if (comparing.value) {
+      renderOriginal(ctx, passW, passH);
+    } else if (glReady && !gl?.isContextLost()) {
       renderWebGL(ctx, passW, passH);
     } else if (passRgb) {
       // Try to init WebGL once we have pass dimensions
@@ -1306,14 +1381,17 @@ function drawPreview() {
 
   canvasDisplayScale = wrap && wrap.clientWidth > 0 ? cv.width / wrap.clientWidth : 1;
 
-  // HUD
+  // HUD — sized by the display scale, or it shrinks to nothing on a 2K pass shown small
+  const hs = canvasDisplayScale;
   ctx.fillStyle = "rgba(255,255,255,0.7)";
-  ctx.font = "11px monospace";
-  ctx.fillText(`Lights: ${lights.value.length}/3`, 8, 16);
-  if (glReady) {
+  ctx.font = `${Math.round(11 * hs)}px monospace`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(comparing.value ? "Original" : `Lights: ${lights.value.length}/3`, 8 * hs, 16 * hs);
+  if (glReady && !comparing.value) {
     ctx.fillStyle = "rgba(100,220,100,0.5)";
-    ctx.font = "10px monospace";
-    ctx.fillText("WebGL", cv.width - 44, 14);
+    ctx.font = `${Math.round(10 * hs)}px monospace`;
+    ctx.fillText("WebGL", cv.width - 44 * hs, 14 * hs);
   }
   if (!passRgb) {
     ctx.fillStyle = "rgba(255,255,255,0.3)";
@@ -1321,6 +1399,7 @@ function drawPreview() {
     ctx.fillText("Execute graph to enable real-time preview", 8, H - 8);
   }
 
+  if (comparing.value) return;  // plate only: no gizmos on top of the comparison
   drawSemicircleWidgets(ctx, cv.width, cv.height);
   const selDir = lights.value.find((l: Light) => l.id === selectedId.value && l.type === "directional");
   if (selDir) {
@@ -1522,7 +1601,9 @@ function renderFallback(ctx: CanvasRenderingContext2D, W: number, H: number) {
 function setPasses(data: PassData) {
   passW = data.width;
   passH = data.height;
-  canvasAspectRatio.value = `${passW} / ${passH}`;
+  passAspect.value = passW / passH;
+  hasPasses.value = true;
+  if (popped.value) nextTick(measureFit);
 
   passRgb     = decodeB64(data.rgb);
   passNormals = decodeB64(data.normals);
@@ -1632,14 +1713,58 @@ function setProcessing(val: boolean) {
   isProcessing.value = val;
 }
 
-defineExpose({ serialise, deserialise, setPasses, setProcessing });
+defineExpose({ serialise, deserialise, setPasses, setProcessing, setPopped });
+
+// The arcs and HUD are sized by displayed pixels, so a resize (window, modal, node) redraws.
+let stageRO: ResizeObserver | null = null;
+let wrapRO: ResizeObserver | null = null;
+// Click a slider's readout to type an exact value. Delegated, so the ~30 readouts need no
+// template change; the span stays (Vue owns it) and is hidden while an input sits beside it.
+// The value goes through the range input's own `input` event, so v-model and emit() run as
+// for a drag. step="any" for the write, or the range would snap what was typed.
+function editReadout(e: MouseEvent) {
+  const el = (e.target as HTMLElement).closest(".rl-fval") as HTMLElement | null;
+  if (!el || el.classList.contains("rl-fval-wide") || el.nextElementSibling?.classList.contains("rl-fval-edit")) return;
+  const rng = el.parentElement?.querySelector("input.rl-range") as HTMLInputElement | null;
+  if (!rng || rng.disabled) return;
+  const box = document.createElement("input");
+  box.className = "rl-fval-edit";
+  box.value = String(Math.round(parseFloat(rng.value) * 1e4) / 1e4);
+  el.style.display = "none";
+  el.after(box);
+  box.focus(); box.select();
+  let done = false;
+  const finish = (commit: boolean) => {
+    if (done) return; done = true;
+    const v = parseFloat(box.value.replace(",", "."));
+    box.remove(); el.style.display = "";
+    if (!commit || !isFinite(v)) return;
+    const step = rng.step;
+    rng.step = "any";
+    rng.value = String(Math.min(+rng.max, Math.max(+rng.min, v)));
+    rng.dispatchEvent(new Event("input", { bubbles: true }));
+    rng.step = step;
+  };
+  box.addEventListener("keydown", (k) => {
+    k.stopPropagation();  // W/R/Delete... are ComfyUI shortcuts
+    if (k.key === "Enter") finish(true);
+    else if (k.key === "Escape") { k.preventDefault(); finish(false); }
+  });
+  box.addEventListener("blur", () => finish(true));
+}
 
 onMounted(() => {
+  rootEl.value?.addEventListener("click", editReadout);
   if (rootEl.value) detachFine = attachFineRange(rootEl.value);
+  if (stageEl.value) { stageRO = new ResizeObserver(measureFit); stageRO.observe(stageEl.value); }
+  if (canvasWrap.value) { wrapRO = new ResizeObserver(scheduleRedraw); wrapRO.observe(canvasWrap.value); }
   nextTick(drawPreview);
 });
 
 onUnmounted(() => {
+  rootEl.value?.removeEventListener("click", editReadout);
+  stageRO?.disconnect();
+  wrapRO?.disconnect();
   detachFine?.();
   destroyWebGL();
   if (rafId !== null) cancelAnimationFrame(rafId);
@@ -1661,6 +1786,76 @@ onUnmounted(() => {
    from overflowing the node and "bleeding" past its border. */
 .rl-root, .rl-root * , .rl-root *::before, .rl-root *::after {
   box-sizing: border-box;
+}
+
+/* ── Tool row ──────────────────────────────────────────────────────────────── */
+.rl-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-color, #374151);
+}
+.rl-tools-gap { flex: 1 1 auto; }
+.rl-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border-color, #374151);
+  border-radius: 5px;
+  background: var(--comfy-input-bg, #1e293b);
+  color: var(--input-text, #e5e7eb);
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+.rl-tool .pi { font-size: 12px; }
+.rl-tool:hover:not(:disabled) { border-color: var(--p-primary-color, #3b82f6); }
+.rl-tool.on { border-color: var(--p-primary-color, #3b82f6); color: var(--p-primary-color, #3b82f6); }
+.rl-tool:disabled { opacity: 0.4; cursor: default; }
+
+/* ── Popped out: canvas left, every panel in a full-height sidebar ─────────── */
+.rl-popped {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  border-radius: 0;
+}
+.rl-popped .rl-tools { grid-column: 1; grid-row: 1; }
+.rl-popped .rl-stage {
+  grid-column: 1; grid-row: 2;
+  display: flex; align-items: center; justify-content: center;
+  min-width: 0; min-height: 0; overflow: hidden;
+  background: #0b0d12;
+}
+.rl-popped .rl-canvas-wrap { flex: 0 0 auto; }
+.rl-popped .rl-controls {
+  grid-column: 2; grid-row: 1 / span 2;
+  overflow-y: auto;
+  border-left: 1px solid var(--border-color, #374151);
+}
+.rl-canvas-wrap.comparing .rl-light-dot { opacity: 0 !important; }
+
+.rl-fval { cursor: text; }
+.rl-fval-wide { cursor: default; }
+.rl-root :deep(.rl-fval-edit) {
+  width: 46px; padding: 0 3px; font: inherit; text-align: right;
+  background: var(--comfy-input-bg, #1e293b); color: var(--input-text, #e5e7eb);
+  border: 1px solid var(--p-primary-color, #3b82f6); border-radius: 3px; outline: none;
+}
+
+.rl-subhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--descrip-text, #9ca3af);
 }
 
 .rl-canvas-wrap {
@@ -1720,6 +1915,7 @@ onUnmounted(() => {
 
 /* ── Collapsible sections ──────────────────────────────────────────────────── */
 .rl-section {
+  flex-shrink: 0;  /* overflow:hidden lets a flex item shrink to nothing in the popped sidebar */
   border: 1px solid var(--border-color, #374151);
   border-radius: 6px;
   background: var(--comfy-menu-bg, #1f2937);
@@ -1770,7 +1966,7 @@ onUnmounted(() => {
 }
 .rl-check.disabled { opacity: 0.45; cursor: default; }
 .rl-check input { margin: 0; }
-.rl-fval-wide { width: auto; text-align: left; }
+.rl-fval-wide { width: auto; text-align: left; white-space: nowrap; }
 
 .rl-sec-title {
   flex: 1 1 auto;
