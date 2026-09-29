@@ -86,6 +86,26 @@ comfyApp.registerExtension({
         if (configWidget.labelEl) configWidget.labelEl.style.display = "none";
       }
 
+      // ── Make the backend run when this page has nothing to show ──────────
+      // ComfyUI skips a node whose inputs did not change, and the preview passes travel by
+      // websocket from INSIDE execute — so after a reload the node counts as done, sends
+      // nothing, and the preview stays empty until an edit changes lights_config. Until this
+      // page has received passes, the prompt carries a per-load marker no earlier run had;
+      // once they arrive it is dropped, and the normal cache applies again.
+      const pageMark = Math.random().toString(36).slice(2);
+      let hasPasses = false;
+      if (configWidget) {
+        configWidget.serializeValue = async () => {
+          const v = configWidget.value;
+          if (hasPasses || typeof v !== "string") return v;
+          try {
+            const o = JSON.parse(v || "{}");
+            if (Array.isArray(o)) return v;  // pre-dict configs: rare, left alone
+            return JSON.stringify({ ...o, fe: pageMark });
+          } catch { return v; }
+        };
+      }
+
       // ── Build container for the Vue app ──────────────────────────────
       const container = document.createElement("div");
       container.style.cssText =
@@ -239,6 +259,7 @@ comfyApp.registerExtension({
           // Update the preview aspect ratio; the ResizeObserver re-fits the
           // node height once the canvas re-lays out at the new proportions.
           if (p.width > 0 && p.height > 0) previewAspect = p.height / p.width;
+          hasPasses = true;
           instance.setPasses(p);  // also clears the processing overlay
         }
       };

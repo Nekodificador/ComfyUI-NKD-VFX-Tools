@@ -20,6 +20,8 @@
     <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle"
          @mousemove="onWrapMove" @mouseleave="onWrapLeave">
       <canvas ref="canvas" class="rl-canvas" @mousedown="onCanvasMouseDown" @click="onCanvasClick" @mousemove="onCanvasMove" @mouseup="onMouseUp" />
+      <!-- Arcs, joystick and text, drawn at screen resolution: the image canvas above is only as sharp as the pass (<= 512 px) -->
+      <canvas ref="overlay" class="rl-overlay" />
       <!-- Draggable point-light indicators -->
       <div
         v-for="light in pointLights"
@@ -417,6 +419,7 @@ const SHADOW_BIAS   = 0.012;
 const SHADOW_SLOPE  = 0.030;
 
 const canvas            = ref<HTMLCanvasElement | null>(null);
+const overlay           = ref<HTMLCanvasElement | null>(null);
 // Sliders: Shift = tenth-speed drag, double-click = reset to data-default (fine_drag.ts,
 // same as Preview 3D / Lens Distort). Delegated on the root, so sliders inside panels
 // that mount later (per-light sections) are covered too.
@@ -1686,29 +1689,49 @@ function drawPreview() {
 
   canvasDisplayScale = wrap && wrap.clientWidth > 0 ? cv.width / wrap.clientWidth : 1;
 
-  // HUD — sized by the display scale, or it shrinks to nothing on a 2K pass shown small
+  // Everything that is not the image goes on the overlay, backed at the size it is SHOWN at
+  // (times the device ratio). The drawing code keeps working in image-canvas units: the overlay
+  // is just scaled by ov.width / cv.width, so arcs, joystick and text stay vector-sharp and
+  // the hit-testing (which reasons in those same units) is untouched.
+  let g: CanvasRenderingContext2D = ctx;
+  const ov = overlay.value;
+  if (ov && wrap) {
+    const r = wrap.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    const ow = Math.max(1, Math.min(4096, Math.round(r.width * dpr)));
+    const oh = Math.max(1, Math.min(4096, Math.round(r.height * dpr)));
+    if (ov.width !== ow || ov.height !== oh) { ov.width = ow; ov.height = oh; }
+    const octx = ov.getContext("2d");
+    if (octx) {
+      octx.setTransform(1, 0, 0, 1, 0, 0);
+      octx.clearRect(0, 0, ow, oh);
+      octx.setTransform(ow / cv.width, 0, 0, oh / cv.height, 0, 0);
+      g = octx;
+    }
+  }
+
+  // HUD — sized by the display scale, so it reads the same whatever the pass resolution
   const hs = canvasDisplayScale;
-  ctx.fillStyle = "rgba(255,255,255,0.7)";
-  ctx.font = `${Math.round(11 * hs)}px monospace`;
-  ctx.textAlign = "left";
-  ctx.textBaseline = "alphabetic";
-  ctx.fillText(comparing.value ? "Original" : `Lights: ${lights.value.length}/${MAX_LIGHTS}`, 8 * hs, 16 * hs);
+  g.fillStyle = "rgba(255,255,255,0.7)";
+  g.font = `${Math.round(11 * hs)}px monospace`;
+  g.textAlign = "left";
+  g.textBaseline = "alphabetic";
+  g.fillText(comparing.value ? "Original" : `Lights: ${lights.value.length}/${MAX_LIGHTS}`, 8 * hs, 16 * hs);
   if (glReady && !comparing.value) {
-    ctx.fillStyle = "rgba(100,220,100,0.5)";
-    ctx.font = `${Math.round(10 * hs)}px monospace`;
-    ctx.fillText("WebGL", cv.width - 44 * hs, 14 * hs);
+    g.fillStyle = "rgba(100,220,100,0.5)";
+    g.font = `${Math.round(10 * hs)}px monospace`;
+    g.fillText("WebGL", cv.width - 44 * hs, 14 * hs);
   }
   if (!passRgb) {
-    ctx.fillStyle = "rgba(255,255,255,0.3)";
-    ctx.font = "10px monospace";
-    ctx.fillText("Execute graph to enable real-time preview", 8, H - 8);
+    g.fillStyle = "rgba(255,255,255,0.3)";
+    g.font = "10px monospace";
+    g.fillText("Execute graph to enable real-time preview", 8, H - 8);
   }
 
   if (comparing.value) return;  // plate only: no gizmos on top of the comparison
-  drawSemicircleWidgets(ctx, cv.width, cv.height);
+  drawSemicircleWidgets(g, cv.width, cv.height);
   const selDir = lights.value.find((l: Light) => l.id === selectedId.value && l.type === "directional");
   if (selDir) {
-    drawDirectionalWidget(ctx, selDir, cv.width, cv.height);
+    drawDirectionalWidget(g, selDir, cv.width, cv.height);
   } else {
     widgetR = 0;
   }
@@ -2179,6 +2202,13 @@ onUnmounted(() => {
   display: block;
   width: 100%;
   height: 100%;
+}
+.rl-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .rl-light-dot {
