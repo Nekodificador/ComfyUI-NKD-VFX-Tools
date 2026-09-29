@@ -10,15 +10,29 @@ Inputs are `rgb`, `normals` and `depth`. Albedo and roughness are optional, but 
 what gives you believable speculars.
 
 **Masks per light.** Wire a mask into `mask_1` and a fresh slot appears (up to four). Each
-light then has a *Mask* picker: confine a rim light to the subject, a fill to the background,
-or light a silhouette only. *Invert* flips the mask, so one subject mask serves both a light
-on the subject and another on everything else. *Mask amount* lets some of the light leak
-outside. Feather the mask upstream with your usual mask nodes; white means lit.
+light then lists its masks and you choose how each one is used. As a **silhouette** the mask
+sits on the screen: isolate a rim light to the subject, or invert it for a fill on everything
+but the subject. As a **gobo** it is the cut-out a real light shines through: wire a window
+pattern, blinds or foliage and the pattern slides with depth along the light, so it bends over
+the nose and drifts across the shoulder instead of sitting flat on the screen (*Project* sets
+how far). One light can mix both, say a window gobo confined to the subject's silhouette. With
+two or more masks in use, *Combine* picks *Intersect* (lit only where every mask agrees) or
+*Union* (lit where any does); an inverted mask subtracts. *Mask amount* lets some light leak
+outside. Feather the masks upstream with your usual mask nodes; white means lit.
 
-**Gobos.** A mask can also act as a gobo, the cut-out a real light shines through: wire a
-window pattern, blinds, or foliage and raise *Project* on that light. The pattern then
-slides with depth along the light, so it bends over the nose and drifts across the shoulder
-instead of sitting flat on the screen. At zero it is the plain mask.
+**Rim from a silhouette.** Pick a mask under *Rim mask* and the light outlines that
+silhouette. It reads the mask, not the normals, so it works when your normal pass is too soft
+for a proper backlight. The falloff comes from the same fast blur as Mask Ops, so it stays smooth
+at any width. A light from the side rims the edge that faces it; a light straight
+behind the subject gives a full halo; and the rim fades as the light comes round to the
+front, since a rim needs a light behind. *Rim* is the strength, *Rim width* how far it reaches
+into the subject, *Rim softness* the shape of the fade (a tight bright line to a long tail),
+and *Rim spread* how far round the outline it wraps. *Rim surface* also asks the normal pass
+for the surface to turn away from the camera, so the rim thickens where the form curves away
+and fades on flat parts.
+
+**Point lights.** Each one shows its three radial sliders (intensity, depth, radius) only
+while the pointer is near it, so the picture stays clear and you get just the dot.
 
 **Shadows per light.** Every light has its own *Shadow* switch. The *Shadows* section stays
 the master switch and holds the tracer settings (strength, softness, range), shared by all

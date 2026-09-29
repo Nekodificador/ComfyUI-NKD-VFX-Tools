@@ -135,41 +135,169 @@ def _apply_look(color, depth_s, look, fog=None):
 MASK_SLOTS = 4  # mask_1..mask_4 — one per RGBA channel of the preview's packed texture
 
 
+# Mask use per slot, as the editor stores it in a light's "mset" (one code per mask_N):
+#   0 off · 1 silhouette · 2 silhouette, inverted · 3 gobo · 4 gobo, inverted
+# A silhouette reads the mask where it sits on screen (isolate the subject, or everything
+# but it). A gobo reads it projected from the light, sliding with depth (see maskProject).
+def _mask_terms(light):
+    """[(slot_index, inverted, gobo)] for a light. Lights saved before the multi-mask
+    editor carry one `mask` (1..4) + `maskInvert`; maskProject > 0 meant "gobo"."""
+    mset = light.get("mset")
+    if isinstance(mset, (list, tuple)):
+        return [(k, code in (2, 4), code in (3, 4))
+                for k, code in enumerate(mset[:MASK_SLOTS]) if code in (1, 2, 3, 4)]
+    idx = int(light.get("mask", 0) or 0)
+    if idx < 1 or idx > MASK_SLOTS:
+        return []
+    gobo = float(light.get("maskProject", 0.0) or 0.0) > 0.0
+    return [(idx - 1, bool(light.get("maskInvert", False)), gobo)]
+
+
 def _light_mask(light, masks, xc=None, yc=None, depth_s=None, sdir=None):
-    """Per-light occlusion factor from the mask the light selected, or None.
+    """Per-light occlusion factor from the masks the light selected, or None.
 
     `masks` is the MASK_SLOTS-long list of (B,H,W) tensors (None = slot not
     wired). An unwired slot is "no mask": the light is unaffected whatever
     Invert says — mirrored by the preview, which zeroes the selector for
     unwired slots.
 
-    maskProject > 0 turns the mask into a gobo: it is read displaced along the
-    light's screen direction by the pixel's depth, so the pattern slides over
-    near surfaces relative to far ones (parallax) instead of sitting glued to
-    the screen. 0 = the plain screen-space mask, bit for bit.
+    Selected masks combine by `mcomb`: 0 = intersect (product: lit only where
+    every mask agrees), 1 = union (lit where any does). "Inverted" terms are
+    complemented BEFORE combining, so intersecting a wall region with the
+    inverted subject lights the wall and spares the subject.
+
+    A gobo term is read displaced along the light's screen direction by the
+    pixel's depth (scaled by maskProject), so the pattern slides over near
+    surfaces relative to far ones instead of sitting glued to the screen.
+    maskProject 0 = the plain screen-space mask, bit for bit.
     """
     if not masks:
         return None
-    idx = int(light.get("mask", 0) or 0)
-    if idx < 1 or idx > len(masks) or masks[idx - 1] is None:
-        return None
-    m = masks[idx - 1]
     k = float(light.get("maskProject", 0.0) or 0.0)
-    if k > 0.0 and sdir is not None and depth_s is not None:
-        dir_u, dir_v = sdir[0], sdir[1]
-        u = xc - dir_u * depth_s * k                      # (B,H,W)
-        v = yc - dir_v * depth_s * k
-        grid = torch.stack([u * 2.0 - 1.0, v * 2.0 - 1.0], dim=-1)
-        B = depth_s.shape[0]
-        m_in = m.unsqueeze(1).expand(B, 1, *m.shape[1:]) if m.shape[0] == 1 else m.unsqueeze(1)
-        m = F.grid_sample(m_in, grid, mode="bilinear", padding_mode="border",
-                          align_corners=False).squeeze(1)  # same sampler as the shadow tracer
-    if light.get("maskInvert", False):
-        m = 1.0 - m
+    vals = []
+    for slot, inv, gobo in _mask_terms(light):
+        if slot >= len(masks) or masks[slot] is None:
+            continue
+        m = masks[slot]
+        if gobo and k > 0.0 and sdir is not None and depth_s is not None:
+            dir_u, dir_v = sdir[0], sdir[1]
+            u = xc - dir_u * depth_s * k                      # (B,H,W)
+            v = yc - dir_v * depth_s * k
+            grid = torch.stack([u * 2.0 - 1.0, v * 2.0 - 1.0], dim=-1)
+            B = depth_s.shape[0]
+            m_in = m.unsqueeze(1).expand(B, 1, *m.shape[1:]) if m.shape[0] == 1 else m.unsqueeze(1)
+            m = F.grid_sample(m_in, grid, mode="bilinear", padding_mode="border",
+                              align_corners=False).squeeze(1)  # same sampler as the shadow tracer
+        vals.append(1.0 - m if inv else m)
+    if not vals:
+        return None
+    m = vals[0]
+    if len(vals) > 1:
+        if int(light.get("mcomb", 0) or 0) == 1:              # union
+            m = 1.0 - torch.stack([1.0 - v for v in vals]).prod(dim=0)
+        else:                                                  # intersect
+            m = torch.stack(torch.broadcast_tensors(*vals)).prod(dim=0)
     amt = max(0.0, min(1.0, float(light.get("maskAmount", 1.0))))
     if amt < 1.0:
         m = 1.0 - amt + amt * m  # mix(1, m, amt): partial exclusion
     return m
+
+
+# ── Rim light from a mask silhouette ────────────────────────────────────────────
+# The mask is softened with the same cheap blur as NKD Mask Ops (three box passes per axis, a
+# gaussian for the eye at conv cost, radius continuous). The blurred mask B is 0.5 exactly on a
+# straight edge and climbs to 1 inside, so `2 (1 - B)` is a smooth "closeness to the edge"
+# profile and -grad B is the edge's outward normal on screen. Both are computed once per
+# (mask, width) as a small field; the light then only reads it. The preview builds the SAME field
+# on the CPU (buildRimField in RelightingCanvas.vue) — keep the two in step.
+RIM_MIN_RADIUS = 2.0  # px; below this a box blur is the identity and there would be no profile
+
+
+def _box3(x, k):
+    """(N,1,H,W): three box passes per axis at odd kernel k, replicate-padded."""
+    if k <= 1:
+        return x
+    pad = k // 2
+    box = torch.ones(1, 1, 1, k, device=x.device, dtype=x.dtype) / k
+    for kern, pads in ((box, (pad, pad, 0, 0)), (box.transpose(2, 3), (0, 0, pad, pad))):
+        for _ in range(3):
+            x = F.conv2d(F.pad(x, pads, mode="replicate"), kern)
+    return x.clamp(0.0, 1.0)
+
+
+def _soft(x, r):
+    """Soften by `r` pixels, continuously: odd kernels are 2 px apart, so blend the two either
+    side of r (same as Mask Ops' blur)."""
+    if r <= 1.0:
+        return x
+    lo = int(r) | 1
+    if lo > r:
+        lo -= 2
+    t = (r - lo) / 2.0
+    a = _box3(x, lo)
+    if t <= 1e-6:
+        return a
+    return a + (_box3(x, lo + 2) - a) * t
+
+
+def _rim_field(m, width):
+    """(edge, ox, oy), each (N,H,W): edge 1 on the silhouette fading to 0 a `width` in (fraction
+    of the short side); (ox, oy) the unit outward normal (0 where the mask is flat)."""
+    N, H, W = m.shape
+    r = max(RIM_MIN_RADIUS, float(width) * min(H, W))
+    B = _soft(m.unsqueeze(1), r)
+    Bp = F.pad(B, (1, 1, 1, 1), mode="replicate")
+    gx = (Bp[:, :, 1:-1, 2:] - Bp[:, :, 1:-1, :-2]).squeeze(1) * 0.5
+    gy = (Bp[:, :, 2:, 1:-1] - Bp[:, :, :-2, 1:-1]).squeeze(1) * 0.5
+    norm = (gx * gx + gy * gy).sqrt()
+    ok = norm > 1e-5
+    inv = torch.where(ok, 1.0 / norm.clamp(min=1e-5), torch.zeros_like(norm))
+    edge = (2.0 * (1.0 - B.squeeze(1))).clamp(0.0, 1.0)
+    return edge, -gx * inv, -gy * inv
+
+
+def _rim_term(light, masks, sdir, normals=None):
+    """Rim light from a mask's silhouette, (N,H,W) or None. Added to the light's diffuse
+    before its mask factor.
+
+    Monocular normals are often too soft to give a believable backlight edge, so this reads
+    the SILHOUETTE instead (see _rim_field for the smooth edge profile and outward normal).
+
+    * `rimSoftness` shapes the falloff into the subject: 0 = a tight bright line, 1 = a long tail.
+    * Direction: with l = the unit vector to the light, the lobe is o . l_xy / |l_xy|, widened
+      by `rimSpread` (0 = only the edge that faces the light, 1 = all the way round). A light
+      straight BEHIND the subject has l_xy ~ 0, so there is no facing edge to pick — it
+      blends to a full halo instead (smoothstep on |l_xy|).
+    * The rim fades as the light comes to the front (l_z > 0): a rim needs a light behind.
+    * `rimSurface` optionally ties it to the normal pass: only where the surface turns away.
+    Zero outside the mask. Mirrored by the shader and the JS fallback.
+    """
+    slot = int(light.get("rimMask", 0) or 0)
+    amt = float(light.get("rimAmount", 1.0))
+    if not masks or sdir is None or amt <= 0.0 or slot < 1 or slot > len(masks) or masks[slot - 1] is None:
+        return None
+    m = masks[slot - 1]                                    # (N,H,W)
+    edge, ox, oy = _rim_field(m, light.get("rimWidth", 0.03))
+    soft = max(0.0, min(1.0, float(light.get("rimSoftness", 0.6))))
+    edge = edge.pow(3.0 - 2.0 * soft)
+    sx = torch.as_tensor(sdir[0], dtype=torch.float32, device=m.device)
+    sy = torch.as_tensor(sdir[1], dtype=torch.float32, device=m.device)
+    sz = torch.as_tensor(sdir[2], dtype=torch.float32, device=m.device)
+    lat = (sx * sx + sy * sy).sqrt()
+    spread = max(0.0, min(1.0, float(light.get("rimSpread", 0.25))))
+    lat_c = lat.clamp(min=1e-6)
+    lobe = ((ox * (sx / lat_c) + oy * (sy / lat_c)) + spread) / (1.0 + spread)
+    lobe = lobe.clamp(0.0, 1.0)
+    halo = (lat / 0.5).clamp(0.0, 1.0)
+    halo = halo * halo * (3.0 - 2.0 * halo)                # smoothstep(0, 0.5, |l_xy|)
+    facing = 1.0 + (lobe - 1.0) * halo
+    behind = (1.0 - sz).clamp(0.0, 1.0)
+    rim = m * edge * facing * behind * amt
+    surf = float(light.get("rimSurface", 0.0) or 0.0)
+    if surf > 0.0 and normals is not None:
+        turn = ((1.0 - normals[..., 2]) * 2.0).clamp(0.0, 1.0)
+        rim = rim * (1.0 + (turn - 1.0) * surf)
+    return rim
 
 
 def _match_mask(mask, target_h, target_w, batch):
@@ -280,6 +408,11 @@ def _relight_gpu(rgb, normals, depth, albedo, roughness,
         if shadows_on and sdir is not None and light.get("castShadow", True):
             shadow_factor = _shadow_factor_gpu(depth_s, xc, yc, sdir, shadows, dev)
             contrib = contrib * shadow_factor
+        # Rim from a silhouette: added after the shadow (an edge glow is not shadowed) and
+        # before the mask, so a light confined to a region confines its rim too.
+        rim = _rim_term(light, masks, sdir, normals_xyz)
+        if rim is not None:
+            contrib = contrib + (rim * att if att is not None else rim)
         # Per-light mask: confines this light (and its shadow) to a region
         mask_factor = _light_mask(light, masks, xc, yc, depth_s, sdir)
         if mask_factor is not None:
@@ -542,6 +675,9 @@ if _HAS_COMFY:
                 node_id="RelightingNode",
                 display_name="😺NKD Relight",
                 category="😺NKD Nodes/Utils",
+                # Runnable on its own (blue play): the preview passes arrive on execute, so
+                # this loads the editor without running the whole graph.
+                is_output_node=True,
                 description="Relight a photo from its normal and depth passes. Place point "
                             "and directional lights in the live preview; screen-space "
                             "shadows are marched over the depth pass, no geometry needed.",
@@ -695,6 +831,70 @@ def demo() -> None:
     assert abs(float(plain[10, 0]) - lit_v) < 1e-6 and abs(float(slid[10, 0]) - dark_v) < 1e-6, "u=0.66 goes dark"
     assert abs(float(slid[13, 0]) - lit_v) < 1e-6, "u=0.84 stays lit"
     assert torch.equal(gobo(0.4, flat_depth), gobo(0.0, flat_depth)), "no depth, no parallax"
+
+    # 6c. Several masks per light, with a use per slot (mset codes: 0 off, 1 silhouette,
+    #     2 silhouette inverted, 3 gobo, 4 gobo inverted) and a combine (mcomb 0 intersect,
+    #     1 union). `half` = right half in mask_2, `top` = upper half in mask_3; a fully lit
+    #     pixel is 0.6, ambient only 0.1 (block 6).
+    top = torch.zeros(1, H, W)
+    top[:, :H // 2, :] = 1.0
+    both = lambda mset, comb=0, **x: _relight(
+        rgb, facing, flat_depth, None, None,
+        json.dumps({"lights": [dict(L, mset=mset, mcomb=comb, **x)]}),
+        masks={"mask_2": half, "mask_3": top})[0]
+    px = lambda o, r, c: round(float(o[r, c, 0]), 4)
+    o = both([0, 1, 1, 0])                       # right AND top
+    assert (px(o, 0, W - 1), px(o, H - 1, W - 1), px(o, 0, 0)) == (0.6, 0.1, 0.1), "intersect"
+    o = both([0, 1, 1, 0], comb=1)               # right OR top
+    assert (px(o, 0, 0), px(o, H - 1, W - 1), px(o, H - 1, 0)) == (0.6, 0.6, 0.1), "union"
+    o = both([0, 1, 2, 0])                       # right, but NOT top
+    assert (px(o, H - 1, W - 1), px(o, 0, W - 1), px(o, H - 1, 0)) == (0.6, 0.1, 0.1), "subtract"
+    assert torch.equal(run(mset=[0, 1, 0, 0]), run(mask=2)), "new format == legacy, one mask"
+    assert torch.equal(both([1, 1, 0, 0]), run(mset=[0, 1, 0, 0])[0]), "unwired slot 1 is ignored"
+    assert torch.equal(both([0, 3, 0, 0]), run(mset=[0, 1, 0, 0])[0]), "gobo at project 0 is the flat mask"
+    slid_new = _relight(rgb, tilted, mid_depth, None, None, json.dumps({"lights": [
+        {"type": "directional", "azimuth": 90, "elevation": 0, "intensity": 1.0,
+         "color": "#ffffff", "mset": [3, 0, 0, 0], "maskProject": 0.4}]}), masks={"mask_1": half})[0, 0]
+    assert torch.equal(slid_new, slid), "gobo code == the legacy Project gobo"
+    # Silhouette and gobo on one light: the silhouette reads flat, the gobo slides. With
+    # project 0.4 the gobo `half` goes dark at u=0.66 while the flat `top` is unaffected.
+    mix = _relight(rgb, tilted, mid_depth, None, None, json.dumps({"lights": [
+        {"type": "directional", "azimuth": 90, "elevation": 0, "intensity": 1.0,
+         "color": "#ffffff", "mset": [3, 1, 0, 0], "maskProject": 0.4}]}),
+        masks={"mask_1": half, "mask_2": torch.ones(1, H, W)})[0, 0]
+    assert torch.equal(mix, slid), "an all-white silhouette leaves the gobo as it was"
+
+    # 6d. Rim from a silhouette. `half` (right half = subject): a light from the LEFT outlines
+    #     the subject's left edge, i.e. the pixels just inside u=0.5; nothing deep inside, and
+    #     nothing outside. A light from the RIGHT (edge facing away) gets none on this edge.
+    #     Width 0.25 of the short side = 4 px on this 16px test frame.
+    rim = lambda az, **x: _relight(rgb, facing, flat_depth, None, None, json.dumps({"lights": [
+        dict(L, azimuth=az, intensity=1.0, **{"rimMask": 2, "rimAmount": 1.0, "rimWidth": 0.25, **x})],
+        "ambientIntensity": 0.0}), masks={"mask_2": half})[0, 0]   # row 0 → (W,3)
+    from_left, from_right = rim(-90), rim(90)
+    edge_px = W // 2                                    # first pixel inside the subject
+    assert float(from_left[edge_px, 0]) > 0.1, float(from_left[edge_px, 0])
+    assert abs(float(from_left[W - 1, 0])) < 1e-6, "deep inside the subject: no rim"
+    assert abs(float(from_left[edge_px - 1, 0])) < 1e-6, "outside the subject: no rim"
+    assert abs(float(from_right[edge_px, 0])) < 1e-6, "the edge faces away from this light"
+    assert abs(float(from_right[W - 1, 0])) < 1e-6
+    assert abs(float(rim(-90, rimAmount=0.0)[edge_px, 0])) < 1e-6, "amount 0 is off"
+    assert abs(float(rim(-90, rimMask=0)[edge_px, 0])) < 1e-6, "no rim mask, no rim"
+    falloff = [float(from_left[x, 0]) for x in range(edge_px, edge_px + 5)]
+    assert all(a >= b for a, b in zip(falloff, falloff[1:])), falloff   # fades away from the edge
+    assert torch.equal(rim(-90, rimMask=3), _relight(rgb, facing, flat_depth, None, None, json.dumps(
+        {"lights": [dict(L, azimuth=-90, intensity=1.0)], "ambientIntensity": 0.0}),
+        masks={"mask_2": half})[0, 0]), "an unwired rim slot changes nothing"
+
+    # 6e. Rim behaviour beyond a side light. A light straight BEHIND (sdir ~ (0,0,-1)) has no
+    #     facing edge, so it must halo the whole outline, not vanish; a light in FRONT gives no
+    #     rim; Surface > 0 needs the normal pass to turn away (this frame faces the camera).
+    assert float(rim(180)[edge_px, 0]) > 0.1, "backlight: halo on this edge too"
+    assert torch.equal(rim(0), rim(0, rimMask=0)), "front light: no rim (the plain diffuse is unchanged)"
+    assert abs(float(rim(-90, rimSurface=1.0)[edge_px, 0])) < 1e-6, "surface faces camera: no rim"
+    assert float(rim(-90, rimSurface=0.0)[edge_px, 0]) > 0.1
+    tight, soft = rim(-90, rimSoftness=0.0), rim(-90, rimSoftness=1.0)
+    assert float(soft[edge_px + 3, 0]) > float(tight[edge_px + 3, 0]), "softness lengthens the tail"
 
     # 7. Per-light shadow toggle: castShadow=false under the global switch equals shadows
     #    off (block 4's setup). castShadow absent keeps the old behaviour (shadow cast).

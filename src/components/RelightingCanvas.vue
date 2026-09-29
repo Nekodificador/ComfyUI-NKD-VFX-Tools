@@ -17,7 +17,8 @@
 
     <!-- Preview canvas area (letterboxed in the stage when popped out) -->
     <div class="rl-stage" ref="stageEl">
-    <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle">
+    <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle"
+         @mousemove="onWrapMove" @mouseleave="onWrapLeave">
       <canvas ref="canvas" class="rl-canvas" @mousedown="onCanvasMouseDown" @click="onCanvasClick" @mousemove="onCanvasMove" @mouseup="onMouseUp" />
       <!-- Draggable point-light indicators -->
       <div
@@ -27,9 +28,8 @@
         :class="{ selected: light.id === selectedId }"
         :style="dotStyle(light)"
         @mousedown.stop="!$event.shiftKey && startDrag($event, light)"
-        @click.stop="$event.shiftKey ? removeLight(light.id) : (!didDrag && !pendingDblClick && selectLight(light.id))"
-        @dblclick.stop="toggleArcs(light.id)"
-      />
+        @click.stop="$event.shiftKey ? removeLight(light.id) : (!didDrag && selectLight(light.id))"
+        />
       <!-- Processing overlay -->
       <Transition name="rl-fade">
         <div v-if="isProcessing" class="rl-processing-overlay">
@@ -47,8 +47,8 @@
     <div class="rl-controls">
       <!-- Light add buttons -->
       <div class="rl-btnbar">
-        <button class="rl-btn" :disabled="lights.length >= 3" @click="addLight('point')">+ Point</button>
-        <button class="rl-btn" :disabled="lights.length >= 3" @click="addLight('directional')">+ Dir</button>
+        <button class="rl-btn" :disabled="lights.length >= MAX_LIGHTS" @click="addLight('point')">+ Point</button>
+        <button class="rl-btn" :disabled="lights.length >= MAX_LIGHTS" @click="addLight('directional')">+ Dir</button>
         <button class="rl-btn rl-btn-ghost" :disabled="lights.length === 0" @click="clearLights">Clear</button>
         <button class="rl-btn rl-btn-ghost" title="Remove the lights and put every setting back to its default" @click="resetAll">Reset</button>
       </div>
@@ -94,34 +94,83 @@
             </div>
             <div class="rl-field">
               <span class="rl-flabel">Vertical</span>
-              <input class="rl-range" data-default="45" :style="rangeStyle(light.elevation, -90, 90)" type="range" min="-90" max="90" step="1" v-model.number="light.elevation" @input="emit" @click.stop />
-              <span class="rl-fval">{{ Math.round(light.elevation) }}°</span>
+              <input class="rl-range" data-default="45" :style="rangeStyle(-light.elevation, -90, 90)" type="range" min="-90" max="90" step="1" :value="-light.elevation" @input="setElevation(light, $event)" @click.stop
+                     title="Height of the light: + is above the subject, − below. (Stored the other way round, in image space where Y points down.)" />
+              <span class="rl-fval">{{ Math.round(-light.elevation) || 0 }}°</span>
             </div>
           </template>
-          <!-- Mask: confine this light (and its shadow) to a wired mask_N -->
-          <div class="rl-field">
-            <span class="rl-flabel">Mask</span>
-            <select class="rl-select" v-model.number="light.mask" @change="emit" @click.stop
-                    title="Confine this light to a mask wired into mask_1..mask_4. White = lit. Feather it upstream.">
-              <option :value="0">None</option>
-              <option v-for="k in MASK_SLOTS" :key="k" :value="k">Mask {{ k }}{{ maskSlots[k - 1] ? '' : ' (not wired)' }}</option>
+          <!-- Masks: each wired mask_N is used as a silhouette (isolate / exclude) or as a gobo -->
+          <div class="rl-subhead">Masks</div>
+          <div class="rl-hint" v-if="!maskRows(light).length">Wire a mask into mask_1 to confine this light.</div>
+          <div class="rl-field" v-for="k in maskRows(light)" :key="k">
+            <span class="rl-flabel">Mask {{ k }}</span>
+            <select class="rl-select" v-model.number="light.mset[k - 1]" @change="onMaskUse(light, k)" @click.stop
+                    title="Silhouette: the mask sits on screen — isolate the subject, or everything but it. Gobo: the mask is projected from the light and slides with depth like a window shadow. Inverted uses the complement.">
+              <option :value="0">Off</option>
+              <option :value="1">Silhouette</option>
+              <option :value="2">Silhouette, inverted</option>
+              <option :value="3">Gobo</option>
+              <option :value="4">Gobo, inverted</option>
             </select>
-            <label class="rl-check" :class="{ disabled: !light.mask }" @click.stop
-                   title="Use the mask's complement: one subject mask serves both a rim light on the subject and a fill on the background.">
-              <input type="checkbox" v-model="light.maskInvert" :disabled="!light.mask" @change="emit" /> Invert
-            </label>
+            <span class="rl-fval rl-fval-wide" v-if="!maskSlots[k - 1]">not wired</span>
           </div>
-          <div class="rl-field" v-if="light.mask > 0">
+          <div class="rl-field" v-if="maskCount(light) > 1">
+            <span class="rl-flabel">Combine</span>
+            <select class="rl-select" v-model.number="light.mcomb" @change="emit" @click.stop
+                    title="Intersect: lit only where every mask agrees (subject AND window). Union: lit where any of them is. Use an inverted mask to subtract.">
+              <option :value="0">Intersect</option>
+              <option :value="1">Union</option>
+            </select>
+          </div>
+          <div class="rl-field" v-if="maskCount(light) > 0">
             <span class="rl-flabel">Mask amount</span>
             <input class="rl-range" data-default="1" :style="rangeStyle(light.maskAmount, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskAmount" @input="emit" @click.stop
-                   title="1 = the light is fully confined to the mask; lower values let some of it leak outside." />
+                   title="1 = the light is fully confined; lower values let some of it leak outside." />
             <span class="rl-fval">{{ light.maskAmount.toFixed(2) }}</span>
           </div>
-          <div class="rl-field" v-if="light.mask > 0">
+          <div class="rl-field" v-if="hasGobo(light)">
             <span class="rl-flabel">Project</span>
-            <input class="rl-range" data-default="0" :style="rangeStyle(light.maskProject, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskProject" @input="emit" @click.stop
-                   title="Gobo: read the mask displaced by depth along the light, so the pattern slides over near surfaces and bends over relief like a window shadow. 0 = flat screen-space mask." />
+            <input class="rl-range" data-default="0.5" :style="rangeStyle(light.maskProject, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.maskProject" @input="emit" @click.stop
+                   title="How far the gobo slides with depth along the light: near surfaces move, far ones stay, so the pattern bends over relief. 0 = flat on the screen." />
             <span class="rl-fval">{{ light.maskProject.toFixed(2) }}</span>
+          </div>
+          <!-- Rim: outline a mask's silhouette on the side that faces this light -->
+          <div class="rl-field" v-if="maskRows(light).length"
+               title="Outline the silhouette of a wired mask on the edge that faces this light. Reads the mask, not the normals, so it works when the normal pass is too soft for a backlight.">
+            <span class="rl-flabel">Rim mask</span>
+            <select class="rl-select" v-model.number="light.rimMask" @change="emit" @click.stop>
+              <option :value="0">Off</option>
+              <option v-for="k in maskRows(light)" :key="k" :value="k">Mask {{ k }}{{ maskSlots[k - 1] ? '' : ' (not wired)' }}</option>
+            </select>
+          </div>
+          <div class="rl-field" v-if="light.rimMask > 0">
+            <span class="rl-flabel">Rim</span>
+            <input class="rl-range" data-default="1" :style="rangeStyle(light.rimAmount, 0, 2)" type="range" min="0" max="2" step="0.05" v-model.number="light.rimAmount" @input="emit" @click.stop />
+            <span class="rl-fval">{{ light.rimAmount.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" v-if="light.rimMask > 0">
+            <span class="rl-flabel">Rim width</span>
+            <input class="rl-range" data-default="0.03" :style="rangeStyle(light.rimWidth, 0.005, 0.15)" type="range" min="0.005" max="0.15" step="0.005" v-model.number="light.rimWidth" @input="emit" @click.stop
+                   title="How far the rim reaches into the subject, as a fraction of the image's short side." />
+            <span class="rl-fval">{{ light.rimWidth.toFixed(3) }}</span>
+          </div>
+          <div class="rl-field" v-if="light.rimMask > 0">
+            <span class="rl-flabel">Rim softness</span>
+            <input class="rl-range" data-default="0.6" :style="rangeStyle(light.rimSoftness, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.rimSoftness" @input="emit" @click.stop
+                   title="Shape of the fade into the subject: 0 = a tight bright line, 1 = a long soft tail." />
+            <span class="rl-fval">{{ light.rimSoftness.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" v-if="light.rimMask > 0">
+            <span class="rl-flabel">Rim spread</span>
+            <input class="rl-range" data-default="0.25" :style="rangeStyle(light.rimSpread, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.rimSpread" @input="emit" @click.stop
+                   title="How far round the outline the rim wraps: 0 = only the edge that faces the light, 1 = all the way round. A light straight behind the subject always gives a full halo." />
+            <span class="rl-fval">{{ light.rimSpread.toFixed(2) }}</span>
+          </div>
+          <div class="rl-field" v-if="light.rimMask > 0">
+            <span class="rl-flabel">Rim surface</span>
+            <input class="rl-range" data-default="0" :style="rangeStyle(light.rimSurface, 0, 1)" type="range" min="0" max="1" step="0.01" v-model.number="light.rimSurface" @input="emit" @click.stop
+                   title="Also require the surface to turn away from the camera, using the normal pass: the rim thickens where the form curves away and fades on flat parts. 0 = silhouette only." />
+            <span class="rl-fval">{{ light.rimSurface.toFixed(2) }}</span>
           </div>
           <div class="rl-field">
             <span class="rl-flabel">Shadow</span>
@@ -272,18 +321,36 @@ interface Light {
   elevation: number;
   radius: number;
   falloff: number;
-  mask: number;         // 0 = none, 1..MASK_SLOTS = mask_N input
-  maskInvert: boolean;
+  mset: number[];       // use of mask_1..mask_N: 0 off, 1 silhouette, 2 silhouette inverted, 3 gobo, 4 gobo inverted
+  mcomb: number;        // how several masks combine: 0 intersect, 1 union
+  rimMask: number;      // 0 off, 1..MASK_SLOTS: outline this mask's silhouette on the side facing the light
+  rimAmount: number;
+  rimWidth: number;     // outer ring radius, fraction of the short side
+  rimSoftness: number;  // 0 tight line .. 1 long tail
+  rimSpread: number;    // 0 only the edge facing the light .. 1 all the way round
+  rimSurface: number;   // 0 silhouette only .. 1 also needs the surface to turn away (normal pass)
   maskAmount: number;   // mix(1, mask, amount)
   maskProject: number;  // gobo parallax: mask read at uv - sdir.xy * depth * amount
   castShadow: boolean;  // under the global Shadows master switch
 }
 
 const MASK_SLOTS = 4;
+// GPU preview cap: every light costs 17 uniform slots and a shadow march. Python has no cap.
+const MAX_LIGHTS = 8;
 
-// Lights saved before masks / per-light shadows existed lack these fields.
-function normLight(l: Partial<Light>): Light {
-  return { mask: 0, maskInvert: false, maskAmount: 1, maskProject: 0, castShadow: true, ...(l as Light) };
+// The ONE list of per-light defaults. Lights saved before masks / per-light shadows existed lack
+// those fields; lights saved with the single-mask editor carry `mask` (1..4) + `maskInvert`
+// instead of `mset` — maskProject > 0 meant "gobo" then (Python reads the same legacy shape).
+function normLight(l: any): Light {
+  const { mask, maskInvert, ...rest } = l;
+  let mset: number[] = Array.isArray(rest.mset) ? rest.mset.slice(0, MASK_SLOTS) : [];
+  while (mset.length < MASK_SLOTS) mset.push(0);
+  if (!Array.isArray(rest.mset) && mask >= 1 && mask <= MASK_SLOTS) {
+    mset[mask - 1] = (rest.maskProject > 0 ? 3 : 1) + (maskInvert ? 1 : 0);
+  }
+  return { mcomb: 0, maskAmount: 1, maskProject: 0, castShadow: true,
+           rimMask: 0, rimAmount: 1, rimWidth: 0.03, rimSoftness: 0.6, rimSpread: 0.25, rimSurface: 0,
+           ...rest, mset } as Light;
 }
 
 interface State {
@@ -437,22 +504,35 @@ function scheduleRedraw() {
   rafId = requestAnimationFrame(() => { rafId = null; drawPreview(); });
 }
 
-// ── Arc visibility toggle ───────────────────────────────────────────────────
-const hiddenArcs = ref(new Set<number>());
+// ── Arc visibility ──────────────────────────────────────────────────────────
+// The three radial sliders of a point light show only while the pointer is within their reach
+// (or while one is being dragged); otherwise just the dot stays, so the picture is clear.
+const hoverId = ref<number | null>(null);
+let arcDragId: number | null = null;
+const ARC_REACH = 18 + 22 + 4;  // inner radius + widest band + hit tolerance, in display px
 
-function toggleArcs(id: number) {
-  pendingDblClick = true;
-  setTimeout(() => { pendingDblClick = false; }, 300);
-  const s = hiddenArcs.value;
-  s.has(id) ? s.delete(id) : s.add(id);
-  hiddenArcs.value = new Set(s);
-  scheduleRedraw();
+function onWrapMove(e: MouseEvent) {
+  const cv = canvas.value;
+  if (!cv) return;
+  const r = cv.getBoundingClientRect();
+  if (r.width === 0) return;
+  const k = cv.width / r.width;  // display px → canvas px
+  const px = (e.clientX - r.left) * k, py = (e.clientY - r.top) * k;
+  let best: number | null = null, bd = Infinity;
+  for (const l of lights.value) {
+    if (l.type !== "point") continue;
+    const d = Math.hypot(px - l.x * cv.width, py - l.y * cv.height);
+    if (d <= ARC_REACH * canvasDisplayScale && d < bd) { best = l.id; bd = d; }
+  }
+  if (best !== hoverId.value) { hoverId.value = best; scheduleRedraw(); }
+}
+function onWrapLeave() {
+  if (hoverId.value !== null) { hoverId.value = null; scheduleRedraw(); }
 }
 
 // ── Drag state ─────────────────────────────────────────────────────────────
 let dragging: Light | null = null;
 let didDrag = false;
-let pendingDblClick = false;
 
 function startDrag(_e: MouseEvent, light: Light) {
   selectedId.value = light.id;
@@ -544,6 +624,8 @@ function onCanvasMouseDown(e: MouseEvent) {
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      arcDragId = null;
+      scheduleRedraw();
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -565,6 +647,7 @@ function onCanvasMouseDown(e: MouseEvent) {
 
     const inBand = dist >= arc.innerR - arc.tol && dist <= arc.innerR + arc.maxLW + arc.tol;
     if (inBand) {
+      arcDragId = light.id;
       if (isIntensity) {
         selectedId.value = light.id;
         makeDrag(() => light.intensity, v => { light.intensity = v; }, 0, 2);
@@ -596,40 +679,64 @@ function onCanvasClick(e: MouseEvent) {
 }
 
 // ── Light management ────────────────────────────────────────────────────────
-function addLight(type: "point" | "directional") {
-  if (lights.value.length >= 3) return;
-  // Mask/shadow fields come from normLight — the ONE list of per-light defaults. A
-  // field missing here (maskProject, once) crashed the render the moment its row
-  // appeared, and Vue tore the whole widget out of the node.
-  const light: Light = normLight({
-    id: Date.now(),
+let idSeq = Date.now();
+// Mask/shadow fields come from normLight — the ONE list of per-light defaults. A
+// field missing here (maskProject, once) crashed the render the moment its row
+// appeared, and Vue tore the whole widget out of the node.
+function mkLight(type: "point" | "directional", over: Partial<Light> = {}): Light {
+  return normLight({
+    id: idSeq++,
     type,
     color: "#ffffff",
     intensity: 1.0,
-    x: 0.3 + lights.value.length * 0.2,
+    x: 0.15 + (lights.value.length * 0.17) % 0.7,
     y: 0.5,
     z: 0.5,
     azimuth: 0,
-    elevation: 45,
+    elevation: -45,  // stored image-space: negative = from above (see setElevation)
     radius: 0.5,
     falloff: 2.0,
+    ...over,
   });
+}
+
+function addLight(type: "point" | "directional") {
+  if (lights.value.length >= MAX_LIGHTS) return;
+  const light = mkLight(type);
   lights.value.push(light);
   selectedId.value = light.id;
+  emit();
+}
+
+// Mask slots a light's editor lists: the wired ones, plus any it still has a use set on.
+const maskRows = (l: Light) =>
+  Array.from({ length: MASK_SLOTS }, (_, k) => k + 1).filter((k) => maskSlots.value[k - 1] || l.mset[k - 1] > 0);
+// Uses that count: an unwired slot selects nothing (the light is left alone, whatever its use).
+const maskCount = (l: Light) => l.mset.filter((c, k) => c > 0 && maskSlots.value[k]).length;
+const hasGobo = (l: Light) => l.mset.some((c, k) => c >= 3 && maskSlots.value[k]);
+function onMaskUse(l: Light, k: number) {
+  // A gobo at Project 0 is just the flat mask; give the choice something to show.
+  if (l.mset[k - 1] >= 3 && l.maskProject === 0) l.maskProject = 0.5;
+  emit();
+}
+
+// `elevation` is stored in image space, where Y points DOWN (the normals are flipped into it), so
+// a positive stored value lights surfaces facing down. The slider shows and writes the negation:
+// + = the light is above. Stored numbers are untouched, so saved workflows look the same.
+function setElevation(l: Light, e: Event) {
+  l.elevation = -Number((e.target as HTMLInputElement).value);
   emit();
 }
 
 function removeLight(id: number) {
   lights.value = lights.value.filter((l: Light) => l.id !== id);
   if (selectedId.value === id) selectedId.value = null;
-  hiddenArcs.value.delete(id);
   emit();
 }
 
 function clearLights() {
   lights.value = [];
   selectedId.value = null;
-  hiddenArcs.value.clear();
   emit();
 }
 
@@ -638,7 +745,6 @@ function clearLights() {
 function resetAll() {
   deserialise("{}");
   selectedId.value = null;
-  hiddenArcs.value.clear();
   emit();
 }
 
@@ -680,7 +786,7 @@ let glOffscreen: OffscreenCanvas | null = null;
 let gl: WebGLRenderingContext | null = null;
 let glProgram: WebGLProgram | null = null;
 let glQuadBuf: WebGLBuffer | null = null;
-let glTextures: { rgb: WebGLTexture | null; normals: WebGLTexture | null; depth: WebGLTexture | null; albedo: WebGLTexture | null; roughness: WebGLTexture | null } = { rgb: null, normals: null, depth: null, albedo: null, roughness: null };
+let glTextures: { rgb: WebGLTexture | null; normals: WebGLTexture | null; depth: WebGLTexture | null; albedo: WebGLTexture | null; roughness: WebGLTexture | null; masks?: WebGLTexture | null; rimField?: WebGLTexture | null } = { rgb: null, normals: null, depth: null, albedo: null, roughness: null };
 let glLocs: Record<string, WebGLUniformLocation | null> = {};
 let glAPos = -1;
 let glReady = false;
@@ -695,7 +801,7 @@ void main() {
   gl_Position = vec4(aPos, 0.0, 1.0);
 }`;
 
-// GLSL fragment shader — Lambertian + Blinn-Phong, max 3 lights
+// GLSL fragment shader — Lambertian + Blinn-Phong, max MAX_LIGHTS lights
 // Uses UNPACK_FLIP_Y_WEBGL so vUv.y=0 = image bottom, vUv.y=1 = image top.
 // imgUv converts to image-space coords (y=0 at top) for light position math.
 const FRAG_SRC = `
@@ -735,25 +841,37 @@ uniform float uHazeInvSpan;  // 1 / span, signed (End < Start = reversed ramp)
 uniform float uHazeLit;
 
 // Flat light arrays (max 3) — avoids struct array issues in GLSL ES 1.00
-uniform int   uLType[3];
-uniform float uLColorR[3];
-uniform float uLColorG[3];
-uniform float uLColorB[3];
-uniform float uLIntensity[3];
-uniform float uLX[3];
-uniform float uLY[3];
-uniform float uLZ[3];
-uniform float uLRadius[3];
-uniform float uLAzimuth[3];
-uniform float uLElevation[3];
+uniform int   uLType[${MAX_LIGHTS}];
+uniform float uLColorR[${MAX_LIGHTS}];
+uniform float uLColorG[${MAX_LIGHTS}];
+uniform float uLColorB[${MAX_LIGHTS}];
+uniform float uLIntensity[${MAX_LIGHTS}];
+uniform float uLX[${MAX_LIGHTS}];
+uniform float uLY[${MAX_LIGHTS}];
+uniform float uLZ[${MAX_LIGHTS}];
+uniform float uLRadius[${MAX_LIGHTS}];
+uniform float uLAzimuth[${MAX_LIGHTS}];
+uniform float uLElevation[${MAX_LIGHTS}];
 // Per-light mask: one-hot channel selector into uMasks (all-zero = no mask), invert, amount
 uniform sampler2D uMasks;
-uniform vec4  uLMaskSel[3];
-uniform float uLMaskInv[3];
-uniform float uLMaskAmt[3];
-uniform float uLProject[3];
+uniform vec4  uLMaskSel[${MAX_LIGHTS}];  // multi-hot: which mask_N this light uses
+uniform vec4  uLMaskInv[${MAX_LIGHTS}];
+uniform vec4  uLMaskGobo[${MAX_LIGHTS}];
+uniform float uLMaskComb[${MAX_LIGHTS}];
+uniform float uLMaskAmt[${MAX_LIGHTS}];
+uniform float uLProject[${MAX_LIGHTS}];
 // Per-light shadow opt-out (uShadowOn stays the master)
-uniform float uLShadow[3];
+uniform float uLShadow[${MAX_LIGHTS}];
+// Rim from a mask silhouette. The smooth edge field (edge, outward normal, mask) is built on the
+// CPU per (mask, width) and stacked in an atlas, one image-sized tile per rim light: RGBA8 =
+// (edge, ox*.5+.5, oy*.5+.5, mask). uLRimTile is the light's tile, -1 = no rim.
+uniform sampler2D uRimField;
+uniform float uRimTiles;
+uniform float uLRimTile[${MAX_LIGHTS}];
+uniform float uLRimAmt[${MAX_LIGHTS}];
+uniform float uLRimSoft[${MAX_LIGHTS}];
+uniform float uLRimSpread[${MAX_LIGHTS}];
+uniform float uLRimSurf[${MAX_LIGHTS}];
 
 // Screen-space shadow tracer — marches the depth pass toward the light.
 // uv0/d0: surface image-UV + depth. sdir: screen-space dir toward the light
@@ -827,7 +945,7 @@ void main() {
 
   // Accumulate lights. A loop variable is the ONLY non-constant index a fragment
   // shader may use on a uniform array in GLSL ES 1.0 (see the note above).
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < ${MAX_LIGHTS}; i++) {
     if (i >= uLightCount) break;
     float contrib         = 0.0;
     float att             = 1.0;
@@ -884,16 +1002,40 @@ void main() {
       contrib *= (1.0 - uShadowStrength * shadow);
     }
 
-    // Per-light mask: confines the light (and its shadow) to the selected mask_N.
-    // dot() with a one-hot selector reads one channel without indexing a sampler array.
+    // Rim from a silhouette (parity with _rim_term). One read of the precomputed field: closeness
+    // to the edge, the edge's outward normal, the mask. The lobe faces the light's screen
+    // direction, blends to a full halo when the light is straight behind, and fades as the
+    // light comes to the front.
+    float rimTile = uLRimTile[i];
+    if (uLRimAmt[i] > 0.0 && rimTile > -0.5) {
+      // 1:1 with the pass, so a NEAREST read is exact (no bleeding between tiles)
+      vec4 rf = texture2D(uRimField, vec2(imgUv.x, (rimTile + imgUv.y) / uRimTiles));
+      float edgeR = pow(rf.r, 3.0 - 2.0 * uLRimSoft[i]);
+      vec2 outN = rf.gb * 2.0 - 1.0;
+      float latR = length(sdir.xy);
+      float lobeR = clamp((dot(outN, sdir.xy / max(latR, 1e-6)) + uLRimSpread[i]) / (1.0 + uLRimSpread[i]), 0.0, 1.0);
+      float facingR = mix(1.0, lobeR, smoothstep(0.0, 0.5, latR));
+      float behindR = clamp(1.0 - sdir.z, 0.0, 1.0);
+      float turnR = mix(1.0, clamp((1.0 - N.z) * 2.0, 0.0, 1.0), uLRimSurf[i]);
+      contrib += rf.a * edgeR * facingR * behindR * turnR * uLRimAmt[i] * att;
+    }
+
+    // Per-light masks: confine the light (and its shadow). Each selected channel is read flat
+    // (silhouette) or displaced along the light by depth (gobo), optionally inverted, then
+    // combined: product = intersect, 1 - product of complements = union (parity with _light_mask).
     vec4 sel = uLMaskSel[i];
     float maskF = 1.0;
     if (dot(sel, sel) > 0.5) {
-      // Gobo: read the mask displaced by depth along the light (parity with _light_mask)
       vec2 muv = imgUv - sdir.xy * dVal * uLProject[i];
-      float m = dot(texture2D(uMasks, vec2(muv.x, 1.0 - muv.y)), sel);
+      vec4 mFlat = texture2D(uMasks, vec2(imgUv.x, 1.0 - imgUv.y));
+      vec4 mGobo = texture2D(uMasks, vec2(muv.x, 1.0 - muv.y));
+      vec4 m = mix(mFlat, mGobo, uLMaskGobo[i]);
       m = mix(m, 1.0 - m, uLMaskInv[i]);
-      maskF = mix(1.0, m, uLMaskAmt[i]);
+      vec4 pIn = mix(vec4(1.0), m, sel);
+      vec4 qIn = mix(vec4(1.0), 1.0 - m, sel);
+      float inter = pIn.x * pIn.y * pIn.z * pIn.w;
+      float uni = 1.0 - qIn.x * qIn.y * qIn.z * qIn.w;
+      maskF = mix(1.0, mix(inter, uni, uLMaskComb[i]), uLMaskAmt[i]);
     }
     contrib *= maskF;
 
@@ -980,7 +1122,11 @@ function initWebGL(w: number, h: number): boolean {
       gl!.texParameteri(gl!.TEXTURE_2D, gl!.TEXTURE_WRAP_T, gl!.CLAMP_TO_EDGE);
       return t;
     };
-    glTextures = { rgb: mkTex(), normals: mkTex(), depth: mkTex(), albedo: mkTex(), roughness: mkTex(), masks: mkTex() };
+    glTextures = { rgb: mkTex(), normals: mkTex(), depth: mkTex(), albedo: mkTex(), roughness: mkTex(), masks: mkTex(), rimField: mkTex() };
+    // The rim atlas is read 1:1 with the pass: NEAREST keeps tiles from bleeding into each other
+    gl.bindTexture(gl.TEXTURE_2D, glTextures.rimField);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
     // Cache uniform locations
     gl.useProgram(glProgram);
@@ -998,12 +1144,16 @@ function initWebGL(w: number, h: number): boolean {
       uHazeAmount: u("uHazeAmount"), uHazeColor: u("uHazeColor"),
       uHazeStart: u("uHazeStart"), uHazeInvSpan: u("uHazeInvSpan"), uHazeLit: u("uHazeLit"),
       uLightCount: u("uLightCount"),
-      uLType0: u("uLType[0]"), uLType1: u("uLType[1]"), uLType2: u("uLType[2]"),
+      uLType: Array.from({ length: MAX_LIGHTS }, (_, k) => u(`uLType[${k}]`)),
       uLColorR: u("uLColorR"), uLColorG: u("uLColorG"), uLColorB: u("uLColorB"),
       uLIntensity: u("uLIntensity"),
       uLX: u("uLX"), uLY: u("uLY"), uLZ: u("uLZ"), uLRadius: u("uLRadius"),
       uLAzimuth: u("uLAzimuth"), uLElevation: u("uLElevation"),
       uMasks: u("uMasks"), uLMaskSel: u("uLMaskSel"), uLMaskInv: u("uLMaskInv"),
+      uLMaskGobo: u("uLMaskGobo"), uLMaskComb: u("uLMaskComb"),
+      uRimField: u("uRimField"), uRimTiles: u("uRimTiles"), uLRimTile: u("uLRimTile"),
+      uLRimAmt: u("uLRimAmt"), uLRimSoft: u("uLRimSoft"), uLRimSpread: u("uLRimSpread"),
+      uLRimSurf: u("uLRimSurf"),
       uLMaskAmt: u("uLMaskAmt"), uLShadow: u("uLShadow"), uLProject: u("uLProject"),
     };
 
@@ -1014,6 +1164,7 @@ function initWebGL(w: number, h: number): boolean {
     gl.uniform1i(glLocs.uAlbedo, 3);
     gl.uniform1i(glLocs.uRoughness, 4);
     gl.uniform1i(glLocs.uMasks, 5);
+    gl.uniform1i(glLocs.uRimField, 6);
 
     glAPos = gl.getAttribLocation(glProgram, "aPos");
     glW = w; glH = h;
@@ -1024,6 +1175,105 @@ function initWebGL(w: number, h: number): boolean {
     glReady = false;
     return false;
   }
+}
+
+// ── Rim field (parity with _rim_field in Python) ─────────────────────────────
+// The mask is softened with the same cheap blur as NKD Mask Ops: three box passes per axis
+// (running sums, so the radius is free) with a continuous radius. B is 0.5 on a straight edge and
+// climbs to 1 inside, so 2(1-B) is a smooth closeness-to-the-edge profile and -grad B the outward
+// normal. Built once per (mask, width) and cached; a new pass set clears the cache.
+const RIM_MIN_RADIUS = 2;
+
+function boxPass(src: Float32Array, dst: Float32Array, W: number, H: number, k: number, horizontal: boolean) {
+  const half = k >> 1, lines = horizontal ? H : W, n = horizontal ? W : H;
+  const step = horizontal ? 1 : W, lineStep = horizontal ? W : 1;
+  for (let l = 0; l < lines; l++) {
+    const base = l * lineStep;
+    const at = (i: number) => src[base + Math.min(n - 1, Math.max(0, i)) * step];  // replicate padding
+    let sum = 0;
+    for (let i = -half; i <= half; i++) sum += at(i);
+    for (let i = 0; i < n; i++) {
+      dst[base + i * step] = sum / k;
+      sum += at(i + half + 1) - at(i - half);
+    }
+  }
+}
+
+function box3(x: Float32Array, W: number, H: number, k: number): Float32Array {
+  if (k <= 1) return x;
+  let a = x, b = new Float32Array(x.length);
+  for (const horizontal of [true, false]) {
+    for (let p = 0; p < 3; p++) { boxPass(a, b, W, H, k, horizontal); [a, b] = [b, a]; }
+  }
+  for (let i = 0; i < a.length; i++) a[i] = Math.min(1, Math.max(0, a[i]));
+  return a;
+}
+
+function softMask(x: Float32Array, W: number, H: number, r: number): Float32Array {
+  if (r <= 1) return x;
+  let lo = Math.floor(r) | 1;
+  if (lo > r) lo -= 2;
+  const t = (r - lo) / 2;
+  const a = box3(x.slice(), W, H, lo);
+  if (t <= 1e-6) return a;
+  const b = box3(x.slice(), W, H, lo + 2);
+  for (let i = 0; i < a.length; i++) a[i] += (b[i] - a[i]) * t;
+  return a;
+}
+
+// RGBA8 tile, image row order: (edge, ox*.5+.5, oy*.5+.5, mask)
+const rimCache = new Map<string, Uint8Array>();
+function buildRimField(ch: number, width: number): Uint8Array {
+  const W = passW, H = passH, n = W * H;
+  const m = new Float32Array(n);
+  for (let i = 0; i < n; i++) m[i] = passMasks![i * 4 + ch] / 255;
+  const B = softMask(m, W, H, Math.max(RIM_MIN_RADIUS, width * Math.min(W, H)));
+  const out = new Uint8Array(n * 4);
+  for (let y = 0; y < H; y++) {
+    const ym = Math.max(0, y - 1), yp = Math.min(H - 1, y + 1);
+    for (let x = 0; x < W; x++) {
+      const xm = Math.max(0, x - 1), xp = Math.min(W - 1, x + 1);
+      const gx = (B[y * W + xp] - B[y * W + xm]) * 0.5, gy = (B[yp * W + x] - B[ym * W + x]) * 0.5;
+      const nrm = Math.hypot(gx, gy), inv = nrm > 1e-5 ? 1 / nrm : 0;
+      const o = (y * W + x) * 4;
+      out[o]     = Math.round(Math.min(1, Math.max(0, 2 * (1 - B[y * W + x]))) * 255);
+      out[o + 1] = Math.round((-gx * inv * 0.5 + 0.5) * 255);
+      out[o + 2] = Math.round((-gy * inv * 0.5 + 0.5) * 255);
+      out[o + 3] = Math.round(m[y * W + x] * 255);
+    }
+  }
+  return out;
+}
+
+// The light's field, or null when it has no rim (off, unwired slot, no amount).
+function rimFieldFor(l: Light): Uint8Array | null {
+  if (!passMasks || l.rimAmount <= 0 || l.rimMask < 1 || l.rimMask > MASK_SLOTS || !maskSlots.value[l.rimMask - 1]) return null;
+  const key = `${l.rimMask - 1}|${l.rimWidth}`;
+  let f = rimCache.get(key);
+  if (!f) {
+    if (rimCache.size > 24) rimCache.clear();  // dragging Width mints a key per step
+    f = buildRimField(l.rimMask - 1, l.rimWidth);
+    rimCache.set(key, f);
+  }
+  return f;
+}
+
+// One image-sized tile per rim light, stacked. Re-uploaded only when the set of tiles changes.
+let rimAtlasTiles: Uint8Array[] = [];
+function uploadRimAtlas(tiles: Uint8Array[]) {
+  if (!gl) return;
+  if (tiles.length === rimAtlasTiles.length && tiles.every((t, i) => t === rimAtlasTiles[i])) return;
+  rimAtlasTiles = tiles.slice();
+  gl.bindTexture(gl.TEXTURE_2D, glTextures.rimField!);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);  // rows are already in image order; tiles must not swap
+  if (!tiles.length) {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  } else {
+    const atlas = new Uint8Array(passW * passH * 4 * tiles.length);
+    tiles.forEach((t, i) => atlas.set(t, i * passW * passH * 4));
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, passW, passH * tiles.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, atlas);
+  }
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
 }
 
 function uploadPassTextures() {
@@ -1087,6 +1337,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   bindTex(3, glTextures.albedo);
   bindTex(4, glTextures.roughness);
   bindTex(5, glTextures.masks);
+  bindTex(6, glTextures.rimField);
 
   // Global uniforms
   const [ar, ag, ab] = hexToRgb(ambientColor.value);
@@ -1114,26 +1365,48 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   gl.uniform1f(glLocs.uHazeInvSpan, 1 / hzSpan);
   gl.uniform1f(glLocs.uHazeLit, hazeLit.value);
 
-  // Per-light uniforms — padded to 3 elements
+  // Per-light uniforms — padded to MAX_LIGHTS elements
   const ls = lights.value;
   const count = ls.length;
   gl.uniform1i(glLocs.uLightCount, count);
 
-  const lType: number[] = [0, 0, 0];
-  const lR: number[] = [1, 1, 1], lG: number[] = [1, 1, 1], lB: number[] = [1, 1, 1];
-  const lInt: number[] = [0, 0, 0];
-  const lX: number[] = [0, 0, 0], lY: number[] = [0, 0, 0], lZ: number[] = [0, 0, 0];
-  const lRad: number[] = [1, 1, 1];
-  const lAz: number[] = [0, 0, 0], lEl: number[] = [0, 0, 0];
-  const lSel = new Float32Array(12);  // 3 lights × vec4 one-hot
-  const lInv: number[] = [0, 0, 0], lAmt: number[] = [1, 1, 1], lSh: number[] = [1, 1, 1];
-  const lProj: number[] = [0, 0, 0];
+  const pad = (v: number) => new Array<number>(MAX_LIGHTS).fill(v);
+  const lType = pad(0);
+  const lR = pad(1), lG = pad(1), lB = pad(1);
+  const lInt = pad(0);
+  const lX = pad(0), lY = pad(0), lZ = pad(0);
+  const lRad = pad(1);
+  const lAz = pad(0), lEl = pad(0);
+  const lSel = new Float32Array(MAX_LIGHTS * 4);  // vec4 one-hot per light
+  const lInv = new Float32Array(MAX_LIGHTS * 4), lGobo = new Float32Array(MAX_LIGHTS * 4);
+  const lComb = pad(0), lAmt = pad(1), lSh = pad(1);
+  const lRimTile = pad(-1), lRimAmt = pad(0);
+  const lRimSoft = pad(0.6), lRimSpread = pad(0.25), lRimSurf = pad(0);
+  const rimTiles: Uint8Array[] = [];
+  const lProj = pad(0);
 
   for (let i = 0; i < count; i++) {
     const l = ls[i];
     // An unwired slot selects nothing → the shader leaves the light alone (parity with Python)
-    if (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1]) lSel[i * 4 + l.mask - 1] = 1;
-    lInv[i] = l.maskInvert ? 1 : 0;
+    for (let k = 0; k < MASK_SLOTS; k++) {
+      const use = l.mset[k];
+      if (use > 0 && maskSlots.value[k]) {
+        lSel[i * 4 + k] = 1;
+        lInv[i * 4 + k] = use === 2 || use === 4 ? 1 : 0;
+        lGobo[i * 4 + k] = use >= 3 ? 1 : 0;
+      }
+    }
+    lComb[i] = l.mcomb;
+    // An unwired rim slot selects nothing, like an unwired mask
+    const rimField = rimFieldFor(l);
+    if (rimField) {
+      lRimTile[i] = rimTiles.length;
+      rimTiles.push(rimField);
+      lRimAmt[i] = l.rimAmount;
+      lRimSoft[i] = l.rimSoftness;
+      lRimSpread[i] = l.rimSpread;
+      lRimSurf[i] = l.rimSurface;
+    }
     lAmt[i] = l.maskAmount;
     lProj[i] = l.maskProject ?? 0;
     lSh[i]  = l.castShadow ? 1 : 0;
@@ -1148,9 +1421,7 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   }
 
   // Integer arrays need individual uniform1i calls in WebGL 1.0
-  gl.uniform1i(glLocs.uLType0, lType[0]);
-  gl.uniform1i(glLocs.uLType1, lType[1]);
-  gl.uniform1i(glLocs.uLType2, lType[2]);
+  for (let i = 0; i < MAX_LIGHTS; i++) gl.uniform1i((glLocs.uLType as any)[i], lType[i]);
   gl.uniform1fv(glLocs.uLColorR, lR);
   gl.uniform1fv(glLocs.uLColorG, lG);
   gl.uniform1fv(glLocs.uLColorB, lB);
@@ -1162,7 +1433,16 @@ function renderWebGL(ctx: CanvasRenderingContext2D, W: number, H: number) {
   gl.uniform1fv(glLocs.uLAzimuth, lAz);
   gl.uniform1fv(glLocs.uLElevation, lEl);
   gl.uniform4fv(glLocs.uLMaskSel, lSel);
-  gl.uniform1fv(glLocs.uLMaskInv, lInv);
+  gl.uniform4fv(glLocs.uLMaskInv, lInv);
+  gl.uniform4fv(glLocs.uLMaskGobo, lGobo);
+  gl.uniform1fv(glLocs.uLMaskComb, lComb);
+  uploadRimAtlas(rimTiles);
+  gl.uniform1f(glLocs.uRimTiles, Math.max(1, rimTiles.length));
+  gl.uniform1fv(glLocs.uLRimTile, lRimTile);
+  gl.uniform1fv(glLocs.uLRimAmt, lRimAmt);
+  gl.uniform1fv(glLocs.uLRimSoft, lRimSoft);
+  gl.uniform1fv(glLocs.uLRimSpread, lRimSpread);
+  gl.uniform1fv(glLocs.uLRimSurf, lRimSurf);
   gl.uniform1fv(glLocs.uLMaskAmt, lAmt);
   gl.uniform1fv(glLocs.uLProject, lProj);
   gl.uniform1fv(glLocs.uLShadow, lSh);
@@ -1202,9 +1482,16 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
     type: l.type, color: hexToRgb(l.color), intensity: l.intensity,
     x: l.x, y: l.y, z: l.z, radius: l.radius,
     azimuth: l.azimuth * Math.PI / 180, elevation: l.elevation * Math.PI / 180,
-    // channel index into passMasks, or -1 (none / unwired slot — parity with Python)
-    maskCh: (l.mask >= 1 && l.mask <= MASK_SLOTS && maskSlots.value[l.mask - 1] && passMasks) ? l.mask - 1 : -1,
-    maskInvert: l.maskInvert, maskAmount: l.maskAmount, castShadow: l.castShadow,
+    // (channel in passMasks, inverted, gobo) per mask in use; unwired slots select nothing
+    mterms: passMasks
+      ? l.mset.map((use, k) => ({ ch: k, inv: use === 2 || use === 4, gobo: use >= 3, on: use > 0 && maskSlots.value[k] }))
+          .filter((t) => t.on)
+      : [],
+    mcomb: l.mcomb,
+    rimField: rimFieldFor(l),
+    rimAmount: l.rimAmount, rimSoftness: l.rimSoftness,
+    rimSpread: l.rimSpread, rimSurface: l.rimSurface,
+    maskAmount: l.maskAmount, castShadow: l.castShadow,
     maskProject: l.maskProject ?? 0,
   }));
   const masks = passMasks;
@@ -1298,14 +1585,32 @@ function renderShaderFallback(ctx: CanvasRenderingContext2D, W: number, H: numbe
           const occ = traceShadow(pu, pv, dVal, sdx, sdy, sdz);
           contrib *= (1 - shStr * occ);
         }
+        if (lp.rimField && lp.rimAmount > 0) {
+          // Rim from the silhouette: one read of the precomputed field (parity with _rim_term / GLSL)
+          const o = (sy * pw + sx) * 4, f = lp.rimField;
+          const edge = Math.pow(f[o] / 255, 3 - 2 * lp.rimSoftness);
+          const ox = f[o + 1] / 127.5 - 1, oy = f[o + 2] / 127.5 - 1, lat = Math.hypot(sdx, sdy);
+          const lobe = Math.min(1, Math.max(0, ((ox * sdx + oy * sdy) / (lat || 1e-6) + lp.rimSpread) / (1 + lp.rimSpread)));
+          const ht = Math.min(1, lat / 0.5), halo = ht * ht * (3 - 2 * ht);
+          const facing = 1 + (lobe - 1) * halo;
+          const behind = Math.min(1, Math.max(0, 1 - sdz));
+          const turn = 1 + (Math.min(1, Math.max(0, (1 - nz) * 2)) - 1) * lp.rimSurface;
+          contrib += (f[o + 3] / 255) * edge * facing * behind * turn * lp.rimAmount * att;
+        }
         let maskF = 1;
-        if (lp.maskCh >= 0 && masks) {
-          // Gobo: read the mask displaced by depth along the light (parity with Python / GLSL)
-          const mu = Math.min(1, Math.max(0, pu - sdx * dVal * lp.maskProject));
-          const mv = Math.min(1, Math.max(0, pv - sdy * dVal * lp.maskProject));
-          const mx = Math.min(pw - 1, Math.round(mu * pw)), my = Math.min(ph - 1, Math.round(mv * ph));
-          let m = masks[(my * pw + mx) * 4 + lp.maskCh] / 255;
-          if (lp.maskInvert) m = 1 - m;
+        if (lp.mterms.length && masks) {
+          let inter = 1, comp = 1;  // product of masks / product of complements
+          for (const t of lp.mterms) {
+            // Gobo terms read displaced by depth along the light (parity with Python / GLSL)
+            const k = t.gobo ? lp.maskProject : 0;
+            const mu = Math.min(1, Math.max(0, pu - sdx * dVal * k));
+            const mv = Math.min(1, Math.max(0, pv - sdy * dVal * k));
+            const mx = Math.min(pw - 1, Math.round(mu * pw)), my = Math.min(ph - 1, Math.round(mv * ph));
+            let m = masks[(my * pw + mx) * 4 + t.ch] / 255;
+            if (t.inv) m = 1 - m;
+            inter *= m; comp *= 1 - m;
+          }
+          const m = lp.mcomb === 1 ? 1 - comp : inter;
           maskF = 1 - lp.maskAmount + lp.maskAmount * m;
         }
         contrib *= maskF;
@@ -1387,7 +1692,7 @@ function drawPreview() {
   ctx.font = `${Math.round(11 * hs)}px monospace`;
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
-  ctx.fillText(comparing.value ? "Original" : `Lights: ${lights.value.length}/3`, 8 * hs, 16 * hs);
+  ctx.fillText(comparing.value ? "Original" : `Lights: ${lights.value.length}/${MAX_LIGHTS}`, 8 * hs, 16 * hs);
   if (glReady && !comparing.value) {
     ctx.fillStyle = "rgba(100,220,100,0.5)";
     ctx.font = `${Math.round(10 * hs)}px monospace`;
@@ -1426,10 +1731,10 @@ function drawSemicircleWidgets(ctx: CanvasRenderingContext2D, W: number, H: numb
 
   for (const light of lights.value) {
     if (light.type !== "point") continue;
-    if (hiddenArcs.value.has(light.id)) continue;
+    if (light.id !== hoverId.value && light.id !== arcDragId) continue;
     const lx  = light.x * W;
     const ly  = light.y * H;
-    const sel = light.id === selectedId.value;
+    const sel = true;  // shown only while in use, so always drawn as active
     const [lr, lg, lb] = hexToRgb(light.color);
     const cr = Math.round(lr * 255), cg = Math.round(lg * 255), cb = Math.round(lb * 255);
     const alphaTrack = sel ? 0.13 : 0.07;
@@ -1621,6 +1926,8 @@ function setPasses(data: PassData) {
     initWebGL(passW, passH);
   }
   texturesDirty = true;
+  rimCache.clear();
+  rimAtlasTiles = [];
 
   isProcessing.value = false;
   nextTick(drawPreview);
@@ -1846,6 +2153,8 @@ onUnmounted(() => {
   background: var(--comfy-input-bg, #1e293b); color: var(--input-text, #e5e7eb);
   border: 1px solid var(--p-primary-color, #3b82f6); border-radius: 3px; outline: none;
 }
+
+.rl-hint { font-size: 10px; color: var(--descrip-text, #9ca3af); padding: 2px 0; }
 
 .rl-subhead {
   display: flex;
