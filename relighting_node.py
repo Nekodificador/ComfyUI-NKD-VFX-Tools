@@ -300,9 +300,9 @@ def _rim_term(light, masks, sdir, normals=None):
     return rim
 
 
-def _match_mask(mask, target_h, target_w, batch):
+def _match_mask(mask, target_h, target_w, batch, device=None):
     """MASK (B,H,W) → float (B or 1,H,W) at the rgb resolution, broadcastable."""
-    m = mask.float()
+    m = mask.float().to(device) if device is not None else mask.float()  # masks often come from CPU nodes
     if m.dim() == 2:
         m = m.unsqueeze(0)
     if m.shape[1] != target_h or m.shape[2] != target_w:
@@ -317,7 +317,7 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     """Whole node body minus the ComfyUI wrapper: resize passes, push the preview
     passes to the frontend, run the GPU pipeline.
 
-    masks: dict {"mask_1": MASK, ...} from the Autogrow input (unwired slots absent).
+    masks: dict {"mask_1": silhouette, "mask_2": gobo}; unwired = None/absent.
     """
     (lights, ambient_intensity, ambient_color, delit_mix,
      roughness_strength, shadows, look) = _parse_state(lights_config)
@@ -338,7 +338,7 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     for k in range(MASK_SLOTS):
         m = (masks or {}).get(f"mask_{k + 1}")
         if m is not None:
-            mask_list[k] = _match_mask(m, target_h, target_w, rgb.shape[0])
+            mask_list[k] = _match_mask(m, target_h, target_w, rgb.shape[0], rgb.device)
 
     # Send downscaled pass data to frontend (GPU resize → CPU only for encoding)
     if unique_id:
@@ -585,7 +585,7 @@ def _pack_masks(masks, batch_h, batch_w):
 
 def _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, masks=None):
     """GPU-resize passes then transfer to CPU only for base64 encoding."""
-    max_size = 512
+    max_size = 1024  # preview passes: sharp enough for the modal, still light over the websocket
     H, W = rgb.shape[1], rgb.shape[2]
     scale = min(max_size / H, max_size / W, 1.0)
     nh = int(H * scale) if scale < 1.0 else H
@@ -693,19 +693,14 @@ if _HAS_COMFY:
                     # real DOM textarea that survives the widget-hiding tricks (measured on
                     # Preview 3D).
                     io.String.Input("lights_config", default="{}", multiline=False, optional=True),
-                    # mask_1..mask_4: a fresh slot appears as you wire one. Each light picks
-                    # a slot in the preview to confine its light (and shadow) to that region.
-                    io.Autogrow.Input(
-                        "masks",
-                        template=io.Autogrow.TemplateNames(
-                            io.Mask.Input("mask"),
-                            names=[f"mask_{k + 1}" for k in range(MASK_SLOTS)],
-                            min=0,
-                        ),
-                        optional=True,
-                        tooltip="Masks a light can be confined to (pick one per light in the "
-                                "editor). Feather them upstream; white = lit.",
-                    ),
+                    # Two mask inputs; each light chooses in the editor whether to use them
+                    # (and invert). Internally silhouette = slot 1, gobo = slot 2.
+                    io.Mask.Input("silhouette", optional=True,
+                                  tooltip="On-screen mask a light can be confined to (or, inverted, "
+                                          "kept out of). Feather it upstream; white = lit."),
+                    io.Mask.Input("gobo", optional=True,
+                                  tooltip="Mask projected from the light, sliding with depth like a "
+                                          "window shadow (Project slider). Feather it upstream."),
                 ],
                 outputs=[io.Image.Output(display_name="relit_image")],
                 hidden=[io.Hidden.unique_id],
@@ -721,11 +716,11 @@ if _HAS_COMFY:
 
         @classmethod
         def execute(cls, rgb, normals, depth, albedo=None, roughness=None,
-                    lights_config="{}", masks=None) -> io.NodeOutput:
+                    lights_config="{}", silhouette=None, gobo=None) -> io.NodeOutput:
             uid = cls.hidden.unique_id
             out = _relight(rgb, normals, depth, albedo, roughness, lights_config,
                            unique_id=str(uid) if uid is not None else "",
-                           masks=masks)
+                           masks={"mask_1": silhouette, "mask_2": gobo})
             return io.NodeOutput(out)
 
 

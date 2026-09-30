@@ -20,7 +20,7 @@
     <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle"
          @mousemove="onWrapMove" @mouseleave="onWrapLeave">
       <canvas ref="canvas" class="rl-canvas" @mousedown="onCanvasMouseDown" @click="onCanvasClick" @mousemove="onCanvasMove" @mouseup="onMouseUp" />
-      <!-- Arcs, joystick and text, drawn at screen resolution: the image canvas above is only as sharp as the pass (<= 512 px) -->
+      <!-- Arcs, joystick and text, drawn at screen resolution: the image canvas above is only as sharp as the pass (<= 1024 px) -->
       <canvas ref="overlay" class="rl-overlay" />
       <!-- Draggable point-light indicators -->
       <div
@@ -101,20 +101,17 @@
               <span class="rl-fval">{{ Math.round(-light.elevation) || 0 }}°</span>
             </div>
           </template>
-          <!-- Masks: each wired mask_N is used as a silhouette (isolate / exclude) or as a gobo -->
+          <!-- Masks: the silhouette and gobo inputs; each light opts in to either, with invert -->
           <div class="rl-subhead">Masks</div>
-          <div class="rl-hint" v-if="!maskRows(light).length">Wire a mask into mask_1 to confine this light.</div>
-          <div class="rl-field" v-for="k in maskRows(light)" :key="k">
-            <span class="rl-flabel">Mask {{ k }}</span>
-            <select class="rl-select" v-model.number="light.mset[k - 1]" @change="onMaskUse(light, k)" @click.stop
-                    title="Silhouette: the mask sits on screen — isolate the subject, or everything but it. Gobo: the mask is projected from the light and slides with depth like a window shadow. Inverted uses the complement.">
-              <option :value="0">Off</option>
-              <option :value="1">Silhouette</option>
-              <option :value="2">Silhouette, inverted</option>
-              <option :value="3">Gobo</option>
-              <option :value="4">Gobo, inverted</option>
-            </select>
-            <span class="rl-fval rl-fval-wide" v-if="!maskSlots[k - 1]">not wired</span>
+          <div class="rl-field" v-for="row in MASK_ROWS" :key="row.k">
+            <span class="rl-flabel">{{ row.label }}</span>
+            <label class="rl-check" @click.stop :title="row.tip">
+              <input type="checkbox" :checked="light.mset[row.k] > 0" @change="setMaskUse(light, row.k, ($event.target as HTMLInputElement).checked, light.mset[row.k] > 0 && light.mset[row.k] % 2 === 0)" /> Use
+            </label>
+            <label class="rl-check" @click.stop>
+              <input type="checkbox" :disabled="light.mset[row.k] === 0" :checked="light.mset[row.k] > 0 && light.mset[row.k] % 2 === 0" @change="setMaskUse(light, row.k, true, ($event.target as HTMLInputElement).checked)" /> Invert
+            </label>
+            <span class="rl-fval rl-fval-wide" v-if="!maskSlots[row.k]">not wired</span>
           </div>
           <div class="rl-field" v-if="maskCount(light) > 1">
             <span class="rl-flabel">Combine</span>
@@ -142,7 +139,7 @@
             <span class="rl-flabel">Rim mask</span>
             <select class="rl-select" v-model.number="light.rimMask" @change="emit" @click.stop>
               <option :value="0">Off</option>
-              <option v-for="k in maskRows(light)" :key="k" :value="k">Mask {{ k }}{{ maskSlots[k - 1] ? '' : ' (not wired)' }}</option>
+              <option v-for="k in maskRows(light)" :key="k" :value="k">Mask {{ MASK_ROWS[k - 1].label }}{{ maskSlots[k - 1] ? '' : ' (not wired)' }}</option>
             </select>
           </div>
           <div class="rl-field" v-if="light.rimMask > 0">
@@ -712,14 +709,20 @@ function addLight(type: "point" | "directional") {
 }
 
 // Mask slots a light's editor lists: the wired ones, plus any it still has a use set on.
+const MASK_ROWS = [
+  { k: 0, label: 'Silhouette', tip: 'Confine this light to the silhouette mask (Invert: everything but it).' },
+  { k: 1, label: 'Gobo', tip: 'Project the gobo mask from the light; it slides with depth like a window shadow.' },
+];
 const maskRows = (l: Light) =>
-  Array.from({ length: MASK_SLOTS }, (_, k) => k + 1).filter((k) => maskSlots.value[k - 1] || l.mset[k - 1] > 0);
+  Array.from({ length: MASK_ROWS.length }, (_, k) => k + 1).filter((k) => maskSlots.value[k - 1] || l.mset[k - 1] > 0);
 // Uses that count: an unwired slot selects nothing (the light is left alone, whatever its use).
 const maskCount = (l: Light) => l.mset.filter((c, k) => c > 0 && maskSlots.value[k]).length;
 const hasGobo = (l: Light) => l.mset.some((c, k) => c >= 3 && maskSlots.value[k]);
-function onMaskUse(l: Light, k: number) {
+function setMaskUse(l: Light, row: number, on: boolean, inv: boolean) {
+  // Codes: silhouette 1 / 2 (inverted), gobo 3 / 4 (inverted); row 0 = silhouette, row 1 = gobo.
+  l.mset[row] = on ? (row === 0 ? 1 : 3) + (inv ? 1 : 0) : 0;
   // A gobo at Project 0 is just the flat mask; give the choice something to show.
-  if (l.mset[k - 1] >= 3 && l.maskProject === 0) l.maskProject = 0.5;
+  if (l.mset[row] >= 3 && l.maskProject === 0) l.maskProject = 0.5;
   emit();
 }
 
