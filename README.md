@@ -40,7 +40,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/Nekodificador/ComfyUI-NKD-VFX-Tools
 ```
 
-Restart ComfyUI. Nothing to download, no extra setup.
+Restart ComfyUI. Nothing to download, no extra setup, except for the SyncLight nodes, which need `diffusers`, `einops`, `pyyaml`, `huggingface_hub` and `pydantic` (`pip install -r` the pack's dependencies) and download their weights on first use.
 
 ---
 
@@ -49,6 +49,7 @@ Restart ComfyUI. Nothing to download, no extra setup.
 | Node | What it does |
 |---|---|
 | [😺NKD Relight](docs/relight.md) | Relight a photo from its depth and normal passes. Drag lights around a sphere and the image updates live on the node. |
+| [😺NKD SyncLight](docs/synclight.md) | Edit the light in one view and every other view of the scene (or video frames) is relit to match. Multi-view relighting model, no camera poses needed. |
 | [😺NKD Normal Detail](docs/normal-detail.md) | Puts the pores, stubble and hair back into a model's normal map, read from the photo and blended the way normals should be. |
 | [😺NKD Lens Blur](docs/lens-blur.md) | Depth of field driven by a depth map. Click where focus lands, set the aperture, and the blur falls off either side of that plane. |
 | [😺NKD Preview 3D](docs/preview-3d.md) | A 3D viewport inside a node, for GLB/GLTF models, gaussian splats and meshes straight off a mesh builder. |

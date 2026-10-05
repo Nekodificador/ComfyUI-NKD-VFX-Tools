@@ -1,0 +1,35 @@
+# wandb
+wandb_project: synclight
+timestep_sampling: custom_timesteps
+unet_input_channels: 8
+vae_num_channels: 4
+selected_timesteps: [250, 500, 750, 1000]
+prob: [0.25, 0.25, 0.25, 0.25]
+pixel_loss_type: lpips # l1 l2
+pixel_loss_weight: 10.0
+latent_loss_type: l2 # l1 l2
+latent_loss_weight: 1.0
+bridge_noise_sigma: 0.005
+source_key: [input1, input2]
+target_key: [target1, target2]
+conditioning_images_keys: {'ConcatEmbedder': ['lightmap1', 'lightmap1']}
+conditioning_masks_keys: []
+  
+# SHARDS_PATH_OR_URLS
+train_shards:
+  - pipe:cat dataset.tar
+
+validation_shards:
+  - pipe:cat dataset.tar
+
+batch_size: 1
+learning_rate: 4e-5
+optimizer: AdamW
+num_steps: [1, 4]
+log_interval: 500
+resume_from_checkpoint: true
+max_steps: 200000
+save_interval: 5000
+save_ckpt_path: ./checkpoints
+num_devices: 5
+num_nodes: 1

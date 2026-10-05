@@ -14,6 +14,7 @@ from .nkd_lens_distort    import NKDLensDistort
 from .nkd_camera_delta    import NKDCameraDeltaPrompt
 from .nkd_normal_detail   import NKDNormalDetail
 from .nkd_texture_project import NKDProjectionPass, NKDBakeProjection
+from .nkd_synclight       import NKDSyncLightLoader, NKDSyncLightLightmap, NKDSyncLightRelight
 
 NODE_CLASS_MAPPINGS = {
     "RelightingNode":         RelightingNode,
@@ -28,6 +29,9 @@ NODE_CLASS_MAPPINGS = {
     "NKDNormalDetail":        NKDNormalDetail,
     "NKDProjectionPass":      NKDProjectionPass,
     "NKDBakeProjection":      NKDBakeProjection,
+    "NKDSyncLightLoader":     NKDSyncLightLoader,
+    "NKDSyncLightLightmap":   NKDSyncLightLightmap,
+    "NKDSyncLightRelight":    NKDSyncLightRelight,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -43,6 +47,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NKDNormalDetail":        "😺NKD Normal Detail",
     "NKDProjectionPass":      "😺NKD Projection Pass",
     "NKDBakeProjection":      "😺NKD Bake Projection",
+    "NKDSyncLightLoader":     "😺NKD SyncLight Loader",
+    "NKDSyncLightLightmap":   "😺NKD SyncLight Lightmap",
+    "NKDSyncLightRelight":    "😺NKD SyncLight Relight",
 }
 
 WEB_DIRECTORY = "./web/js"

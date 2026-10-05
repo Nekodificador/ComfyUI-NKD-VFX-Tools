@@ -1,0 +1,8 @@
+Vendored from https://github.com/CVC-Color/synclight (Apache License 2.0)
+SyncLight: Single-Edit Multi-View Relighting — Serrano-Lozano, Bhattad, Herranz,
+Lalonde, Vazquez-Corral (NeurIPS 2026).
+
+Copied: src/synclight/{models,config.py} and ckpt/config.yaml.
+Changes: absolute `synclight.*` imports made relative; `lpips` and
+`skimage` (training-only code paths) imported lazily. The model code is
+otherwise unmodified. Inference glue lives in ../nkd_synclight.py.
