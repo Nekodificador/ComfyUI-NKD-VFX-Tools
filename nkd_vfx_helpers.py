@@ -315,6 +315,21 @@ def _safe_join(base: str, *parts: str):
     return p if p == root or p.startswith(root + os.sep) else None
 
 
+def _safe_annotated_path(name: str):
+    """Resolve a ComfyUI file reference ("sub/file.png", optionally suffixed " [input]",
+    " [output]" or " [temp]") the way folder_paths.get_annotated_filepath does, but only
+    inside that folder: returns None for "..", absolute paths or symlinks that leave it."""
+    import re
+    import folder_paths
+    name = str(name or "").strip()
+    m = re.match(r"^(.*?)\s*\[(input|output|temp)\]$", name)
+    rel, kind = (m.group(1), m.group(2)) if m else (name, "input")
+    base = {"input": folder_paths.get_input_directory,
+            "output": folder_paths.get_output_directory,
+            "temp": folder_paths.get_temp_directory}[kind]()
+    return _safe_join(base, rel) if rel else None
+
+
 def _safe_name(name: str, default: str) -> str:
     """A bare file name from user text: no directories, only plain characters."""
     import os

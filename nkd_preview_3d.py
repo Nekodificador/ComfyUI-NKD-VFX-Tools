@@ -30,9 +30,9 @@ from typing_extensions import override
 
 import folder_paths
 try:
-    from .nkd_vfx_helpers import _safe_join
+    from .nkd_vfx_helpers import _safe_join, _safe_annotated_path
 except ImportError:  # `python nkd_preview_3d.py` (self-check) runs it bare
-    from nkd_vfx_helpers import _safe_join
+    from nkd_vfx_helpers import _safe_join, _safe_annotated_path
 import nodes
 from comfy_api.latest import ComfyExtension, Types, io
 from comfy_api.latest._io import ComfyTypeIO, comfytype
@@ -502,9 +502,16 @@ class NKDPreview3D(io.ComfyNode):
             return io.NodeOutput(None, None, None, None, camera_info, None, mask3d_in,
                                  _ref_to_file3d(model_ref), model_3d_info)
 
-        for key in ("image", "object", "depth"):
-            ref = capture.get(key, "")
-            path = folder_paths.get_annotated_filepath(ref) if ref else None
+        # Every file the capture names must live in ComfyUI's input / output / temp:
+        # the capture is widget JSON, so it is checked before LoadImage resolves it.
+        m3 = capture.get("mask3d")
+        refs = {k: capture.get(k, "") for k in ("image", "object", "depth")}
+        if capture.get("paint_mask"):
+            refs["paint_mask"] = capture["paint_mask"]
+        if isinstance(m3, dict) and m3.get("image"):
+            refs["mask3d"] = m3["image"]
+        for key, ref in refs.items():
+            path = _safe_annotated_path(ref) if ref else None
             if not path or not os.path.isfile(path):
                 raise RuntimeError(
                     f"😺NKD Preview 3D: the render file for '{key}' is gone ({ref!r}). ComfyUI's "
@@ -526,7 +533,6 @@ class NKDPreview3D(io.ComfyNode):
         if capture.get("paint_mask"):
             pm, _ = load_image.load_image(image=capture["paint_mask"])
             paint_mask = pm[..., 0]
-        m3 = capture.get("mask3d")
         if isinstance(m3, dict) and m3.get("image"):
             packed, _ = load_image.load_image(image=m3["image"])
             mask3d = _unpack_mask3d(packed, int(m3.get("count", 0)))
