@@ -19,6 +19,7 @@ import { smoothNormalsByPosition } from './smooth_normals'
 import { objectBase, objPosition, pivotFromGroup, type Quat, type V3 } from './pivot'
 import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
+import { clampHalf, dragFace, unitFaces } from './crop_volume'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
@@ -253,6 +254,42 @@ type MirrorAxis = 'none' | 'X' | 'Y' | 'Z'
 const mirrorGuide = ref<MirrorAxis>('none')
 let mirrorLine: THREE.LineLoop | null = null
 
+// ── Crop volume ───────────────────────────────────────────────────────────
+// A box that keeps what is inside it and hides the rest. Monocular scene models (MoGe,
+// SHARP) project their background out towards infinity, so the raw bbox is enormous while
+// the usable content sits in a speck at the middle — Frame model then parks the camera a
+// kilometre away. Cropping is what gives the framing something sane to measure.
+//
+// The box IS an Object3D, child of `model` (so it follows the Load3D placement and the Object
+// transform for free, same as the mirror guide): its position is the centre, its quaternion the
+// orientation and its SCALE the half-extents of a ±1 unit box. Holding it as a transform rather
+// than as min/max is what makes a rotated crop cost nothing — the clip planes and Spark's box
+// sdf both read the orientation straight off this one matrix.
+const cropOn = ref(false)
+let cropFitted = false // a box the user has never sized would crop to a meaningless ±1
+let cropBoxObj: THREE.Object3D | null = null
+let cropWire: THREE.LineSegments | null = null
+let cropHandles: THREE.Mesh[] = [] // 6 face grips, in the scene so the box's scale can't squash them
+let cropEdit: any = null // Spark SplatEdit — the splat path
+let cropSdf: any = null
+let sparkMod: any = null // the dynamically imported module, kept for SplatEdit
+// Six world-space half-spaces — the mesh path. Mutated in place: three only recompiles a
+// shader when the plane COUNT changes, so moving them every frame is free.
+const cropPlanes = [0, 0, 0, 0, 0, 0].map(() => new THREE.Plane())
+let cropMatsOn = false // what the materials currently carry, so needsUpdate fires only on the flip
+// Face drag in flight. The plane, the axis and the START size are all pinned at pointerdown:
+// deriving the face from where it began is what lets Shift be toggled mid-drag without a jump.
+let cropDrag: {
+  axis: 0 | 1 | 2; sign: 1 | -1
+  plane: THREE.Plane; axisL: THREE.Vector3; origin: THREE.Vector3
+  startHalf: number; startCentre: THREE.Vector3
+  lastT: number; acc: number
+} | null = null
+let cropDragging = false
+// Mirrors setHelpersVisible so updateCrop can honour it without asking helpersVisible(), which
+// would read the very object updateCrop is about to write.
+let cropHelpersOn = true
+
 // ── 3D mask brush ─────────────────────────────────────────────────────────
 // Paint, on the model itself, the region an inpaint may touch. The mask lives on the
 // VERTICES (a float attribute `nkdMask`), which works the same for a UV-mapped mesh and
@@ -451,24 +488,34 @@ const bgDepthMaterial = new THREE.ShaderMaterial({
 // Monocular maps are INVERSE depth (disparity): grey ~ 1/z, falling off fast near the
 // camera — a linear remap there paints a mid-room object near-white (measured). `inv`
 // picks the curve; dNear/dFar anchor it, same values that place the map in scene units.
+// `clipping: true` plus the four chunks are what make the crop volume reach the depth EXPORT.
+// A ShaderMaterial gets none of three's clipping for free — without this the colour frame
+// would be cropped and the depth PNG beside it would not, which is the worst kind of wrong:
+// silently inconsistent. The chunks use `varying`, which three #defines to in/out for GLSL3.
+// `mvPosition` is not a free choice of name: clipping_planes_vertex reads that exact symbol.
 const linearDepthMaterial = new THREE.ShaderMaterial({
   glslVersion: THREE.GLSL3,
+  clipping: true,
   uniforms: { dNear: { value: 1 }, dFar: { value: 30 }, inv: { value: 1 } },
   vertexShader: `
+    #include <clipping_planes_pars_vertex>
     out float vZ;
     void main() {
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      vZ = -mv.z;
-      gl_Position = projectionMatrix * mv;
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      vZ = -mvPosition.z;
+      gl_Position = projectionMatrix * mvPosition;
+      #include <clipping_planes_vertex>
     }
   `,
   fragmentShader: `
+    #include <clipping_planes_pars_fragment>
     uniform float dNear;
     uniform float dFar;
     uniform float inv;
     in float vZ;
     out vec4 fragColor;
     void main() {
+      #include <clipping_planes_fragment>
       float z = max(vZ, 1e-4);
       float g = inv > 0.5
         ? (1.0 / z - 1.0 / dFar) / (1.0 / dNear - 1.0 / dFar)
@@ -1098,6 +1145,10 @@ function setOrthoView(on: boolean) {
 
 function renderFrame(drawBackdrop = true) {
   syncMaskOverlay()
+  applyCropMaterials()
+  // The grips are sized by their distance to the camera, so they have to be re-parked whenever
+  // the view moves, not only when the box changes.
+  if (cropOn.value) updateCropHandles()
   const r = renderer.value
   if (!r) return
   r.autoClear = false
@@ -1146,6 +1197,10 @@ function depthHasSubject(): boolean {
 function renderDepthPass(forExport: boolean) {
   const r = renderer.value
   if (!r) return
+  // Also here, not only in renderFrame: capture() can reach this pass without a colour frame
+  // in between, and a depth PNG that ignores the crop while the image beside it honours it is
+  // the silent kind of wrong. Idempotent — it costs one boolean once the planes are in place.
+  applyCropMaterials()
   // Fit HERE, not on a timer: capture() has just switched the camera to the export aspect,
   // so the range is fitted to the camera the depth is actually taken from.
   refreshAutoRange()
@@ -1612,7 +1667,8 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     const url = viewUrl(ref)
     const isPly = /\.ply$/i.test(ref.filename)
     if (SPLAT_EXTS.test(ref.filename) || (isPly && (await isGaussianPly(url)))) {
-      const { SplatMesh, SparkRenderer } = await import('@sparkjsdev/spark')
+      sparkMod = await import('@sparkjsdev/spark')
+      const { SplatMesh, SparkRenderer } = sparkMod
       // Spark does NOT auto-create its renderer (checked in the dist): without a
       // SparkRenderer in the scene a SplatMesh loads fine and draws nothing.
       if (!sparkRenderer && renderer.value) {
@@ -1639,6 +1695,11 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
       model = null
     }
     disposeMaskOverlay()   // the attribute lived on the old geometry
+    // The box and the sdf hung off the model that is going away; the box TRANSFORM is the
+    // user's and stays. updateCrop() below re-parents it onto the new model.
+    cropBoxObj?.removeFromParent()
+    cropEdit = null
+    cropSdf = null
     proj = null
     model = loaded
     modelIsSplat = loadedIsSplat
@@ -1662,6 +1723,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     applyObjectTransform()
     loadedModelKey = key
     buildMirrorGuide()
+    updateCrop()
     if (maskPaint.value) ensureMaskAttributes()
     applyPendingMask3d()
     status.value = ''
@@ -1815,6 +1877,8 @@ function applyObjectTransform() {
   g.position.set(objPos.x + pivotP.x, objPos.y + pivotP.y, objPos.z + pivotP.z)
   modelHolder?.position.copy(pivotP).multiplyScalar(-1)
   contactDirty = true // the footprint moved — re-bake the grounding shadow
+  // The clip planes are WORLD space: the model just moved under them.
+  if (cropOn.value) updateCrop()
 }
 
 /** Where the object sits, independent of the pivot. Capture it, move the pivot, restore it:
@@ -1921,6 +1985,12 @@ function readbackGizmo() {
     }
     return
   }
+  // The gizmo may be moving the crop box. Its transform IS the crop's state, so there is
+  // nothing to copy anywhere: just rebuild the planes and the sdf from where it now sits.
+  if (cropOn.value && cropBoxObj && transformControls?.object === cropBoxObj) {
+    updateCrop()
+    return
+  }
   const g = pivotGroup
   if (!g) return
   // Alt: the drag moved the pivot, not the object. Read the pivot it implies and undo the
@@ -1971,17 +2041,26 @@ function setGizmoMode(m: 'off' | 'translate' | 'rotate' | 'scale') {
   gizmoTargetId.value = null
   pivotEdit.value = false // this re-attaches below; no setPivotEdit round-trip needed
   if (!transformControls || !gizmoHelper) return
-  if (m === 'off' || !pivotGroup) {
+  // While the crop is on, W/E/R belong to the box: it is what you are shaping, and reaching for
+  // the object's own transform in the middle of framing a crop is never what you meant.
+  const target = cropOn.value && cropBoxObj ? cropBoxObj : pivotGroup
+  if (m === 'off' || !target) {
     transformControls.detach()
     transformControls.enabled = false
     gizmoHelper.removeFromParent() // out of the scene so its updateMatrixWorld can't run unattached
   } else {
-    transformControls.attach(pivotGroup)
+    transformControls.attach(target)
     transformControls.setMode(m)
     transformControls.enabled = true
     gizmoHelper.visible = true
     if (!gizmoHelper.parent) scene.add(gizmoHelper)
   }
+}
+
+/** Re-point an already-open gizmo after the crop is switched on or off, so it never stays
+ *  latched to an object the toolbar no longer says it is editing. */
+function syncGizmoTarget() {
+  if (gizmoMode.value !== 'off') setGizmoMode(gizmoMode.value)
 }
 
 // ── Extra lights rig ─────────────────────────────────────────────────────────
@@ -2324,6 +2403,10 @@ function endStroke() {
   notifyStateChanged()
 }
 function onBrushDown(e: PointerEvent) {
+  // The crop grips get first refusal: this listener is in the CAPTURE phase on the viewport, so
+  // stopping here is what keeps OrbitControls and TransformControls (both bubbling, on the
+  // canvas below) from claiming a drag that was meant for a face.
+  if (onCropDown(e)) { e.stopPropagation(); e.preventDefault(); return }
   if (!maskPaint.value) return
   if (e.button !== 0 && !(e.button === 2 && e.altKey)) return   // right button orbits
   e.stopPropagation(); e.preventDefault()
@@ -2333,10 +2416,14 @@ function onBrushDown(e: PointerEvent) {
   beginStroke(e)
 }
 function onBrushMove(e: PointerEvent) {
+  if (onCropMove(e)) { e.stopPropagation(); return }
   if (stroke) { e.stopPropagation(); dabAt(e) }
   updateBrushRing(e)
 }
-function onBrushUp(e: PointerEvent) { if (stroke) { e.stopPropagation(); endStroke() } }
+function onBrushUp(e: PointerEvent) {
+  if (onCropUp()) { e.stopPropagation(); return }
+  if (stroke) { e.stopPropagation(); endStroke() }
+}
 /** The per-vertex mask as an image: one grey pixel per vertex, 1024 to a row. It rides
  *  to the backend like the captures do, and the bake reads it back by vertex count. */
 function packMask3d(): { data: string; count: number } | null {
@@ -2447,8 +2534,337 @@ function setMirrorGuide(axis: MirrorAxis) {
   notifyStateChanged()   // serialised state, not a graph edit: same persistence gap as the brush
 }
 
+// ── Crop volume ───────────────────────────────────────────────────────────
+
+/** The content's own box in MODEL-local space — the frame the crop box lives in.
+ *
+ *  NOT localBox(): that one measures in pivotGroup space (the frame pivotP lives in), so its
+ *  numbers would mean something different from a box hanging off `model`. One frame for the
+ *  box, the wireframe, the grips, the planes and the sdf, or they drift.
+ *
+ *  A splat keeps its extent inside the SplatMesh — Box3.setFromObject returns an EMPTY box for
+ *  one, which is why Frame model has never worked on a splat — so Spark's own measurement is
+ *  the only source, lifted back out of the OpenCV flip the mesh carries. */
+function contentBox(): THREE.Box3 | null {
+  if (!model) return null
+  model.updateMatrixWorld(true)
+  if (modelIsSplat) {
+    const sm: any = model.children.find((c: any) => typeof c.getBoundingBox === 'function')
+    if (!sm) return null
+    // Centres only: adding each gaussian's radius pads the box by the long tail of stray
+    // splats, which is the very junk the crop is here to cut.
+    const b: THREE.Box3 = sm.getBoundingBox(true)
+    if (!b || b.isEmpty()) return null
+    sm.updateMatrix()
+    return b.clone().applyMatrix4(sm.matrix)
+  }
+  const inv = new THREE.Matrix4().copy(model.matrixWorld).invert()
+  const box = new THREE.Box3()
+  const tmp = new THREE.Box3()
+  const rel = new THREE.Matrix4()
+  model.traverse((child) => {
+    if (!(child instanceof THREE.Mesh) || !child.geometry) return
+    if (!child.geometry.boundingBox) child.geometry.computeBoundingBox()
+    tmp.copy(child.geometry.boundingBox!).applyMatrix4(rel.multiplyMatrices(inv, child.matrixWorld))
+    box.union(tmp)
+  })
+  return box.isEmpty() ? null : box
+}
+
+/** The box, its outline and its six face grips, built once and reused.
+ *
+ *  The grips live in the SCENE rather than under the box on purpose: the box's scale IS the
+ *  half-extents, so a child grip would be stretched into an ellipsoid by a flat crop. Parked in
+ *  the scene they stay round and a constant size on screen, which is what makes them grabbable
+ *  at any zoom. updateCropHandles() puts them back on the faces. */
+function ensureCropObjects() {
+  if (cropBoxObj) return
+  cropBoxObj = new THREE.Object3D()
+  cropBoxObj.name = 'NKDCropBox'
+  cropWire = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2)),
+    new THREE.LineBasicMaterial({ color: 0xffb020, depthTest: false, transparent: true, opacity: 0.9 })
+  )
+  cropWire.renderOrder = 998
+  cropBoxObj.add(cropWire)
+  const geo = new THREE.SphereGeometry(1, 12, 8)
+  for (let axis = 0; axis < 3; axis++) {
+    for (const sign of [1, -1]) {
+      const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: 0xffb020, depthTest: false, transparent: true, opacity: 0.95,
+      }))
+      m.renderOrder = 999
+      m.name = 'NKDCropGrip'
+      m.userData.crop = { axis, sign }
+      cropHandles.push(m)
+      scene.add(m)
+    }
+  }
+}
+
+/** Rebuild everything the crop drives — outline, grips, mesh clip planes, splat sdf — from the
+ *  one box transform, so they cannot disagree. Cheap: call it on every drag frame. */
+function updateCrop() {
+  ensureCropObjects()
+  const box = cropBoxObj!
+  if (model && box.parent !== model) model.add(box)
+  // Half-extents can only be positive, and the gizmo's scale handles will happily drag one
+  // through zero — which mirrors the box, turns every face inside out and vanishes the model.
+  box.scale.set(clampHalf(box.scale.x), clampHalf(box.scale.y), clampHalf(box.scale.z))
+  const shown = cropOn.value && cropHelpersOn
+  box.visible = shown
+  for (const h of cropHandles) h.visible = shown && !gizmoDragging
+  if (!model) return
+  model.updateMatrixWorld(true)
+  box.updateMatrixWorld(true)
+  // The faces come from crop_volume.ts (the sign convention, the part with a test); carrying
+  // them into place is three's Plane.applyMatrix4, which uses the normal matrix and so stays
+  // correct under rotation and non-uniform scale. The box's own matrix holds all three of
+  // centre, orientation and size, which is why a rotated crop needs no extra maths here.
+  unitFaces().forEach((f, i) => {
+    cropPlanes[i].set(new THREE.Vector3(f.n[0], f.n[1], f.n[2]), f.c).applyMatrix4(box.matrixWorld)
+  })
+  updateCropHandles()
+  updateSplatCrop()
+}
+
+/** Splats are not geometry three can clip: Spark draws them from its own buffers with its own
+ *  shader, so clippingPlanes never reach them. It does ship an edit system, and an INVERTED
+ *  box sdf with opacity 0 says "everything outside this box goes transparent" — a crop,
+ *  evaluated on the GPU, with no buffer rebuild and nothing to undo. Rotation comes free:
+ *  Spark encodes the sdf's own quaternion. */
+function updateSplatCrop() {
+  if (!modelIsSplat || !model || !sparkMod || !cropBoxObj) return
+  const sm: any = model.children.find((c: any) => typeof c.getBoundingBox === 'function')
+  if (!sm) return
+  if (!cropEdit) {
+    cropSdf = new sparkMod.SplatEditSdf({ type: 'box', invert: true, opacity: 0 })
+    cropEdit = new sparkMod.SplatEdit({ rgbaBlendMode: 'multiply' })
+    // A CHILD, not addSdf(): Spark reads an sdf's matrixWorld, and one registered through
+    // addSdf is never in the graph, so it keeps an identity matrix — the box would sit in
+    // world space and ignore the model placement entirely.
+    cropEdit.add(cropSdf)
+    // It must be a DESCENDANT of the SplatMesh: that object's own update() is what traverses
+    // for edits. The mesh carries the OpenCV flip, so undo it here and the sdf shares the
+    // model-space frame the crop box is written in.
+    cropEdit.rotation.x = Math.PI
+    sm.add(cropEdit)
+  }
+  // Collected with traverseVisible, so hiding the edit IS the off switch.
+  cropEdit.visible = cropOn.value
+  cropSdf.position.copy(cropBoxObj.position)
+  cropSdf.quaternion.copy(cropBoxObj.quaternion)
+  // A BOX sdf reads its scale as HALF-extents (sizes.xyz in Spark's sdf shader), not as a
+  // transform: Spark forces the scale to 1 before it decomposes the matrix. Which is exactly
+  // what this object's scale already is.
+  cropSdf.scale.copy(cropBoxObj.scale)
+}
+
+/** Hand the planes to every material that draws the model, the depth pass and the contact
+ *  shadow included. Driven from renderFrame because Unbake, Smooth and every load REPLACE
+ *  materials: one owner in the draw path cannot fall out of step with them the way a handful
+ *  of call sites would. Costs one boolean while the crop is off. */
+function applyCropMaterials() {
+  const want = cropOn.value && !modelIsSplat
+  if (!want && !cropMatsOn) return
+  const planes = want ? cropPlanes : null
+  const flip = want !== cropMatsOn // the plane COUNT changed → the shader has to be rebuilt
+  const set = (m: THREE.Material | THREE.Material[] | null | undefined) => {
+    if (!m) return
+    for (const one of Array.isArray(m) ? m : [m]) {
+      one.clippingPlanes = planes
+      if (flip) one.needsUpdate = true
+    }
+  }
+  model?.traverse((c) => { if (c instanceof THREE.Mesh) set(c.material) })
+  set(linearDepthMaterial)
+  set(meshDepthMaterial)
+  set(contactDepthMat)
+  cropMatsOn = want
+}
+
+/** The crop's eight corners as a world-space box. A rotated crop has no axis-aligned form, so
+ *  this is its AABB: the smallest upright box that still contains everything kept. */
+function cropWorldBox(): THREE.Box3 | null {
+  if (!cropBoxObj || !model) return null
+  model.updateMatrixWorld(true)
+  cropBoxObj.updateMatrixWorld(true)
+  const b = new THREE.Box3()
+  const v = new THREE.Vector3()
+  for (let i = 0; i < 8; i++) {
+    v.set(i & 1 ? 1 : -1, i & 2 ? 1 : -1, i & 4 ? 1 : -1).applyMatrix4(cropBoxObj.matrixWorld)
+    b.expandByPoint(v)
+  }
+  return b
+}
+
+/** What the camera should frame, in WORLD space. With a crop on, the crop is the answer —
+ *  that is the whole reason it exists on a monocular scene model. */
+function framingBox(): THREE.Box3 | null {
+  if (!model) return null
+  if (!cropOn.value) {
+    // Per-vertex, and so tighter on a rotated model: exactly what Frame model always used.
+    const w = new THREE.Box3().setFromObject(model)
+    if (!w.isEmpty()) return w
+    const c = contentBox()
+    return c ? c.applyMatrix4(model.matrixWorld) : null
+  }
+  const crop = cropWorldBox()
+  const c = contentBox()
+  const content = c ? c.applyMatrix4(model.matrixWorld) : null
+  if (!crop) return content
+  // Meeting the content matters when the box has been grown past the model: framing the empty
+  // air around it would undo the very zoom the crop was for.
+  if (content) {
+    const met = crop.clone().intersect(content)
+    if (!met.isEmpty()) return met
+  }
+  return crop
+}
+
+/** Box back to the whole model, upright. The starting point you then shrink. */
+function fitCrop() {
+  ensureCropObjects()
+  const b = contentBox()
+  if (!b) { status.value = 'No model to fit the crop to'; return }
+  b.getCenter(cropBoxObj!.position)
+  b.getSize(cropBoxObj!.scale).multiplyScalar(0.5)
+  cropBoxObj!.quaternion.identity()
+  cropFitted = true
+  updateCrop()
+  notifyStateChanged()
+}
+
+/** Upright again without moving or resizing it. Only worth a button because the box can be
+ *  rotated at all: getting back to axis-aligned by hand is fiddly. */
+function resetCropRotation() {
+  if (!cropBoxObj) return
+  cropBoxObj.quaternion.identity()
+  updateCrop()
+  notifyStateChanged()
+}
+
+function toggleCrop() {
+  cropOn.value = !cropOn.value
+  // Switching it on over a box nobody has sized would crop to a meaningless ±1 cube — on a
+  // MoGe scene that is the entire model gone, and it would read as the feature being broken.
+  // Start from the content, so turning it on is always a no-op you then shrink.
+  if (cropOn.value && !cropFitted) fitCrop()
+  else updateCrop()
+  // W/E/R follow whatever is being edited: the box while cropping, the object otherwise.
+  syncGizmoTarget()
+  notifyStateChanged()
+}
+
+/** Park the grips on the six face centres at a constant size on screen. Their world position
+ *  comes from the box's matrix, so they follow rotation and non-uniform scale for free. */
+function updateCropHandles() {
+  if (!cropBoxObj || !cropHandles.length) return
+  const cam = viewCam()
+  cropBoxObj.updateMatrixWorld(true)
+  const p = new THREE.Vector3()
+  for (const h of cropHandles) {
+    const { axis, sign } = h.userData.crop as { axis: number; sign: number }
+    p.set(axis === 0 ? sign : 0, axis === 1 ? sign : 0, axis === 2 ? sign : 0)
+    h.position.copy(p.applyMatrix4(cropBoxObj.matrixWorld))
+    // Sized by distance so a grip stays the same handful of pixels whether you are on top of
+    // the model or across the room from it.
+    h.scale.setScalar(Math.max(h.position.distanceTo(cam.position) * 0.012, 1e-4))
+  }
+}
+
+/** The pointer as a ray in the box's PARENT space (model space). Measuring there rather than in
+ *  world means the model's own placement and scale never have to be divided back out. */
+function cropPointerRay(e: PointerEvent): THREE.Ray | null {
+  if (!model || !host.value) return null
+  const { x, y, w, h } = brushPoint(e)
+  const rc = new THREE.Raycaster()
+  rc.setFromCamera(new THREE.Vector2((x / w) * 2 - 1, -(y / h) * 2 + 1), viewCam())
+  model.updateMatrixWorld(true)
+  return rc.ray.clone().applyMatrix4(new THREE.Matrix4().copy(model.matrixWorld).invert())
+}
+
+/** Which grip is under the pointer, if any. Six spheres is a cheap raycast, and it only runs
+ *  while the crop is on. */
+function cropGripAt(e: PointerEvent): THREE.Mesh | null {
+  if (!cropOn.value || !cropHandles.length || !host.value) return null
+  const { x, y, w, h } = brushPoint(e)
+  const rc = new THREE.Raycaster()
+  rc.setFromCamera(new THREE.Vector2((x / w) * 2 - 1, -(y / h) * 2 + 1), viewCam())
+  const hit = rc.intersectObjects(cropHandles, false)[0]
+  return (hit?.object as THREE.Mesh) ?? null
+}
+
+/** Local direction of one of the box's own axes, in parent space. */
+function cropAxisDir(axis: number): THREE.Vector3 {
+  return new THREE.Vector3(axis === 0 ? 1 : 0, axis === 1 ? 1 : 0, axis === 2 ? 1 : 0)
+    .applyQuaternion(cropBoxObj!.quaternion).normalize()
+}
+
+function onCropDown(e: PointerEvent): boolean {
+  if (e.button !== 0 || gizmoDragging || !cropBoxObj || !model) return false
+  const grip = cropGripAt(e)
+  if (!grip) return false
+  const { axis, sign } = grip.userData.crop as { axis: 0 | 1 | 2; sign: 1 | -1 }
+  const axisL = cropAxisDir(axis)
+  const startHalf = cropBoxObj.scale.getComponent(axis)
+  const origin = cropBoxObj.position.clone().addScaledVector(axisL, sign * startHalf)
+  const camL = viewCam().getWorldDirection(new THREE.Vector3())
+    .transformDirection(new THREE.Matrix4().copy(model.matrixWorld).invert()).normalize()
+  // A plane that CONTAINS the drag axis and faces the camera as squarely as it can: the camera
+  // direction with its component along the axis taken out. Without removing that component the
+  // plane could sit edge-on to the view and the pointer would ride off to infinity.
+  const n = camL.clone().addScaledVector(axisL, -camL.dot(axisL))
+  if (n.lengthSq() < 1e-8) return false   // looking straight down the axis: nothing to drag along
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n.normalize(), origin)
+  const ray = cropPointerRay(e)
+  const hit = ray?.intersectPlane(plane, new THREE.Vector3())
+  if (!hit) return false
+  cropDrag = {
+    axis, sign, plane, axisL, origin,
+    startHalf, startCentre: cropBoxObj.position.clone(),
+    lastT: hit.sub(origin).dot(axisL), acc: 0,
+  }
+  cropDragging.value = true
+  applyControlsEnabled()
+  try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId) } catch { /* no live pointer */ }
+  return true
+}
+
+function onCropMove(e: PointerEvent): boolean {
+  if (!cropDrag || !cropBoxObj) return false
+  const d = cropDrag
+  const ray = cropPointerRay(e)
+  const hit = ray?.intersectPlane(d.plane, new THREE.Vector3())
+  if (!hit) return true
+  const t = hit.sub(d.origin).dot(d.axisL)
+  // Accumulate the POINTER's movement, gained, and derive the face from the START size. The
+  // other way round — gaining the object's own step each frame — leaves the pointer ahead of
+  // the face, so the next frame reads a bigger delta and Shift quietly does nothing. Same
+  // reason the gizmo damps the pointer rather than the object.
+  d.acc += (t - d.lastT) * (isFine(e) ? FINE_GAIN : 1)
+  d.lastT = t
+  const { half, shift } = dragFace(d.startHalf, d.sign, d.acc)
+  cropBoxObj.scale.setComponent(d.axis, half)
+  cropBoxObj.position.copy(d.startCentre).addScaledVector(d.axisL, shift)
+  updateCrop()
+  return true
+}
+
+function onCropUp(): boolean {
+  if (!cropDrag) return false
+  cropDrag = null
+  cropDragging.value = false
+  applyControlsEnabled()
+  notifyStateChanged()
+  return true
+}
+
 function setHelpersVisible(v: boolean) {
+  cropHelpersOn = v
   if (mirrorLine) mirrorLine.visible = v
+  if (cropBoxObj) cropBoxObj.visible = v && cropOn.value
+  for (const h of cropHandles) h.visible = v && cropOn.value && !gizmoDragging
   if (maskOverlay) maskOverlay.visible = v
   if (brushRing && !v) brushRing.visible = false   // never in an export; hover brings it back
   for (const e of lightObjs.values()) if (e.helper) e.helper.visible = v
@@ -2459,7 +2875,7 @@ function setHelpersVisible(v: boolean) {
 function helpersVisible() {
   for (const e of lightObjs.values()) if (e.helper) return e.helper.visible
   if (mirrorLine) return mirrorLine.visible
-  return true
+  return cropHelpersOn
 }
 
 
@@ -2806,7 +3222,7 @@ function toggleGrid() {
 /** Single owner of controls.enabled: the lock AND the gizmo drag both suppress
  *  orbiting, so neither may write the flag directly or they undo each other. */
 function applyControlsEnabled() {
-  if (controls) controls.enabled = !camLocked.value && !gizmoDragging
+  if (controls) controls.enabled = !camLocked.value && !gizmoDragging && !cropDragging
 }
 
 function toggleCamLock() {
@@ -2839,7 +3255,8 @@ function frameModel() {
   // Framing moves the camera, which is exactly what the lock exists to prevent.
   if (camLocked.value) { status.value = 'Camera is locked — unlock to reframe'; return }
   if (!model) return
-  const box = new THREE.Box3().setFromObject(model)
+  const box = framingBox()
+  if (!box) return
   const size = box.getSize(new THREE.Vector3()).length()
   const center = box.getCenter(new THREE.Vector3())
   if (!isFinite(size) || size <= 0) return
@@ -2903,10 +3320,8 @@ function onViewHelperClick(ev: PointerEvent) {
 
 /** What a view should look AT: the model, falling back to the orbit target when there is none. */
 function viewCentre(): THREE.Vector3 {
-  if (model) {
-    const b = new THREE.Box3().setFromObject(model)
-    if (!b.isEmpty()) return b.getCenter(new THREE.Vector3())
-  }
+  const b = framingBox()
+  if (b && !b.isEmpty()) return b.getCenter(new THREE.Vector3())
   return controls?.target.clone() ?? new THREE.Vector3()
 }
 
@@ -2964,6 +3379,15 @@ function serialise(): string {
       pivotC: { x: pivotCustom.x, y: pivotCustom.y, z: pivotCustom.z },
       gizmoSpace: gizmoSpace.value,
       mirrorGuide: mirrorGuide.value,
+      // The box's own transform IS the state: centre, orientation and half-extents.
+      crop: cropBoxObj
+        ? {
+            on: cropOn.value, fitted: cropFitted,
+            pos: cropBoxObj.position.toArray(),
+            quat: cropBoxObj.quaternion.toArray(),
+            half: cropBoxObj.scale.toArray(),
+          }
+        : { on: cropOn.value, fitted: cropFitted },
     },
     // Absent when nothing is painted. A mask still waiting for its model is kept as it
     // came, so a save before the model loads does not lose it.
@@ -3067,9 +3491,24 @@ function deserialise(json: string) {
       // Absent in workflows saved before the toggle existed: those keep three's default, world.
       if (o.gizmoSpace === 'world' || o.gizmoSpace === 'local') setGizmoSpace(o.gizmoSpace)
       if (['none', 'X', 'Y', 'Z'].includes(o.mirrorGuide)) { mirrorGuide.value = o.mirrorGuide; buildMirrorGuide() }
+      // Absent in workflows saved before the crop existed: those stay uncropped, as they were.
+      if (o.crop) {
+        ensureCropObjects()
+        const arr3 = (v: any) => Array.isArray(v) && v.length >= 3 && v.every((n: any) => Number.isFinite(n))
+        if (arr3(o.crop.pos)) cropBoxObj!.position.fromArray(o.crop.pos)
+        if (arr3(o.crop.half)) cropBoxObj!.scale.fromArray(o.crop.half)
+        if (Array.isArray(o.crop.quat) && o.crop.quat.length >= 4 && o.crop.quat.every((n: any) => Number.isFinite(n))) {
+          cropBoxObj!.quaternion.fromArray(o.crop.quat).normalize()
+        }
+        // A restored box IS a sized one: without this, switching it off and on would refit to
+        // the content and throw away the box that came back with the workflow.
+        cropFitted = o.crop.fitted !== false
+        cropOn.value = !!o.crop.on
+      }
       // The model may not be loaded yet — setModel recomputes the pivot and re-applies.
       recomputePivot()
       applyObjectTransform()
+      updateCrop()
     }
     applyLighting()
     if (s.camera) applyCameraInfo(s.camera)
@@ -3171,6 +3610,9 @@ onMounted(() => {
   // lights (the cube-shadow path has no radius blur), so a point light's Size did nothing.
   // VSM blurs the shadow map by shadow.radius for EVERY light type, point included.
   r.shadowMap.type = THREE.VSMShadowMap
+  // Per-material clipping, not renderer.clippingPlanes: the global one would cut the backdrop
+  // quad and the grid too, and the crop is about the model.
+  r.localClippingEnabled = true
   el.appendChild(r.domElement)
   renderer.value = r
 
@@ -3567,6 +4009,19 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                  :title="`Brush radius: ${brushRadius}px`" />
           <button :disabled="!maskHasPaint" @click="clearMask" title="Clear the 3D mask">
             <i class="pi pi-times" />
+          </button>
+        </template>
+        <span class="nkd-ovsep" />
+        <button :class="{ on: cropOn }" @click="toggleCrop"
+                title="Crop volume: keep only what is inside the box and hide the rest. Monocular scene models (MoGe, SHARP) throw their background out towards infinity, so the bounding box is enormous and Frame model is useless; cut it away and the framing has something sane to measure. Drag the dots on each face to pull that face in, or shape the box with W move, E rotate and R scale. Changes the rendered outputs, not the geometry on the model output.">
+          <i class="pi pi-eraser" />
+        </button>
+        <template v-if="cropOn">
+          <button @click="fitCrop" title="Box back to the whole model, upright: the starting point to shrink">
+            <i class="pi pi-expand" />
+          </button>
+          <button @click="resetCropRotation" title="Straighten the box back to the model's axes, leaving it where it is">
+            <i class="pi pi-undo" />
           </button>
         </template>
       </div>

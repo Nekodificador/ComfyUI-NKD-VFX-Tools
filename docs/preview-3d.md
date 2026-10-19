@@ -78,6 +78,43 @@ The painted mask travels too: wire one viewer's `mask3d` into the next one's
 `paint_mask` from its own camera, and can be painted on further. Paint once,
 frame as many views as you like.
 
+## Crop volume
+
+Single-image scene models throw their background out towards infinity. MoGe does
+it on a spherical scene and SHARP does it too. The result is a model whose
+bounding box is enormous while everything you actually want sits in a speck at
+the middle, so Frame model parks the camera a kilometre away and the subject
+lands a few pixels across.
+
+The crop button in the viewport toolbar keeps only what is inside a box and hides
+the rest. It starts from the whole model, so switching it on never removes
+anything until you shape the box.
+
+- **Drag the dot on any face** to pull that face in or out. The opposite face
+  stays where it is, which is what you want when you are cutting one wall away.
+  Hold Shift for tenth speed, same as everywhere else.
+- **W, E and R** move, rotate and scale the box while the crop is on. They go
+  back to driving the object when you switch it off.
+- A rotated box is the point of E: a scene is rarely square to the model's axes,
+  and a slanted cut is often the one that separates the subject from the wall
+  behind it.
+- **Fit** puts the box back around the whole model, upright.
+- **Straighten** takes the rotation out and leaves the box where it is.
+
+The box is drawn as an amber outline with a grip on each face, it follows the
+model's placement, and like every other guide it stays out of the export.
+
+Framing reads the crop, which is the point of the whole thing. Once the far junk
+is outside the box, Frame model has something sane to measure. Splats get a
+working Frame model out of this for the first time, because a gaussian splat
+keeps its extent somewhere three cannot see.
+
+Cropping is a viewport matter. It changes the rendered `image`, `object`, `mask`
+and `depth` together, and it leaves the geometry on the `model` output alone. For
+finishing work on a splat, meaning scattered artefacts cleaned one at a time
+rather than a volume cut away, export it and use a dedicated splat editor. The
+viewer reads back whatever you save.
+
 ## Mirror guide
 
 The Object panel can draw the model's symmetry plane as a dotted outline, X, Y or

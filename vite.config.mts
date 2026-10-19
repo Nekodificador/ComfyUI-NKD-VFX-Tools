@@ -54,6 +54,9 @@ export default defineConfig({
         nkd_depth_range:   "./src/depth_range.ts",
         nkd_pivot:         "./src/pivot.ts",
         nkd_mask_codec:    "./src/mask_codec.ts",
+        // Likewise: the crop volume's six half-spaces, so `node test_crop_volume.mjs` asserts
+        // the sign convention on the shipped function.
+        nkd_crop_volume:   "./src/crop_volume.ts",
         nkd_view_gizmo:    "./src/view_gizmo.ts",
         // Likewise: the position-weld normal smoothing, so `node test_autosmooth.mjs` asserts on
         // the SHIPPED function instead of a re-implementation of it.
