@@ -37,10 +37,10 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from .nkd_vfx_helpers import _gaussian, _mask_grow, _resize_mask, _work_device
+    from .nkd_vfx_helpers import _gaussian, _make_room, _mask_grow, _resize_mask, _work_device
     from .nkd_camera_delta import _quat, _vec
 except ImportError:  # pragma: no cover - standalone (pack dir on sys.path)
-    from nkd_vfx_helpers import _gaussian, _mask_grow, _resize_mask, _work_device
+    from nkd_vfx_helpers import _gaussian, _make_room, _mask_grow, _resize_mask, _work_device
     from nkd_camera_delta import _quat, _vec
 
 # comfy_api only exists inside ComfyUI. Everything above the _HAS_COMFY guard
@@ -802,6 +802,9 @@ if _HAS_COMFY:
                                      "no passes wired, mesh passed through")
 
             device = _work_device(live[0].image)
+            # ponytail: the atlas path holds a few dozen float32 values per texel at its peak
+            _make_room(device, int(texture_size) ** 2 * 4 * 48
+                       + sum(p.image.numel() * 4 * 3 for p in live))
             for p in live:
                 p.to(device)
             # One plane per axis any pass asked for, in placed space, on the device.

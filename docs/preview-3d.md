@@ -143,7 +143,7 @@ without a renderer.
 
 ## Camera pins
 
-Find a scene's perspective by fitting a known object to it. Turn on the pin tool, click the model and drag that point to where it belongs in the image: the object stays still and the camera moves.
+Find a scene's perspective by fitting a known object to it. Turn on Match perspective, next to the camera lock, click the model and drag that point to where it belongs in the image: the object stays still and the camera moves.
 
 - One pin slides the camera. More pins pin down its angle and distance.
 - From four pins on the lens is solved too, unless you turn that off.

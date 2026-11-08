@@ -595,10 +595,11 @@ const blurFrag = (axis: 'x' | 'y') => `
     gl_FragColor = sum;
   }
 `
-let pmrem: THREE.PMREMGenerator | null = null
 let envRT: THREE.WebGLRenderTarget | null = null
 let model: THREE.Object3D | null = null
 let modelIsSplat = false
+let bgKey = ''    // which file the backdrop and the scene depth were loaded from
+let depthKey = ''
 let splatBox: THREE.Box3 | null = null // Spark walks every gaussian to measure: once per model
 let splatPoints: Float32Array | null = null // gaussian centres in model space, for picking pins
 let sparkRenderer: THREE.Object3D | null = null // Spark's draw pass; nothing paints splats without it
@@ -723,7 +724,13 @@ function applyLighting() {
     )
     keyLight.target.position.set(0, 0, 0)
     keyLight.intensity = lightInt.value
-    keyLight.castShadow = shadows.value
+    // A splat casts nothing, and an unused map keeps its ~64 MB until it is let go.
+    keyLight.castShadow = shadows.value && !modelIsSplat
+    if (!keyLight.castShadow && keyLight.shadow.map) {
+      const s: any = keyLight.shadow
+      s.map.dispose(); s.map = null
+      s.mapPass?.dispose(); s.mapPass = null
+    }
     keyLight.shadow.radius = shadowSoft.value // spreads the PCF kernel; needs PCFShadowMap
     const cam = keyLight.shadow.camera as THREE.OrthographicCamera
     cam.left = -12; cam.right = 12; cam.top = 12; cam.bottom = -12
@@ -849,6 +856,22 @@ function whiteEquirect() {
   return new THREE.DataTexture(new Uint8Array(64 * 32 * 4).fill(255), 64, 32)
 }
 
+/** The plate, small, as a 2:1 equirect. PMREM sizes its targets off the source width, and the
+ *  environment is a colour cast: a 4K plate would hold ~190 MiB for what 1024 px says as well.
+ *  Drawn to a canvas, which also keeps it apart from the backdrop quad's own texture. */
+const ENV_WIDTH = 1024
+function plateEquirect(image: HTMLImageElement) {
+  const cv = document.createElement('canvas')
+  cv.width = Math.min(ENV_WIDTH, image.width)
+  cv.height = Math.max(1, Math.round(cv.width / 2))
+  const ctx = cv.getContext('2d')!
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(image, 0, 0, cv.width, cv.height)
+  const t = new THREE.CanvasTexture(cv)
+  t.colorSpace = THREE.SRGBColorSpace
+  return t
+}
+
 /** The backdrop as an environment, so the model picks up the scene's colour.
  *  A flat photo is not a 360 capture — this is a colour cast, not true reflections.
  *  With nothing wired it is a flat white equirect, so Env reads as a plain global fill
@@ -860,15 +883,14 @@ function updateEnvironment() {
   if (!r) return
   envRT?.dispose()
   envRT = null
-  pmrem = pmrem ?? new THREE.PMREMGenerator(r)
+  const pmrem = new THREE.PMREMGenerator(r)
   pmrem.compileEquirectangularShader()
-  // Clone: the backdrop quad draws from this same texture, and switching its mapping to
-  // equirect would wreck how the photo itself is drawn.
-  const equirect = bgTexture ? bgTexture.clone() : whiteEquirect()
+  const equirect = bgTexture ? plateEquirect(bgTexture.image as HTMLImageElement) : whiteEquirect()
   equirect.needsUpdate = true
   equirect.mapping = THREE.EquirectangularReflectionMapping
   envRT = pmrem.fromEquirectangular(equirect)
   equirect.dispose()
+  pmrem.dispose() // it keeps a scratch target as big as the result, and only runs per plate
   scene.environment = envRT.texture
   scene.environmentIntensity = env.value
 }
@@ -1332,6 +1354,14 @@ function lgScale(): number {
   return typeof s === 'number' && s > 0 ? s : 1
 }
 
+/** The viewer only draws for a while after something happens: a resting one costs the GPU
+ *  nothing, however many of them the workflow has. A second of slack covers damping and Spark,
+ *  which sorts in a worker and shows the result on a later frame.
+ *  ponytail: wakes come from input and the exposed calls, not from each setter. A state change
+ *  with neither stays stale until the pointer crosses the viewer. */
+let wakeUntil = 0
+function wake(ms = 1000) { wakeUntil = Math.max(wakeUntil, performance.now() + ms) }
+
 let lastScale = 0
 function loop() {
   // getDelta() every frame, animating or not: it measures the gap since the LAST call, so
@@ -1353,11 +1383,16 @@ function loop() {
     else if (orthoAim.angleTo(camera.quaternion) > 1e-3) setOrthoView(false)
   }
   wasFlying = flying
-  if (pinMode.value) drawPins() // an orbit moves where the model points land
+  if (flying) wake()
   // Re-fit the resolution when the canvas zoom changes — a CSS transform that fires no
   // ResizeObserver, so it must be polled. Reading a number (no layout reflow) is cheap.
   const s = lgScale()
   if (Math.abs(s - lastScale) > 0.001) { lastScale = s; resize() }
+  if (performance.now() >= wakeUntil && !(contact.value && contactDirty)) {
+    raf = requestAnimationFrame(loop)
+    return
+  }
+  if (pinMode.value) drawPins() // an orbit moves where the model points land
   if (contact.value && contactDirty) { renderContactShadow(); contactDirty = false }
   // The Depth panel shows the depth pass itself rather than a second little canvas: same
   // code as the export, full size, and the range gizmo drawn over it.
@@ -1396,6 +1431,7 @@ watch([contactStr, contactBlur, contactSlab], () => { contactDirty = true })
  * produced a giant square before.
  */
 function resize() {
+  wake() // setSize clears the canvas, so it has to be drawn again
   const r = renderer.value
   const el = host.value
   if (!r || !el) return
@@ -1418,14 +1454,15 @@ function resize() {
     : (el.clientHeight || Math.round((w * props.aspect.h) / props.aspect.w))
   if (w < 1 || h < 1) return
   // The displayed size is clientWidth × the LiteGraph canvas zoom (a CSS transform that
-  // clientWidth doesn't see). Render at dpr × zoom × 2 so the buffer matches the on-screen
-  // pixels with 2× supersampling — crisp at any zoom. Capped so a big zoom can't allocate a
+  // clientWidth doesn't see). Render at dpr × zoom so the buffer matches the on-screen
+  // pixels: crisp at any zoom, and MSAA already smooths the edges. Supersampling on top of it
+  // cost four times the memory per viewer. Capped so a big zoom can't allocate a
   // giant target. updateStyle=false keeps the canvas CSS at 100%; only the backing buffer grows.
   const MAX_BUF = 4096
   // In the modal the widget is out of the LiteGraph canvas, so its zoom transform no longer
   // applies — feeding it here would size the buffer for a scale nothing is drawing at.
   const MAX_BUF_SCALE = popped.value ? 1 : lgScale()
-  const target = Math.min(window.devicePixelRatio, 2) * MAX_BUF_SCALE * 2
+  const target = Math.min(window.devicePixelRatio, 2) * MAX_BUF_SCALE
   const ratio = Math.max(0.5, Math.min(target, MAX_BUF / Math.max(w, h)))
   r.setPixelRatio(ratio)
   r.setSize(w, h, false)
@@ -1464,7 +1501,12 @@ function applyBackdrop() {
   m.needsUpdate = true
 }
 
+const refKey = (ref: { filename: string; type: string; subfolder: string }) =>
+  `${ref.type}|${ref.subfolder || ''}|${ref.filename}`
+
 async function setBackground(ref: { filename: string; type: string; subfolder: string } | null) {
+  if (ref && bgTexture && refKey(ref) === bgKey) return // the name comes from the pixels
+  bgKey = ref ? refKey(ref) : ''
   if (!ref) {
     bgTexture?.dispose()
     bgTexture = null
@@ -1691,11 +1733,26 @@ function applySmoothNormals() {
   })
 }
 
+/** Everything a model holds on the GPU: dropping the object frees none of it. Includes what
+ *  Unbake and Smooth keep aside. Spark's objects bring their own dispose. */
+function disposeModel(obj: THREE.Object3D) {
+  obj.traverse((c: any) => {
+    c.dispose?.()
+    c.geometry?.dispose?.()
+    c.userData.nkdOrigGeom?.dispose?.()
+    for (const m of [c.material, c.userData.nkdOrigMat].flat()) {
+      if (!m) continue
+      for (const v of Object.values(m)) if ((v as any)?.isTexture) (v as THREE.Texture).dispose()
+      m.dispose?.()
+    }
+  })
+}
+
 /** One load in flight; a newer call wins and the stale one drops its result. */
 async function setModel(ref: { filename: string; type: string; subfolder: string } | null) {
   const generation = ++loadGeneration
   if (!ref) return
-  const key = `${ref.type}|${ref.subfolder || ''}|${ref.filename}`
+  const key = refKey(ref)
   if (model && key === loadedModelKey) return
   status.value = 'Loading model…'
   try {
@@ -1726,18 +1783,19 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     } else {
       loaded = (await new GLTFLoader().loadAsync(url)).scene
     }
-    if (generation !== loadGeneration) return // superseded; leave the newer load alone
-    if (model) {
-      pins.value = [] // their points belonged to the model that is leaving
-      model.removeFromParent()
-      model = null
-    }
+    if (generation !== loadGeneration) { disposeModel(loaded); return } // superseded; leave the newer load alone
     disposeMaskOverlay()   // the attribute lived on the old geometry
     // The box and the sdf hung off the model that is going away; the box TRANSFORM is the
     // user's and stays. updateCrop() below re-parents it onto the new model.
     cropBoxObj?.removeFromParent()
     cropEdit = null
     cropSdf = null
+    if (model) {
+      pins.value = [] // their points belonged to the model that is leaving
+      model.removeFromParent()
+      disposeModel(model)
+      model = null
+    }
     proj = null
     model = loaded
     modelIsSplat = loadedIsSplat
@@ -1766,6 +1824,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     updateCrop()
     if (maskPaint.value) ensureMaskAttributes()
     applyPendingMask3d()
+    applyLighting() // the key light only casts for meshes
     status.value = ''
   } catch (e: any) {
     if (generation === loadGeneration) status.value = `Model failed: ${e?.message ?? e}`
@@ -3148,6 +3207,14 @@ function cameraInfo() {
 }
 
 /** Render scene / mask / normal at an exact size, off the live viewport size. */
+/** PNG of the canvas as it is NOW: toBlob copies the bitmap when called and encodes off the main
+ *  thread, so the next pass can draw straight away. toDataURL blocked the page for each pass
+ *  and handed back base64 strings a third bigger than the file. */
+function canvasPng(cv: HTMLCanvasElement) {
+  return new Promise<Blob>((ok, fail) =>
+    cv.toBlob((b) => (b ? ok(b) : fail(new Error('PNG encode failed'))), 'image/png'))
+}
+
 async function capture(width: number, height: number) {
   const r = renderer.value
   if (!r) throw new Error('viewport not ready')
@@ -3177,7 +3244,7 @@ async function capture(width: number, height: number) {
   //    it matches the export camera exactly.
   if (contact.value) { renderContactShadow(); contactDirty = false }
   renderFrame()
-  const scene_ = r.domElement.toDataURL('image/png')
+  const scene_ = canvasPng(r.domElement)
 
   // 2. The model alone on transparency. Its alpha is also the mask, so one render serves
   //    both — no reason to draw the same thing twice. The shadow catcher stays out: its
@@ -3191,21 +3258,21 @@ async function capture(width: number, height: number) {
   if (contactGroup) contactGroup.visible = false
   r.setClearColor(0x000000, 0)
   renderFrame(false)
-  const object = r.domElement.toDataURL('image/png')
+  const object = canvasPng(r.domElement)
 
   // 3. Depth — the exact pass the Depth tab previews, gizmo excluded.
   renderDepthPass(true)
-  const depth = r.domElement.toDataURL('image/png')
+  const depth = canvasPng(r.domElement)
 
   // 4. The painted 3D mask, seen from this camera: white where painted, black elsewhere.
   //    Only when there is paint; an all-black mask would just cost an upload.
-  let paintMask: string | undefined
+  let paintMask: Promise<Blob> | undefined
   let mask3d: { data: string; count: number } | null = null
   if (maskHasPaint.value) {
     scene.overrideMaterial = maskExportMat
     renderFrame(false)
     scene.overrideMaterial = null
-    paintMask = r.domElement.toDataURL('image/png')
+    paintMask = canvasPng(r.domElement)
     mask3d = packMask3d()
   }
 
@@ -3221,11 +3288,16 @@ async function capture(width: number, height: number) {
   camera.aspect = prevAspect
   camera.updateProjectionMatrix()
   fitBackground()
+  wake() // the canvas is left holding the last export pass
 
-  return { scene: scene_, object, depth, paintMask, mask3d, camera_info: cameraInfo() }
+  const [sceneBlob, objectBlob, depthBlob, paintBlob] = await Promise.all([scene_, object, depth, paintMask])
+  return { scene: sceneBlob, object: objectBlob, depth: depthBlob, paintMask: paintBlob, mask3d,
+           camera_info: cameraInfo() }
 }
 
 async function setSceneDepth(ref: { filename: string; type: string; subfolder: string } | null) {
+  if (ref && sceneDepthTexture && refKey(ref) === depthKey) return
+  depthKey = ref ? refKey(ref) : ''
   if (!ref) {
     sceneDepthTexture?.dispose()
     sceneDepthTexture = null
@@ -3465,6 +3537,7 @@ async function loadScene(payload: any) {
   // on every run would throw the fit away. Clearing the pins hands it back.
   if (payload.camera_info && !pins.value.length) applyCameraInfo(payload.camera_info)
   if (payload.model_3d_info) applyModelInfo(payload.model_3d_info)
+  wake(3000) // a big splat takes a few sorts to settle
 }
 
 function setFloorClip(on: boolean) {
@@ -3657,6 +3730,7 @@ function serialise(): string {
 }
 
 function deserialise(json: string) {
+  wake()
   try {
     const s = JSON.parse(json)
     if (typeof s.camLocked === 'boolean') {
@@ -3822,6 +3896,7 @@ function onGizmoKey(ev: KeyboardEvent) {
   ev.stopPropagation()
   if (mode) toggleGizmoMode(mode)
   else toggleGizmoSpace()
+  wake()
 }
 
 /** Alt down/up toggles pivot editing. Also on window blur: Alt+Tab steals the keyup, and a
@@ -3831,8 +3906,9 @@ function onAltKey(ev: KeyboardEvent) {
   if (!popped.value && !pointerInView) return
   ev.preventDefault() // bare Alt otherwise reaches for the browser menu bar
   setPivotEdit(ev.type === 'keydown')
+  wake()
 }
-function onWindowBlur() { setPivotEdit(false) }
+function onWindowBlur() { setPivotEdit(false); wake() }
 
 function cleanup() {
   window.removeEventListener('keydown', onGizmoKey, true)
@@ -3859,8 +3935,13 @@ function cleanup() {
   contactHBlur?.dispose()
   contactVBlur?.dispose()
   envRT?.dispose()
-  pmrem?.dispose()
+  if (model) { disposeModel(model); model = null }
+  ;(sparkRenderer as any)?.dispose?.()
+  sparkRenderer = null
   renderer.value?.dispose()
+  // dispose() leaves the context alive until the browser collects it, and Chrome starts
+  // retiring live ones once a page holds too many.
+  renderer.value?.forceContextLoss()
   renderer.value = null
 }
 
@@ -3881,7 +3962,14 @@ onMounted(() => {
   renderer.value = r
 
   // Hold Shift for tenth-speed dragging on every slider in every panel.
-  detachFine = attachFineRange(el.closest('.nkd-p3d') as HTMLElement ?? el)
+  const root = el.closest('.nkd-p3d') as HTMLElement ?? el
+  detachFine = attachFineRange(root)
+  // Every panel and the viewport live under the root and drags capture the pointer, so these
+  // see all the input there is. Capture phase: several handlers stop propagation.
+  for (const type of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'click', 'input', 'change']) {
+    root.addEventListener(type, () => wake(), { capture: true, passive: true })
+  }
+  r.domElement.addEventListener('webglcontextrestored', () => wake())
 
   initScene()
   controls = new OrbitControls(camera, r.domElement)
@@ -3890,6 +3978,7 @@ onMounted(() => {
   controls.dampingFactor = 0.12
   // The key light's world position depends on the camera yaw — track it while orbiting.
   controls.addEventListener('change', applyLighting)
+  controls.addEventListener('change', () => wake())
   // Shift = tenth-speed orbit/pan/dolly, the same modifier as every slider and the gizmo. It
   // rides the SAME pointer damping the gizmo uses (see below) — OrbitControls reads clientX/Y
   // out of the event exactly like TransformControls does, so one shadowing covers both.
@@ -3951,6 +4040,7 @@ onMounted(() => {
   detachGizmoFine = () => r.domElement.removeEventListener('pointermove', dampPointer, true)
 
   transformControls.addEventListener('objectChange', readbackGizmo)
+  transformControls.addEventListener('change', () => wake())
   gizmoHelper = (transformControls as any).getHelper?.() ?? (transformControls as unknown as THREE.Object3D)
   // NOT added to the scene until a gizmo mode is active: the helper's updateMatrixWorld runs
   // on every render regardless of visibility, and with no object attached it throws
@@ -4235,6 +4325,19 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                   : 'Camera free — click to lock it'">
           <i :class="camLocked ? 'pi pi-lock' : 'pi pi-lock-open'" />
         </button>
+        <button :class="{ on: pinMode }" @click="togglePins"
+                title="Match perspective: click the model to pin a point and drag it to its place in the image. The object stays still and the camera moves. Shift drags finer, right-click on a pin deletes it, right-drag orbits. While there are pins a wired camera is only the starting point.">
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M1 6h14M8 6 1 2M8 6 1 14M8 6l7-4M8 6l7 8" /><circle cx="8" cy="6" r="1.6" fill="currentColor" stroke="none" /></svg>
+        </button>
+        <template v-if="pinMode">
+          <button :class="{ on: pinLens }" @click="pinLens = !pinLens; notifyStateChanged()"
+                  :title="`Solve the lens too, from ${PIN_MIN_FOR_LENS} pins on. Off keeps the current focal length.`">
+            <i class="pi pi-camera" />
+          </button>
+          <button :disabled="!pins.length" @click="clearPins" title="Remove every pin. The camera stays where it is.">
+            <i class="pi pi-times" />
+          </button>
+        </template>
         <!-- Gizmo controls, mirrored from the Object panel: same call, same toggle-off, one state.
              Reaching them without opening a panel is the point — the panel covers the model.
              Left to right they follow the KEYS: Q W E R. -->
@@ -4292,22 +4395,6 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           </button>
           <button @click="resetCropRotation" title="Straighten the box back to the model's axes, leaving it where it is">
             <i class="pi pi-undo" />
-          </button>
-        </template>
-      </div>
-      <div class="nkd-overlay" @pointerdown.stop>
-        <span class="nkd-ovsep" />
-        <button :class="{ on: pinMode }" @click="togglePins"
-                title="Camera pins: click the model to pin a point and drag it to its place in the image. The object stays still and the camera moves. Shift drags finer, right-click on a pin deletes it, right-drag orbits. While there are pins a wired camera is only the starting point.">
-          <i class="pi pi-map-marker" />
-        </button>
-        <template v-if="pinMode">
-          <button :class="{ on: pinLens }" @click="pinLens = !pinLens; notifyStateChanged()"
-                  :title="`Solve the lens too, from ${PIN_MIN_FOR_LENS} pins on. Off keeps the current focal length.`">
-            <i class="pi pi-camera" />
-          </button>
-          <button :disabled="!pins.length" @click="clearPins" title="Remove every pin. The camera stays where it is.">
-            <i class="pi pi-times" />
           </button>
         </template>
       </div>

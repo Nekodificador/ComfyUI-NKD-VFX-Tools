@@ -68,12 +68,13 @@ function keepDomWidgetSized(node: any, container: HTMLElement): () => void {
 }
 
 
-// djb2 over a string — cheap, good enough to tell two renders apart. Length is mixed in to
-// shrink the already-tiny collision chance for same-length data URLs.
-function hashStr(s: string): string {
+// djb2 over the bytes — cheap, good enough to tell two renders apart. Length is mixed in to
+// shrink the already-tiny collision chance. Not crypto.subtle: it only exists on https or
+// localhost, and ComfyUI is often opened over the LAN.
+function hashBytes(b: Uint8Array): string {
   let h = 5381
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
-  return `${s.length}:${h >>> 0}`
+  for (let i = 0; i < b.length; i++) h = ((h << 5) + h + b[i]) | 0
+  return `${b.length}:${h >>> 0}`
 }
 
 async function uploadShot(shot: any) {
@@ -90,8 +91,8 @@ async function uploadShot(shot: any) {
   return JSON.stringify(out)
 }
 
-async function uploadTempImage(dataUrl: string, prefix: string) {
-  const blob = await fetch(dataUrl).then((r) => r.blob())
+async function uploadTempImage(png: Blob | string, prefix: string) {
+  const blob = typeof png === 'string' ? await fetch(png).then((r) => r.blob()) : png
   const name = `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.png`
   const body = new FormData()
   body.append('image', new File([blob], name, { type: 'image/png' }))
@@ -266,7 +267,7 @@ comfyApp.registerExtension({
           const height = node.widgets?.find((w: any) => w.name === 'height')?.value ?? 1024
           try {
             const shot = await api_.capture(width, height)
-            const hash = shotHash(shot, width, height)
+            const hash = await shotHash(shot, width, height)
             // Nothing moved since the last capture → reuse the already-uploaded paths so the
             // widget value is byte-identical and the node stays cached.
             if (hash === lastRenderHash && lastValue) return lastValue
@@ -388,10 +389,9 @@ comfyApp.registerExtension({
       let lastSession = ''
 
       // The painted mask is part of the export: a brush stroke has to re-run the node.
-      const shotHash = (shot: any, width: number, height: number) => hashStr(
-        `${width}x${height}|${JSON.stringify(shot.camera_info)}|` +
-        `${shot.scene}${shot.object}${shot.depth}${shot.paintMask ?? ''}`
-      )
+      const shotHash = async (shot: any, width: number, height: number) => hashBytes(new Uint8Array(
+        await new Blob([`${width}x${height}|${JSON.stringify(shot.camera_info)}|`,
+                        shot.scene, shot.object, shot.depth, shot.paintMask ?? '']).arrayBuffer()))
 
       const onScene = async (e: any) => {
         const d = e?.detail
@@ -426,7 +426,7 @@ comfyApp.registerExtension({
           if (!api_) error = 'viewport not mounted'
           if (api_) {
             const shot = await api_.capture(d.width, d.height)
-            const hash = shotHash(shot, d.width, d.height)
+            const hash = await shotHash(shot, d.width, d.height)
             // Loading the scene changed nothing visible (the usual case once a model is
             // in): hand back the paths already uploaded rather than a second copy of the
             // same pixels under a new name.

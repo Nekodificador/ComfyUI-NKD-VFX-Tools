@@ -176,11 +176,16 @@ class TrimeshIO(ComfyTypeIO):
 
 def _tensor_to_temp_png(image, prefix: str) -> str:
     """Write an IMAGE tensor's first frame to the temp dir. Returns an annotated path."""
-    array = (image[0].cpu().numpy() * 255).astype(np.uint8)
+    array = np.ascontiguousarray((image[0].cpu().numpy() * 255).astype(np.uint8))
     temp_dir = folder_paths.get_temp_directory()
     os.makedirs(temp_dir, exist_ok=True)  # may not exist yet, or have been cleaned
-    filename = f"{prefix}_{uuid.uuid4().hex}.png"
-    PILImage.fromarray(array).save(os.path.join(temp_dir, filename), compress_level=1)
+    # Named by content: the same pixels are the same file, so a re-run writes nothing and the
+    # viewport skips the reload, instead of paying for it on every execution.
+    digest = hashlib.sha1(array).hexdigest()[:16]
+    filename = f"{prefix}_{array.shape[1]}x{array.shape[0]}_{digest}.png"
+    path = os.path.join(temp_dir, filename)
+    if not os.path.exists(path):
+        PILImage.fromarray(array).save(path, compress_level=1)
     return filename
 
 
@@ -192,8 +197,11 @@ def _stable_temp_name(path: str, ext: str) -> str:
     queue: a visible flash, and a pile of temp files. Same bytes now means the same
     name, which the browser and the widget can both skip.
     """
+    sha = hashlib.sha1()
     with open(path, "rb") as f:
-        digest = hashlib.sha1(f.read()).hexdigest()[:16]
+        for chunk in iter(lambda: f.read(1 << 20), b""):  # these files run to hundreds of MB
+            sha.update(chunk)
+    digest = sha.hexdigest()[:16]
     name = f"nkd_preview3d_{digest}{ext}"
     target = os.path.join(os.path.dirname(path), name)
     if os.path.exists(target):
@@ -457,10 +465,8 @@ class NKDPreview3D(io.ComfyNode):
         # before execution. Hand over what we actually ran with so it can catch up.
         mask3d_ref = None
         if mask3d_in is not None and getattr(mask3d_in, "count", 0) > 0:
-            # Packed the way the viewport packs its own, and named by content, so the
-            # same mask sent twice is the same file.
+            # Packed the way the viewport packs its own.
             fn = _tensor_to_temp_png(_pack_mask3d(mask3d_in.values), "nkd_mask3d")
-            fn = _stable_temp_name(os.path.join(folder_paths.get_temp_directory(), fn), ".png")
             mask3d_ref = {"filename": fn, "type": "temp", "subfolder": "", "count": mask3d_in.count}
 
         fresh = await _fresh_capture({
@@ -584,6 +590,16 @@ def demo():
     with open(path, "rb") as f:
         assert f.read(4) == b"glTF", "the viewport loads it as a glTF binary"
     os.remove(path)
+
+    # The backdrop is named by its pixels: a re-run must hand the viewport the same file, or it
+    # reloads the plate and rebuilds the environment on every execution.
+    plate = torch.rand(1, 6, 8, 3)
+    a = _tensor_to_temp_png(plate, "nkd_test")
+    assert _tensor_to_temp_png(plate.clone(), "nkd_test") == a, "same pixels, same file"
+    b = _tensor_to_temp_png(1.0 - plate, "nkd_test")
+    assert b != a, "other pixels must not reuse the file"
+    for fn in (a, b):
+        os.remove(os.path.join(folder_paths.get_temp_directory(), fn))
 
     # A bare string resolves against input first, then output (Hy3DExportMesh returns
     # output-relative paths like "3D/Hy3D_00005_.glb" — serving those as input 404s).

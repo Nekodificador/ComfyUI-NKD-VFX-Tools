@@ -19,7 +19,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io, ui
 
 from .nkd_vfx_helpers import (_gaussian, _luminance, _resize_auto, _resize_mask,
-                              _work_device, preview_frames)
+                              _make_room, _work_device, preview_frames)
 
 _BLENDS = ["Reoriented", "UDN", "Overlay"]
 _RESOLUTIONS = ["image", "normals"]
@@ -124,6 +124,8 @@ def apply_normal_detail(normals, image, resolution, amount, blend, bands,
         return enc(out), enc(d)
 
     device = _work_device(normals)
+    # ponytail: rough peak of the band stack; generous, since a short guess costs an OOM
+    _make_room(device, max(normals.shape[0], image.shape[0]) * w * h * 4 * 32)
     try:
         out, det = run(device)
     except torch.cuda.OutOfMemoryError:

@@ -1256,11 +1256,14 @@ function rimFieldFor(l: Light): Uint8Array | null {
   if (!passMasks || l.rimAmount <= 0 || l.rimMask < 1 || l.rimMask > MASK_SLOTS || !maskSlots.value[l.rimMask - 1]) return null;
   const key = `${l.rimMask - 1}|${l.rimWidth}`;
   let f = rimCache.get(key);
-  if (!f) {
-    if (rimCache.size > 24) rimCache.clear();  // dragging Width mints a key per step
+  if (f) {
+    rimCache.delete(key);  // most recent last, so the lights in use are never the ones dropped
+  } else {
+    // Dragging Width mints a key per step, at up to 4 MB each.
+    if (rimCache.size > MAX_LIGHTS) rimCache.delete(rimCache.keys().next().value!);
     f = buildRimField(l.rimMask - 1, l.rimWidth);
-    rimCache.set(key, f);
   }
+  rimCache.set(key, f);
   return f;
 }
 
@@ -1468,6 +1471,7 @@ function destroyWebGL() {
   Object.values(glTextures).forEach(t => t && gl!.deleteTexture(t));
   if (glQuadBuf) gl.deleteBuffer(glQuadBuf);
   if (glProgram) gl.deleteProgram(glProgram);
+  gl.getExtension("WEBGL_lose_context")?.loseContext();  // or the context outlives the node
   glOffscreen = null; gl = null; glProgram = null; glReady = false;
 }
 
@@ -1961,7 +1965,9 @@ function setPasses(data: PassData) {
 
 function decodeB64(b64: string): Uint8Array {
   const bin = atob(b64);
-  return Uint8Array.from(bin, c => c.charCodeAt(0));
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
 }
 
 // ── Serialisation ───────────────────────────────────────────────────────────

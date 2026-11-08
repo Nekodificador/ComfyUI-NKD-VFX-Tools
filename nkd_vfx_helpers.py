@@ -293,6 +293,19 @@ def preview_frames(x: torch.Tensor, count: int = _PREVIEW_FRAMES) -> torch.Tenso
     return x[idx]
 
 
+def _make_room(device: torch.device, nbytes: int) -> None:
+    """Ask ComfyUI to unload models until `nbytes` fit on `device`. Without it a node grabs
+    VRAM the loaded models already hold: an OOM, or Windows spilling into shared memory
+    and the whole desktop stalling. No-op on CPU and outside ComfyUI."""
+    if device.type == "cpu":
+        return
+    try:
+        import comfy.model_management as mm
+        mm.free_memory(int(nbytes), device)
+    except Exception:
+        pass
+
+
 def _work_device(x: torch.Tensor) -> torch.device:
     if x.device.type != "cpu":
         return x.device
