@@ -597,7 +597,13 @@ onMounted(() => {
   // Hold Shift for tenth-speed dragging on every slider in the panel.
   detachFine = attachFineRange(wrap.value?.parentElement ?? document.body);
 });
-onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
+onBeforeUnmount(() => {
+  ro?.disconnect();
+  detachFine?.();
+  // Every open of the editor makes a new context: the closed one has to go with it.
+  gl?.getExtension("WEBGL_lose_context")?.loseContext();
+  gl = null;
+});
 </script>
 
 <template>

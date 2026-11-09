@@ -344,12 +344,21 @@ def _relight(rgb, normals, depth, albedo, roughness, lights_config, unique_id=""
     if unique_id:
         _send_passes_to_frontend(unique_id, rgb, normals, depth, albedo, roughness, mask_list)
 
-    # Full batched relighting on GPU
-    return _relight_gpu(
-        rgb, normals, depth, albedo, roughness,
-        lights, ambient_intensity, ambient_color, delit_mix, roughness_strength,
-        shadows, mask_list, look
-    )
+    # One frame at a time: each light makes several image-sized temporaries, and on a whole
+    # clip they all exist at once. Peak memory now stays that of a single frame.
+    args = (lights, ambient_intensity, ambient_color, delit_mix, roughness_strength, shadows)
+    B = rgb.shape[0]
+    if B == 1:
+        return _relight_gpu(rgb, normals, depth, albedo, roughness, *args, mask_list, look)
+    frame = lambda t, i: None if t is None else t[min(i, t.shape[0] - 1)].unsqueeze(0)
+    out = None
+    for i in range(B):
+        o = _relight_gpu(frame(rgb, i), frame(normals, i), frame(depth, i), frame(albedo, i),
+                         frame(roughness, i), *args, [frame(m, i) for m in mask_list], look)
+        if out is None:
+            out = o.new_empty((B,) + tuple(o.shape[1:]))
+        out[i] = o[0]
+    return out
 
 
 def _relight_gpu(rgb, normals, depth, albedo, roughness,
@@ -987,6 +996,20 @@ def demo() -> None:
     assert sent["passes"]["width"] == W and sent["passes"]["height"] == H
     assert n_bytes("rgb") == H * W * 3 and n_bytes("depth") == H * W * 3, (n_bytes("rgb"), n_bytes("depth"))
     assert n_bytes("masks") == H * W * 4 and sent["passes"]["maskSlots"] == [True, False, False, False]
+
+    # Frame by frame must equal the whole batch at once, with shadows, a mask and the look on.
+    Bt = 3
+    cfg = json.dumps({"lights": [dict(light, mask=1), {"type": "point", "x": 0.3, "y": 0.4,
+                      "intensity": 2.0}], "shadowsEnabled": True, "exposure": 0.5})
+    rgb3, dep3 = torch.rand(Bt, H, W, 3), torch.rand(Bt, H, W, 3)
+    mask3 = torch.rand(Bt, H, W)
+    per_frame = _relight(rgb3, tilted.expand(Bt, -1, -1, -1), dep3, None, None, cfg,
+                         masks={"mask_1": mask3})
+    st = _parse_state(cfg)
+    whole = _relight_gpu(rgb3, tilted.expand(Bt, -1, -1, -1), dep3, None, None, *st[:6],
+                         [mask3, None, None, None], st[6])
+    assert per_frame.shape == whole.shape and torch.allclose(per_frame, whole, atol=1e-6), \
+        (per_frame - whole).abs().max()
 
     print("relighting_node self-check OK")
 

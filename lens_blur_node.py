@@ -64,7 +64,11 @@ class NKDLensBlurNode:
         if unique_id:
             self._send_passes_to_frontend(unique_id, rgb, depth)
 
-        result = self._blur_gpu(rgb, depth, focal_depth, field_of_depth, blur_strength)
+        # Frame by frame: a whole clip at once multiplied the peak by its length.
+        result = torch.empty_like(rgb)
+        for i in range(rgb.shape[0]):
+            d = depth[min(i, depth.shape[0] - 1)].unsqueeze(0)
+            result[i] = self._blur_gpu(rgb[i:i + 1], d, focal_depth, field_of_depth, blur_strength)[0]
         return (result,)
 
     def _sample_depth(self, depth, nx: float, ny: float) -> float:
@@ -110,63 +114,39 @@ class NKDLensBlurNode:
         x     = rgb_f[..., :3].permute(0, 3, 1, 2)  # (B, 3, H, W)
         Crgb  = 3
 
-        # All levels in one fused conv2d call:
-        # Treat each (level, channel) pair as an independent group so CUDA
-        # launches a single kernel instead of N sequential ones.
-        # x_rep: (B, N*3, H, W) — replicate the image N times along the channel dim
-        x_rep = x.repeat(1, N, 1, 1)  # (B, N*3, H, W)
-
-        # Build the combined weight tensor (N*3, 1, 1, K_max) for the row pass
-        # and (N*3, 1, K_max, 1) for the col pass.
-        # Each level gets its own 1-D Gaussian (zero-padded to K_max).
+        # One level at a time, each added with its share of the two levels that bracket the
+        # pixel. The fused version replicated the image N times along the channels, so every
+        # level lived at once: N x 3 full-size planes, several times over.
         max_radius = max(1, int(math.ceil(3.0 * max(s for s in sigmas if s >= 0.5))))
         K = 2 * max_radius + 1
         pad_w = min(max_radius, W // 2 - 1) if W > 2 else 0
         pad_h = min(max_radius, H // 2 - 1) if H > 2 else 0
-
-        row_weights = torch.zeros(N * Crgb, 1, 1, K, device=dev)
-        col_weights = torch.zeros(N * Crgb, 1, K, 1, device=dev)
-
         coords = torch.arange(K, dtype=torch.float32, device=dev) - max_radius
+
+        idx_f  = blur_amount * (N - 1)
+        idx_lo = idx_f.long().clamp(0, N - 2)
+        t      = (idx_f - idx_lo.float()).clamp(0.0, 1.0)
+
+        # Replicate-pad before each pass so border pixels are extended, not zeroed.
+        # This prevents the dark-edge vignette caused by zero-padding in F.conv2d.
+        x_pad = F.pad(x, (pad_w, pad_w, 0, 0), mode='replicate')
+        result = torch.zeros_like(x)
         for li, sigma in enumerate(sigmas):
+            share = ((idx_lo == li).float() * (1.0 - t) + (idx_lo == li - 1).float() * t).unsqueeze(1)
+            if not bool(share.any()):
+                continue
             if sigma < 0.5:
                 g = torch.zeros(K, device=dev)
                 g[max_radius] = 1.0
             else:
                 g = torch.exp(-0.5 * (coords / sigma) ** 2)
                 g = g / g.sum()
-            for c in range(Crgb):
-                idx = li * Crgb + c
-                row_weights[idx, 0, 0, :] = g
-                col_weights[idx, 0, :, 0] = g
+            out = F.conv2d(x_pad, g.view(1, 1, 1, K).repeat(Crgb, 1, 1, 1), groups=Crgb)
+            out = F.pad(out, (0, 0, pad_h, pad_h), mode='replicate')
+            out = F.conv2d(out, g.view(1, 1, K, 1).repeat(Crgb, 1, 1, 1), groups=Crgb)
+            result += out * share
 
-        # Replicate-pad before each pass so border pixels are extended, not zeroed.
-        # This prevents the dark-edge vignette caused by zero-padding in F.conv2d.
-        out = F.pad(x_rep, (pad_w, pad_w, 0, 0), mode='replicate')
-        out = F.conv2d(out, row_weights, padding=0, groups=N * Crgb)
-        out = F.pad(out, (0, 0, pad_h, pad_h), mode='replicate')
-        out = F.conv2d(out, col_weights, padding=0, groups=N * Crgb)
-        # out: (B, N*3, H, W) — reshape to (B, N, 3, H, W)
-        stack = out.view(B, N, Crgb, H, W)
-
-        idx_f  = blur_amount * (N - 1)
-        idx_lo = idx_f.long().clamp(0, N - 2)
-        idx_hi = (idx_lo + 1).clamp(0, N - 1)
-        t      = (idx_f - idx_lo.float()).clamp(0.0, 1.0)
-
-        # Gather the two bracketing levels per pixel
-        # idx: (B, H, W) → expand to (B, 3, H, W) for indexing along dim 1 (levels)
-        idx_lo_e = idx_lo.unsqueeze(1).expand(B, Crgb, H, W)  # (B, 3, H, W)
-        idx_hi_e = idx_hi.unsqueeze(1).expand(B, Crgb, H, W)
-        t_e      = t.unsqueeze(1).expand(B, Crgb, H, W)
-
-        # stack: (B, N, 3, H, W) → (B, 3, H, W, N) for gather on last dim
-        stack_p = stack.permute(0, 2, 3, 4, 1)
-        lo = stack_p.gather(4, idx_lo_e.unsqueeze(-1)).squeeze(-1)
-        hi = stack_p.gather(4, idx_hi_e.unsqueeze(-1)).squeeze(-1)
-
-        result = torch.lerp(lo, hi, t_e).clamp(0.0, 1.0)  # (B, 3, H, W)
-        result = result.permute(0, 2, 3, 1)                 # (B, H, W, 3)
+        result = result.clamp(0.0, 1.0).permute(0, 2, 3, 1)  # (B, H, W, 3)
 
         # Re-attach original alpha channel untouched
         if C == 4:

@@ -140,3 +140,13 @@ without a renderer.
 ---
 
 [← All 😺NKD VFX Tools nodes](../README.md)
+
+## Camera pins
+
+Find a scene's perspective by fitting a known object to it. Turn on Match perspective, next to the camera lock, click the model and drag that point to where it belongs in the image: the object stays still and the camera moves.
+
+- One pin slides the camera. More pins pin down its angle and distance.
+- From four pins on the lens is solved too, unless you turn that off.
+- Hold Shift to drag finer. Right-click a pin to delete it. Right-drag orbits.
+- Works on meshes and splats. Turning the tool on unlocks the camera.
+- A wired `camera_info` is the starting point: while there are pins it no longer replaces the result. Clear the pins to hand the camera back.

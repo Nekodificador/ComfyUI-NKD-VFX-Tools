@@ -53,6 +53,7 @@ export default defineConfig({
         // asserted against outside a browser.
         nkd_depth_range:   "./src/depth_range.ts",
         nkd_pivot:         "./src/pivot.ts",
+        nkd_pin_solver:    "./src/pin_solver.ts",
         nkd_mask_codec:    "./src/mask_codec.ts",
         // Likewise: the crop volume's six half-spaces, so `node test_crop_volume.mjs` asserts
         // the sign convention on the shipped function.
