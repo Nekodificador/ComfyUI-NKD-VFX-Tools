@@ -59,6 +59,9 @@ export default defineConfig({
         // the sign convention on the shipped function.
         nkd_crop_volume:   "./src/crop_volume.ts",
         nkd_view_gizmo:    "./src/view_gizmo.ts",
+        // Likewise: the pin ghost view's shaders, so test_ghost_edges.html builds its materials
+        // from the shipped strings.
+        nkd_ghost_edges:   "./src/ghost_edges.ts",
         // Likewise: the position-weld normal smoothing, so `node test_autosmooth.mjs` asserts on
         // the SHIPPED function instead of a re-implementation of it.
         nkd_smooth_normals: "./src/smooth_normals.ts",

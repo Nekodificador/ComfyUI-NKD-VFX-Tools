@@ -21,6 +21,7 @@ import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { solvePins } from './pin_solver'
 import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
 import { clampHalf, dragFace, unitFaces } from './crop_volume'
+import { AUX_FRAG, AUX_VERT, COMPOSITE_FRAG, COMPOSITE_VERT, edgeThresholds } from './ghost_edges'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
@@ -306,6 +307,12 @@ const pinCanvas = ref<HTMLCanvasElement | null>(null)
 let pinDrag: { pin: CamPin; x: number; y: number } | null = null
 const PIN_GRAB = 14 // viewport pixels
 const PIN_MIN_FOR_LENS = 4 // below this the lens is underdetermined and would just wander
+// Ghost view while pinning: the object see-through with its contours in yellow, so the photo's
+// own object shows through and edges can be laid on edges. View only: capture() never sees it.
+const ghostView = ref(true)
+const ghostOpacity = ref(0.35)
+const ghostDetail = ref(0.5)
+const ghostBack = ref(true) // hidden contours, dashed (meshes only)
 
 // ── 3D mask brush ─────────────────────────────────────────────────────────
 // Paint, on the model itself, the region an inpaint may touch. The mask lives on the
@@ -598,6 +605,7 @@ const blurFrag = (axis: 'x' | 'y') => `
 let envRT: THREE.WebGLRenderTarget | null = null
 let model: THREE.Object3D | null = null
 let modelIsSplat = false
+const modelIsSplatRef = ref(false) // the same, for the template
 let bgKey = ''    // which file the backdrop and the scene depth were loaded from
 let depthKey = ''
 let splatBox: THREE.Box3 | null = null // Spark walks every gaussian to measure: once per model
@@ -1222,6 +1230,211 @@ function drawOverFloor(r: THREE.WebGLRenderer) {
   floor.forEach((o, i) => { o.visible = shown[i] })
 }
 
+// ── Ghost view (camera pins) ──────────────────────────────────────────────
+// Two buffers and one composite (src/ghost_edges.ts): the object alone, and what its edges are
+// measured on. Drawn only from loop(); capture() calls renderFrame() and never comes here.
+let ghostRT: THREE.WebGLRenderTarget | null = null
+let auxRT: THREE.WebGLRenderTarget | null = null
+let backRT: THREE.WebGLRenderTarget | null = null
+const auxMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true })
+const auxFlatMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true, defines: { FLAT: 1 } })
+// The back layer: the same aux, peeled against the front one (both share these uniforms).
+const peelUniforms = { tFront: { value: null as THREE.Texture | null }, peelTexel: { value: new THREE.Vector2() }, peelSlack: { value: 0 } }
+const peelMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true, defines: { PEEL: 1 }, uniforms: peelUniforms })
+const peelFlatMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true, defines: { PEEL: 1, FLAT: 1 }, uniforms: peelUniforms })
+const ghostMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tGhost: { value: null }, tAux: { value: null }, texel: { value: new THREE.Vector2() },
+    tBack: { value: null }, back: { value: false }, backColor: { value: new THREE.Color(0.35, 0.75, 1) },
+    thick: { value: 1 }, opacity: { value: 0.35 }, depthThr: { value: 0 }, normalThr: { value: 0 },
+    splat: { value: false }, logNear: { value: 0 }, logFar: { value: 1 },
+    edgeColor: { value: new THREE.Color(1, 0.85, 0) },
+  },
+  vertexShader: COMPOSITE_VERT, fragmentShader: COMPOSITE_FRAG,
+  transparent: true, depthTest: false, depthWrite: false,
+})
+const ghostQuad = new THREE.Scene()
+ghostQuad.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), ghostMat))
+
+/** A splat has no surface to give a normal, so its aux pass is depth only: a second
+ *  SparkRenderer in a scene of its own, with a SplatMesh that SHARES the packed data and a
+ *  modifier writing Spark's log-normalised depth as colour. Swapping a modifier on the one mesh
+ *  between two renders does not work: Spark regenerates on the NEXT render (measured), so each
+ *  pass would show the other's colours. A uniform near/far change has the same one-render lag,
+ *  which is why the decode uses the range of the previous render. */
+let splatAux: {
+  src: any; scene: THREE.Scene; spark: any; mesh: any; zN: any; zF: any
+  edit: any; sdf: any; used: [number, number]
+} | null = null
+function disposeSplatAux() {
+  if (!splatAux) return
+  splatAux.spark.dispose?.()
+  splatAux.mesh.packedSplats = undefined // shared with the visible mesh: not ours to free
+  splatAux.mesh.dispose?.()
+  splatAux = null
+}
+function ensureSplatAux(src: any) {
+  if (splatAux?.src === src) return splatAux!
+  disposeSplatAux()
+  const { SplatMesh, SparkRenderer, dyno } = sparkMod
+  const scn = new THREE.Scene()
+  const spark = new SparkRenderer({ renderer: renderer.value })
+  const mesh = new SplatMesh({ packedSplats: src.packedSplats })
+  mesh.matrixAutoUpdate = false
+  scn.add(spark, mesh)
+  const zN = dyno.dynoFloat(0.1), zF = dyno.dynoFloat(10)
+  mesh.enableWorldToView = true
+  mesh.worldModifier = dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }: any) => {
+    let { center } = dyno.splitGsplat(gsplat).outputs
+    center = mesh.context.worldToView.apply(center)
+    const d = dyno.normalizedDepth(dyno.neg(dyno.split(center).outputs.z), zN, zF)
+    return { gsplat: dyno.combineGsplat({ gsplat, r: d, g: d, b: d }) }
+  })
+  mesh.updateGenerator()
+  // Its own copy of the crop: the visible mesh's edit can only have one parent.
+  const { edit, sdf } = makeCropEdit()
+  mesh.add(edit)
+  splatAux = { src, scene: scn, spark, mesh, zN, zF, edit, sdf, used: [0.1, 10] }
+  return splatAux!
+}
+function renderSplatAux(r: THREE.WebGLRenderer, sm: any) {
+  const a = ensureSplatAux(sm)
+  a.mesh.matrix.copy(sm.matrixWorld)
+  a.edit.visible = cropOn.value
+  if (cropBoxObj) {
+    a.sdf.position.copy(cropBoxObj.position)
+    a.sdf.quaternion.copy(cropBoxObj.quaternion)
+    a.sdf.scale.copy(cropBoxObj.scale)
+  }
+  // Tight range around the object: Spark keeps colour in 8 bits, so the range IS the precision.
+  // With the crop on, around the crop: a MoGe-scale splat reaches far past what is kept, and
+  // spreading 256 steps over all of it would band at the default threshold.
+  const box = cropOn.value && cropBoxObj
+    ? new THREE.Box3(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1)).applyMatrix4(cropBoxObj.matrixWorld)
+    : modelBox()
+  const sphere = box.getBoundingSphere(new THREE.Sphere())
+  const dist = camera.position.distanceTo(sphere.center)
+  const n = Math.max(1e-3, dist - sphere.radius * 1.1)
+  const f = dist + sphere.radius * 1.1
+  const [pn, pf] = a.used
+  ghostMat.uniforms.logNear.value = Math.log2(pn + 1)
+  ghostMat.uniforms.logFar.value = Math.log2(pf + 1)
+  if (Math.abs(n - a.zN.value) > 1e-6 || Math.abs(f - a.zF.value) > 1e-6) {
+    a.zN.value = n
+    a.zF.value = f
+    a.mesh.updateVersion()
+  }
+  a.used = [a.zN.value, a.zF.value]
+  r.render(a.scene, viewCam())
+}
+
+function sizeGhostTargets(w: number, h: number) {
+  if (ghostRT?.width === w && ghostRT.height === h) return
+  ghostRT?.dispose()
+  auxRT?.dispose()
+  backRT?.dispose()
+  ghostRT = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, samples: 4 })
+  // No MSAA and nearest: the edges are measured on exact values, not on blends of them.
+  const exact = { type: THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter }
+  auxRT = new THREE.WebGLRenderTarget(w, h, exact)
+  backRT = new THREE.WebGLRenderTarget(w, h, exact)
+}
+function disposeGhost() {
+  ghostRT?.dispose()
+  auxRT?.dispose()
+  backRT?.dispose()
+  ghostRT = auxRT = backRT = null
+  disposeSplatAux()
+}
+// Two half-float targets (one 4× MSAA) and maybe a second SparkRenderer: hold them only while
+// the view is up.
+watch(() => pinMode.value && ghostView.value, (on) => { if (!on) disposeGhost() })
+
+/** Pin mode with the ghost on draws this instead of renderFrame. The floor layers stay out:
+ *  the point is to see the photo, and a grid or a shadow ghosted over it is only noise. */
+function renderGhostView() {
+  const r = renderer.value
+  if (!r || !model) { renderFrame(); return }
+  syncMaskOverlay()
+  applyCropMaterials()
+  if (cropOn.value) updateCropHandles()
+  const size = r.getDrawingBufferSize(new THREE.Vector2())
+  sizeGhostTargets(size.x, size.y)
+  const floor = [grid, shadowCatcher, contactGroup, gizmoHelper, rangeGizmo].filter(Boolean) as THREE.Object3D[]
+  const shown = floor.map((o) => o.visible)
+  floor.forEach((o) => { o.visible = false })
+  const prevClear = r.getClearColor(new THREE.Color())
+  const prevAlpha = r.getClearAlpha()
+  r.setClearColor(0x000000, 0)
+  r.setRenderTarget(ghostRT)
+  r.clear()
+  r.render(scene, viewCam())
+  // The aux pass is the object and nothing else: a helper there would get outlined too.
+  const helpers = helpersVisible()
+  setHelpersVisible(false)
+  r.setRenderTarget(auxRT)
+  r.clear()
+  r.shadowMap.autoUpdate = false // same frame, same shadows: the ghost pass already drew them
+  const sm: any = modelIsSplat ? model.children.find((c: any) => c.packedSplats) : null
+  if (sm) renderSplatAux(r, sm)
+  else if (!modelIsSplat) {
+    const restore = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? auxMat : auxFlatMat))
+    r.render(scene, viewCam())
+    restore()
+    // Hidden contours: one depth peel. A splat has no depth buffer to peel against.
+    if (ghostBack.value) {
+      peelUniforms.tFront.value = auxRT!.texture
+      peelUniforms.peelTexel.value.set(1 / size.x, 1 / size.y)
+      // ponytail: 1% of the object's radius; a hidden part closer than that behind the skin is lost.
+      peelUniforms.peelSlack.value = 0.01 * modelBox().getBoundingSphere(new THREE.Sphere()).radius
+      r.setRenderTarget(backRT)
+      r.clear()
+      const undo = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? peelMat : peelFlatMat))
+      r.render(scene, viewCam())
+      undo()
+    }
+  }
+  r.shadowMap.autoUpdate = true
+  setHelpersVisible(helpers)
+  r.setRenderTarget(null)
+  floor.forEach((o, i) => { o.visible = shown[i] })
+  r.setClearColor(prevClear, prevAlpha)
+
+  const u = ghostMat.uniforms
+  const t = edgeThresholds(ghostDetail.value)
+  u.tGhost.value = ghostRT!.texture
+  u.tAux.value = auxRT!.texture
+  u.tBack.value = backRT!.texture
+  u.back.value = ghostBack.value && !modelIsSplat
+  u.texel.value.set(1 / size.x, 1 / size.y)
+  u.thick.value = Math.max(1, Math.round(r.getPixelRatio()))
+  u.opacity.value = ghostOpacity.value
+  u.depthThr.value = t.depthThr
+  u.normalThr.value = t.normalThr
+  u.splat.value = !!sm
+  r.autoClear = false
+  r.clear()
+  const tone = r.toneMapping
+  r.toneMapping = THREE.NoToneMapping
+  r.render(bgScene, bgCamera)
+  r.render(ghostQuad, bgCamera)
+  r.toneMapping = tone
+  r.autoClear = true
+}
+
+/** Swap every model mesh's material for the duration of one render; returns the undo. Only the
+ *  model's meshes: helpers run their own updateMatrixWorld that reads material.color. */
+function overrideModelMaterials(pick: (m: THREE.Mesh) => THREE.Material) {
+  const originals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
+  model?.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      originals.set(child, child.material)
+      child.material = pick(child)
+    }
+  })
+  return () => originals.forEach((mat, mesh) => { mesh.material = mat })
+}
+
 /**
  * The depth render — ONE implementation for the export and for the live preview, so what
  * the Depth tab shows is literally what the depth output will be.
@@ -1280,7 +1493,6 @@ function renderDepthPass(forExport: boolean) {
   if (forExport && rangeGizmo) rangeGizmo.visible = false
   setHelpersVisible(false)
 
-  const originals = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
   let overrideMat: THREE.Material = meshDepthMaterial
   // Auto implies the range: there is no point fitting a range the pass would ignore.
   if (sceneDepthTexture || depthManual.value || autoZ.value) {
@@ -1310,14 +1522,7 @@ function renderDepthPass(forExport: boolean) {
   // et al.) and the gizmo run their own updateMatrixWorld that reads material.color, which
   // MeshDepthMaterial lacks — swapping their material there throws. Everything non-model is
   // hidden in this pass anyway, so it never needed the depth material.
-  if (model && !modelIsSplat) {
-    model.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        originals.set(child, child.material)
-        child.material = overrideMat
-      }
-    })
-  }
+  const restoreMats = model && !modelIsSplat ? overrideModelMaterials(() => overrideMat) : null
   r.setClearColor(0x000000, 1)
   r.autoClear = false
   r.clear()
@@ -1331,7 +1536,7 @@ function renderDepthPass(forExport: boolean) {
   r.render(scene, viewCam())
   r.autoClear = true
 
-  originals.forEach((mat, mesh) => { mesh.material = mat })
+  restoreMats?.()
   if (sparkRenderer) sparkRenderer.visible = sparkWasVisible
   if (modelIsSplat && model) model.visible = modelWasVisible
   camera.near = prevNear
@@ -1396,7 +1601,10 @@ function loop() {
   if (contact.value && contactDirty) { renderContactShadow(); contactDirty = false }
   // The Depth panel shows the depth pass itself rather than a second little canvas: same
   // code as the export, full size, and the range gizmo drawn over it.
-  if (depthPanelOpen.value) {
+  if (pinMode.value && ghostView.value && model) {
+    if (rangeGizmo) rangeGizmo.visible = false
+    renderGhostView()
+  } else if (depthPanelOpen.value) {
     updateDepthGizmo()
     // Only paint the depth pass when it would actually contain something. With
     // nothing to measure it renders a flat void, and a viewport that goes black
@@ -1790,6 +1998,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     cropBoxObj?.removeFromParent()
     cropEdit = null
     cropSdf = null
+    disposeSplatAux() // it shares the leaving splat's buffers
     if (model) {
       pins.value = [] // their points belonged to the model that is leaving
       model.removeFromParent()
@@ -1799,6 +2008,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
     proj = null
     model = loaded
     modelIsSplat = loadedIsSplat
+    modelIsSplatRef.value = loadedIsSplat
     splatBox = null
     splatPoints = null
     model.name = 'NKDModel'
@@ -2950,16 +3160,9 @@ function updateSplatCrop() {
   const sm: any = model.children.find((c: any) => typeof c.getBoundingBox === 'function')
   if (!sm) return
   if (!cropEdit) {
-    cropSdf = new sparkMod.SplatEditSdf({ type: 'box', invert: true, opacity: 0 })
-    cropEdit = new sparkMod.SplatEdit({ rgbaBlendMode: 'multiply' })
-    // A CHILD, not addSdf(): Spark reads an sdf's matrixWorld, and one registered through
-    // addSdf is never in the graph, so it keeps an identity matrix — the box would sit in
-    // world space and ignore the model placement entirely.
-    cropEdit.add(cropSdf)
+    ;({ edit: cropEdit, sdf: cropSdf } = makeCropEdit())
     // It must be a DESCENDANT of the SplatMesh: that object's own update() is what traverses
-    // for edits. The mesh carries the OpenCV flip, so undo it here and the sdf shares the
-    // model-space frame the crop box is written in.
-    cropEdit.rotation.x = Math.PI
+    // for edits.
     sm.add(cropEdit)
   }
   // Collected with traverseVisible, so hiding the edit IS the off switch.
@@ -2970,6 +3173,20 @@ function updateSplatCrop() {
   // transform: Spark forces the scale to 1 before it decomposes the matrix. Which is exactly
   // what this object's scale already is.
   cropSdf.scale.copy(cropBoxObj.scale)
+}
+
+/** The splat crop: an inverted box sdf at zero opacity under a multiply edit. The edit carries
+ *  rotation.x = π to undo the SplatMesh's OpenCV flip, so the sdf shares the model-space frame
+ *  the crop box is written in. */
+function makeCropEdit() {
+  const sdf = new sparkMod.SplatEditSdf({ type: 'box', invert: true, opacity: 0 })
+  const edit = new sparkMod.SplatEdit({ rgbaBlendMode: 'multiply' })
+  // A CHILD, not addSdf(): Spark reads an sdf's matrixWorld, and one registered through
+  // addSdf is never in the graph, so it keeps an identity matrix — the box would sit in
+  // world space and ignore the model placement entirely.
+  edit.add(sdf)
+  edit.rotation.x = Math.PI
+  return { edit, sdf }
 }
 
 /** Hand the planes to every material that draws the model, the depth pass and the contact
@@ -3669,6 +3886,7 @@ function serialise(): string {
     floorClip: floorClip.value,
     pins: pins.value,
     pinLens: pinLens.value,
+    ghost: { on: ghostView.value, opacity: ghostOpacity.value, detail: ghostDetail.value, back: ghostBack.value },
     camLocked: camLocked.value,
     camera: cameraInfo(),
     roll: roll.value,
@@ -3752,6 +3970,10 @@ function deserialise(json: string) {
     if (typeof s.floorClip === 'boolean') setFloorClip(s.floorClip)
     if (Array.isArray(s.pins)) pins.value = s.pins
     if (typeof s.pinLens === 'boolean') pinLens.value = s.pinLens
+    if (typeof s.ghost?.on === 'boolean') ghostView.value = s.ghost.on
+    if (typeof s.ghost?.opacity === 'number') ghostOpacity.value = Math.min(1, Math.max(0, s.ghost.opacity))
+    if (typeof s.ghost?.back === 'boolean') ghostBack.value = s.ghost.back
+    if (typeof s.ghost?.detail === 'number') ghostDetail.value = Math.min(1, Math.max(0, s.ghost.detail))
     if (typeof s.showGrid === 'boolean') {
       showGrid.value = s.showGrid
       if (grid) grid.visible = s.showGrid
@@ -3935,6 +4157,12 @@ function cleanup() {
   contactHBlur?.dispose()
   contactVBlur?.dispose()
   envRT?.dispose()
+  disposeGhost()
+  auxMat.dispose()
+  auxFlatMat.dispose()
+  peelMat.dispose()
+  peelFlatMat.dispose()
+  ghostMat.dispose()
   if (model) { disposeModel(model); model = null }
   ;(sparkRenderer as any)?.dispose?.()
   sparkRenderer = null
@@ -4337,6 +4565,22 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <button :disabled="!pins.length" @click="clearPins" title="Remove every pin. The camera stays where it is.">
             <i class="pi pi-times" />
           </button>
+          <button :class="{ on: ghostView }" @click="ghostView = !ghostView; notifyStateChanged()"
+                  title="Ghost view: the object see-through with its contours in yellow (outline, parts covering parts, sharp turns), so you can lay its edges on the photo's. Only while pinning; it never reaches the outputs.">
+            <i class="pi pi-clone" />
+          </button>
+          <template v-if="ghostView">
+            <button :class="{ on: ghostBack && !modelIsSplatRef }" :disabled="modelIsSplatRef" @click="ghostBack = !ghostBack; notifyStateChanged()"
+                    :title="modelIsSplatRef ? 'Hidden contours need a surface to see through: splats have none.' : 'Hidden contours: the edges behind the visible surface, dashed in blue.'">
+              <i class="pi pi-eye" />
+            </button>
+            <label class="nkd-ghostfield" title="How much of the object shows through.">Opacity
+              <input type="range" min="0" max="1" step="0.05" data-default="0.35" v-model.number="ghostOpacity" @change="notifyStateChanged()">
+            </label>
+            <label class="nkd-ghostfield" title="Which contours get a line. Low keeps the outline and the strong edges; high adds the subtle turns of the surface. Splats only have outlines and depth steps: they carry no surface to show a crease.">Detail
+              <input type="range" min="0" max="1" step="0.05" data-default="0.5" v-model.number="ghostDetail" @change="notifyStateChanged()">
+            </label>
+          </template>
         </template>
         <!-- Gizmo controls, mirrored from the Object panel: same call, same toggle-off, one state.
              Reaching them without opening a panel is the point — the panel covers the model.
@@ -4571,6 +4815,8 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-overlay { display: flex; gap: 4px; align-items: center; }
 .nkd-brush { width: 72px; height: 14px; margin: 0 2px; accent-color: #4ab4ff; }
 .nkd-view.nkd-painting { cursor: crosshair; }
+.nkd-ghostfield { display: flex; align-items: center; gap: 3px; font-size: 10px; color: #8a93a6; }
+.nkd-ghostfield input { width: 56px; height: 14px; margin: 0; accent-color: #ffd900; }
 /* Pop-out sits opposite the view controls: it acts on the WINDOW, not on the scene. */
 .nkd-overlay-r { margin-left: auto; }
 .nkd-ovsep { width: 1px; align-self: stretch; background: #3a3d46; margin: 0 2px; flex: 0 0 auto; }
