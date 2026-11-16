@@ -4103,6 +4103,16 @@ const GIZMO_KEYS: Record<string, 'translate' | 'rotate' | 'scale'> = {
 }
 let pointerInView = false
 function onViewEnter() { pointerInView = true }
+/** Hovering the viewer takes focus so the wheel stays here (see data-capture-wheel). Never from
+ *  a field the user is typing in, and handed back on the way out. */
+function claimWheel(e: PointerEvent) {
+  const a = document.activeElement as HTMLElement | null
+  if (a && a !== document.body && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) return
+  ;(e.currentTarget as HTMLElement).focus({ preventScroll: true })
+}
+function releaseWheel(e: PointerEvent) {
+  if (document.activeElement === e.currentTarget) (e.currentTarget as HTMLElement).blur()
+}
 function onViewLeave() { pointerInView = false; if (brushRing) brushRing.visible = false }
 function onGizmoKey(ev: KeyboardEvent) {
   if (!popped.value && !pointerInView) return
@@ -4302,7 +4312,10 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 </script>
 
 <template>
-  <div class="nkd-p3d" :class="{ 'nkd-popped': popped }">
+  <!-- data-capture-wheel + focus: the frontend's own opt-out for Nodes 2.0, which otherwise sends
+       every wheel over a node to the graph zoom (only while focus is inside the element). -->
+  <div class="nkd-p3d" :class="{ 'nkd-popped': popped }" tabindex="-1" data-capture-wheel="true"
+       @pointerenter="claimWheel" @pointerleave="releaseWheel">
     <div class="nkd-bar">
       <!-- Outside the tabs' v-if: an action, wanted on any panel and popped out too. -->
       <button @click="fitToGround"
@@ -4655,7 +4668,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
       :style="popped && fitW
         ? { aspectRatio: `${aspect.w} / ${aspect.h}`, width: fitW + 'px', height: fitH + 'px' }
         : { aspectRatio: `${aspect.w} / ${aspect.h}` }"
-      @contextmenu.prevent
+      @contextmenu.prevent.stop
       @pointerenter="onViewEnter"
       @pointerleave="onViewLeave"
       @pointerdown.capture="onBrushDown"
@@ -4674,6 +4687,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 /* No height here on purpose: the node reserves space with the SAME width×aspect formula
    this content resolves to naturally (Sigmas Curve architecture). A height:100% would
    depend on the host chain handing a height down — the link that breaks in the wild. */
+.nkd-p3d:focus { outline: none; }
 .nkd-p3d { display: flex; flex-direction: column; width: 100%;
   box-sizing: border-box; border: 1px solid #2a2d36; border-radius: 6px; overflow: hidden; }
 .nkd-p3d, .nkd-p3d *, .nkd-p3d *::before, .nkd-p3d *::after { box-sizing: border-box; }

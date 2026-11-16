@@ -30,6 +30,26 @@ const VIEW_W = 360
 const ROW_SAFETY = 8
 
 /**
+ * Right button with a modifier over the viewer belongs to the viewer (Alt+right erases the 3D
+ * mask, right drag orbits). Extensions that read right-drags on nodes (NodeWrangler: Alt/Ctrl/
+ * Shift + right) listen on window in the capture phase and kill the event before it reaches us.
+ * These two run first because they are added at import time, and extensions add theirs in
+ * setup(), which only runs once every extension has been imported: the button is hidden from
+ * window-phase listeners while the event is over a viewer, and given back on the way down at
+ * document, before any element listener — ours included — reads it.
+ * ponytail: relies on import-before-setup ordering; a listener another extension adds at its
+ * own import time, before ours, would still see the click.
+ */
+window.addEventListener('pointerdown', (e) => {
+  if (e.button === 2 && (e.target as Element | null)?.closest?.('.nkd-p3d .nkd-view')) {
+    Object.defineProperty(e, 'button', { value: -1, configurable: true })
+  }
+}, true)
+document.addEventListener('pointerdown', (e) => {
+  if (Object.prototype.hasOwnProperty.call(e, 'button')) delete (e as any).button
+}, true)
+
+/**
  * Width keeper ported verbatim from NKD Sigmas Curve (proven on the classic renderer):
  * the host can collapse or balloon on selection/re-layout, and node.size[0] is the one
  * reference that survives. Height needs no keeper — it is deterministic (see below).
