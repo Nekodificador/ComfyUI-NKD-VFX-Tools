@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NKD ghost edges — GPU self-check</title>
+<!--
+  Self-check for the pin ghost view's edges (src/ghost_edges.ts). Needs a real GL context.
+
+    npm run build                 # the test imports the SHIPPED shaders from web/js
+    python -m http.server 8791    # from the repo root, so ./node_modules/three resolves
+    open http://127.0.0.1:8791/test_ghost_edges.html
+
+  It rebuilds the two-buffer rig from renderGhostView() in src/Preview3DWidget.vue on a cube
+  seen corner-on, with a smaller box in front whose faces are PARALLEL to the cube's: the
+  boundary between them has no crease, so only the depth test can find it.
+-->
+<body style="background:#14171c;color:#d6dae0;font:13px/1.55 ui-monospace,Consolas,monospace;padding:18px">
+<pre id="out">running…</pre>
+<script type="module">
+import * as THREE from './node_modules/three/build/three.module.js'
+import { AUX_VERT, AUX_FRAG, COMPOSITE_VERT, COMPOSITE_FRAG, edgeThresholds } from './web/js/nkd_ghost_edges.js'
+
+const W = 400, H = 400
+const L = [], out = document.getElementById('out')
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n') }
+let failed = 0
+const check = (ok, msg) => { if (!ok) failed++; log(`${ok ? '  ok  ' : ' FAIL '} ${msg}`) }
+
+const r = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true })
+r.setSize(W, H)
+document.body.appendChild(r.domElement)
+const cam = new THREE.PerspectiveCamera(40, W / H, 0.1, 100)
+cam.position.set(4.5, 3.6, 5.4); cam.lookAt(0, 0, 0)
+cam.updateMatrixWorld()
+
+const scene = new THREE.Scene()
+const grey = new THREE.MeshBasicMaterial({ color: 0x808080 })
+const cube = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), grey)
+// In front of the cube's +Z face, axis-aligned: its front face is parallel to that face.
+const front = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), grey)
+front.position.set(0.2, -0.1, 1.8)
+scene.add(cube, front)
+
+const rtOpts = { type: THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter }
+const ghostRT = new THREE.WebGLRenderTarget(W, H, rtOpts)
+const auxRT = new THREE.WebGLRenderTarget(W, H, rtOpts)
+const backRT = new THREE.WebGLRenderTarget(W, H, rtOpts)
+const peelMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true,
+  defines: { PEEL: 1 }, uniforms: { tFront: { value: auxRT.texture }, peelTexel: { value: new THREE.Vector2(1 / W, 1 / H) }, peelSlack: { value: 0.017 } } })
+const auxMat = new THREE.ShaderMaterial({ vertexShader: AUX_VERT, fragmentShader: AUX_FRAG, side: THREE.DoubleSide, clipping: true })
+// What Spark writes for a splat: log-normalised depth, the same formula as its normalizedDepth,
+// quantised to 8 bits because that is what its packed colour keeps.
+const SPLAT_N = 2, SPLAT_F = 9
+const splatMat = new THREE.ShaderMaterial({
+  uniforms: { n: { value: SPLAT_N }, f: { value: SPLAT_F } },
+  vertexShader: 'varying float vZ; void main(){ vec4 mv = modelViewMatrix*vec4(position,1.0); vZ=-mv.z; gl_Position=projectionMatrix*mv; }',
+  fragmentShader: 'uniform float n; uniform float f; varying float vZ; void main(){ float z=clamp(vZ,n,f); float d=(log2(z+1.0)-log2(n+1.0))/(log2(f+1.0)-log2(n+1.0)); gl_FragColor=vec4(vec3(floor(d*255.0+0.5)/255.0),1.0); }',
+})
+const comp = new THREE.ShaderMaterial({
+  uniforms: {
+    tGhost: { value: ghostRT.texture }, tAux: { value: auxRT.texture },
+    tBack: { value: backRT.texture }, back: { value: false }, backColor: { value: new THREE.Color(0.35, 0.75, 1) },
+    texel: { value: new THREE.Vector2(1 / W, 1 / H) }, thick: { value: 1 },
+    opacity: { value: 0.35 }, depthThr: { value: 0 }, normalThr: { value: 0 },
+    splat: { value: false }, logNear: { value: Math.log2(SPLAT_N + 1) }, logFar: { value: Math.log2(SPLAT_F + 1) },
+    edgeColor: { value: new THREE.Color(1, 0.85, 0) },
+  },
+  vertexShader: COMPOSITE_VERT, fragmentShader: COMPOSITE_FRAG,
+  transparent: true, depthTest: false, depthWrite: false,
+})
+const quad = new THREE.Scene(); quad.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), comp))
+const qcam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
+
+const BACK = new THREE.Color(0.2, 0.05, 0.05) // stands in for the photo
+function draw({ detail = 0.5, normalThr, depthThr, splat = false, back = false } = {}) {
+  const t = edgeThresholds(detail)
+  comp.uniforms.normalThr.value = normalThr ?? t.normalThr
+  comp.uniforms.depthThr.value = depthThr ?? t.depthThr
+  comp.uniforms.splat.value = splat
+  comp.uniforms.back.value = back
+  r.setClearColor(0, 0)
+  r.setRenderTarget(ghostRT); r.clear(); r.render(scene, cam)
+  scene.overrideMaterial = splat ? splatMat : auxMat
+  r.setRenderTarget(auxRT); r.clear(); r.render(scene, cam)
+  if (back) { scene.overrideMaterial = peelMat; r.setRenderTarget(backRT); r.clear(); r.render(scene, cam) }
+  scene.overrideMaterial = null
+  r.setRenderTarget(null)
+  r.setClearColor(BACK, 1); r.clear()
+  r.render(quad, qcam)
+  const px = new Uint8Array(W * H * 4)
+  const gl = r.getContext(); gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px)
+  return px
+}
+// Pixel of a world point, in readPixels rows (origin bottom-left).
+const at = (x, y, z) => { const v = new THREE.Vector3(x, y, z).project(cam); return [Math.round((v.x + 1) / 2 * W), Math.round((v.y + 1) / 2 * H)] }
+const px = (buf, [x, y]) => Array.from(buf.slice((y * W + x) * 4, (y * W + x) * 4 + 3))
+// Yellow anywhere within 2 px: the line is a couple of pixels wide and straddles the contour.
+const yellowNear = (buf, [x, y]) => {
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const [R, G, B] = px(buf, [x + dx, y + dy])
+    if (R > 200 && G > 170 && B < 80) return true
+  }
+  return false
+}
+const isYellow = (c) => c[0] > 200 && c[1] > 170 && c[2] < 80
+
+const crease = at(1, 0.3, 1)          // vertical edge between the +X and +Z faces
+const silhouette = at(-1, -0.4, 1)    // the cube's left outline
+const faceTop = at(-0.3, 1, -0.4)     // middle of the top face, nothing near it
+const sky = [5, H - 5]
+const occl = at(0.2 - 0.3, 0.05, 2.1) // the small box's left edge, over the cube's +Z face
+
+let buf = draw()
+check(yellowNear(buf, crease), `crease between two visible faces is yellow ${px(buf, crease)}`)
+check(yellowNear(buf, silhouette), 'the outer silhouette is yellow')
+check(yellowNear(buf, occl), 'the small box over the parallel face is outlined (depth, not crease)')
+const ft = px(buf, faceTop)
+check(!isYellow(ft), `a flat face stays clean ${ft}`)
+// Ghost at 0.35 over the backdrop, in linear light (0x808080 is sRGB, ~0.216 linear).
+const lin = (c) => { const k = new THREE.Color(c / 255, 0, 0).convertSRGBToLinear(); return k.r }
+check(Math.abs(lin(ft[0]) - (grey.color.r * 0.35 + BACK.r * 0.65)) < 0.01, `the face is the ghost over the backdrop (red ${lin(ft[0]).toFixed(3)} linear)`)
+check(px(buf, sky).join() === [BACK.r, BACK.g, BACK.b].map((v) => Math.round(new THREE.Color(v, 0, 0).convertLinearToSRGB().r * 255)).join(), `the backdrop shows where there is no object ${px(buf, sky)}`)
+
+// Controls: each check above must depend on the test that is supposed to make it pass.
+buf = draw({ normalThr: 2 })
+check(!yellowNear(buf, crease), 'CONTROL: creases off → the crease is gone (it was the normal test)')
+check(yellowNear(buf, occl), 'CONTROL: creases off → the parallel box still outlined (it is the depth test)')
+buf = draw({ normalThr: 2, depthThr: 1e9 })
+check(!yellowNear(buf, occl) && !yellowNear(buf, silhouette), 'CONTROL: both off → no lines at all')
+
+// A splat: no normals, Spark's log depth in the aux buffer.
+buf = draw({ splat: true })
+check(yellowNear(buf, silhouette), 'splat: silhouette from the decoded depth')
+check(yellowNear(buf, occl), 'splat: the box in front from the decoded depth')
+check(!isYellow(px(buf, faceTop)), 'splat: a flat face stays clean despite the 8-bit depth')
+
+// Hidden contours (depth-peeled second layer): the cube's far vertical edge, which no camera
+// ray reaches without passing through the front faces first.
+const hiddenEdge = at(-1, 0, -1)
+const blueNear = (buf, [x, y], rad = 5) => {
+  for (let dy = -rad; dy <= rad; dy++) for (let dx = -rad; dx <= rad; dx++) {
+    const [R, G, B] = px(buf, [x + dx, y + dy])
+    if (B > 180 && R < 170 && B > R + 40) return true
+  }
+  return false
+}
+buf = draw({ back: true })
+check(blueNear(buf, hiddenEdge), 'back on: the hidden far edge is drawn in the back colour')
+check(yellowNear(buf, crease) && !isYellow(px(buf, faceTop)), 'back on: the visible lines are unchanged and the top face has no yellow')
+check(!blueNear(buf, sky, 3), 'back on: nothing hidden is drawn outside the object')
+buf = draw()
+check(!blueNear(buf, hiddenEdge), 'CONTROL: back off → the hidden edge is not drawn')
+
+draw({ back: true }) // leave the view on screen for a look
+log('')
+log(failed ? `${failed} FAILED` : 'ALL PASSED')
+</script>

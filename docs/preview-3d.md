@@ -150,3 +150,4 @@ Find a scene's perspective by fitting a known object to it. Turn on Match perspe
 - Hold Shift to drag finer. Right-click a pin to delete it. Right-drag orbits.
 - Works on meshes and splats. Turning the tool on unlocks the camera.
 - A wired `camera_info` is the starting point: while there are pins it no longer replaces the result. Clear the pins to hand the camera back.
+- Ghost view (on by default while pinning) draws the object see-through with a yellow line on its outline, where one part covers another and where the surface turns sharply, so you can lay its edges on the photo's. Opacity sets how much shows through, Detail how subtle a contour gets a line. Splats get outlines and depth steps but no creases. The eye button adds the hidden contours, the ones behind the visible surface, dashed in blue (meshes only). It only changes the view, never the outputs.
