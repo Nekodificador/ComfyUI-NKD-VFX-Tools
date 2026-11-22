@@ -21,6 +21,7 @@ import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { solvePins } from './pin_solver'
 import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
 import { clampHalf, dragFace, unitFaces } from './crop_volume'
+import { clipPlanesFor, FLOOR_HALF_SPACE } from './clip_planes'
 import { AUX_FRAG, AUX_VERT, COMPOSITE_FRAG, COMPOSITE_VERT, edgeThresholds } from './ghost_edges'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
@@ -281,7 +282,10 @@ let sparkMod: any = null // the dynamically imported module, kept for SplatEdit
 // Six world-space half-spaces — the mesh path. Mutated in place: three only recompiles a
 // shader when the plane COUNT changes, so moving them every frame is free.
 const cropPlanes = [0, 0, 0, 0, 0, 0].map(() => new THREE.Plane())
-let cropMatsOn = false // what the materials currently carry, so needsUpdate fires only on the flip
+// The floor's own half-space, in world units, where the shadow catcher sits.
+const floorPlane = new THREE.Plane(
+  new THREE.Vector3(...FLOOR_HALF_SPACE.normal), FLOOR_HALF_SPACE.constant)
+let clipCount = 0 // how many planes the materials carry, so needsUpdate fires only on a change
 // Face drag in flight. The plane, the axis and the START size are all pinned at pointerdown:
 // deriving the face from where it began is what lets Shift be toggled mid-drag without a jump.
 let cropDrag: {
@@ -1196,7 +1200,7 @@ function setOrthoView(on: boolean) {
 
 function renderFrame(drawBackdrop = true) {
   syncMaskOverlay()
-  applyCropMaterials()
+  applyClipPlanes()
   // The grips are sized by their distance to the camera, so they have to be re-parked whenever
   // the view moves, not only when the box changes.
   if (cropOn.value) updateCropHandles()
@@ -1356,7 +1360,7 @@ function renderGhostView() {
   const r = renderer.value
   if (!r || !model) { renderFrame(); return }
   syncMaskOverlay()
-  applyCropMaterials()
+  applyClipPlanes()
   if (cropOn.value) updateCropHandles()
   const size = r.getDrawingBufferSize(new THREE.Vector2())
   sizeGhostTargets(size.x, size.y)
@@ -1471,7 +1475,7 @@ function renderDepthPass(forExport: boolean) {
   // Also here, not only in renderFrame: capture() can reach this pass without a colour frame
   // in between, and a depth PNG that ignores the crop while the image beside it honours it is
   // the silent kind of wrong. Idempotent — it costs one boolean once the planes are in place.
-  applyCropMaterials()
+  applyClipPlanes()
   // Fit HERE, not on a timer: capture() has just switched the camera to the export aspect,
   // so the range is fitted to the camera the depth is actually taken from.
   refreshAutoRange()
@@ -3192,12 +3196,21 @@ function makeCropEdit() {
 /** Hand the planes to every material that draws the model, the depth pass and the contact
  *  shadow included. Driven from renderFrame because Unbake, Smooth and every load REPLACE
  *  materials: one owner in the draw path cannot fall out of step with them the way a handful
- *  of call sites would. Costs one boolean while the crop is off. */
-function applyCropMaterials() {
-  const want = cropOn.value && !modelIsSplat
-  if (!want && !cropMatsOn) return
-  const planes = want ? cropPlanes : null
-  const flip = want !== cropMatsOn // the plane COUNT changed → the shader has to be rebuilt
+ *  of call sites would. Costs one comparison while nothing clips.
+ *
+ *  The FLOOR rides here rather than on the shadow catcher's depth write, which only ever
+ *  reached splats: the catcher is a ShadowMaterial, three marks those transparent, and a
+ *  transparent mesh draws after every opaque one — far too late to hide a mesh already in
+ *  the colour buffer. Clipping also keeps the buried part out of the depth pass and the
+ *  contact shadow, which the depth write never did. */
+function applyClipPlanes() {
+  const planes = clipPlanesFor({
+    cropPlanes, floorPlane,
+    crop: cropOn.value, floor: floorClip.value, isSplat: modelIsSplat,
+  })
+  const count = planes ? planes.length : 0
+  if (!count && !clipCount) return
+  const flip = count !== clipCount // the plane COUNT changed → the shader has to be rebuilt
   const set = (m: THREE.Material | THREE.Material[] | null | undefined) => {
     if (!m) return
     for (const one of Array.isArray(m) ? m : [m]) {
@@ -3209,7 +3222,7 @@ function applyCropMaterials() {
   set(linearDepthMaterial)
   set(meshDepthMaterial)
   set(contactDepthMat)
-  cropMatsOn = want
+  clipCount = count
 }
 
 /** The crop's eight corners as a world-space box. A rotated crop has no axis-aligned form, so
@@ -3759,6 +3772,9 @@ async function loadScene(payload: any) {
 
 function setFloorClip(on: boolean) {
   floorClip.value = on
+  // What hides a SPLAT: Spark's shader never sees a clipping plane, but the catcher is drawn
+  // in the same late pass a splat is, so its depth does reach one. Meshes are clipped instead,
+  // from applyClipPlanes on the next frame.
   if (shadowCatcher) (shadowCatcher.material as THREE.Material).depthWrite = on
 }
 

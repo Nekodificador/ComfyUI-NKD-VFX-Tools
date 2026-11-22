@@ -58,6 +58,9 @@ export default defineConfig({
         // Likewise: the crop volume's six half-spaces, so `node test_crop_volume.mjs` asserts
         // the sign convention on the shipped function.
         nkd_crop_volume:   "./src/crop_volume.ts",
+        // Likewise: which clipping planes the crop and the floor hand the materials, so
+        // `node test_clip_planes.mjs` asserts on the shipped function.
+        nkd_clip_planes:   "./src/clip_planes.ts",
         nkd_view_gizmo:    "./src/view_gizmo.ts",
         // Likewise: the pin ghost view's shaders, so test_ghost_edges.html builds its materials
         // from the shipped strings.

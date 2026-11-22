@@ -1,0 +1,1 @@
+const r={normal:[0,1,0],constant:0};function o(n){if(n.isSplat)return null;const l=[];return n.crop&&l.push(...n.cropPlanes),n.floor&&l.push(n.floorPlane),l.length?l:null}export{r as FLOOR_HALF_SPACE,o as clipPlanesFor};
