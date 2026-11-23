@@ -62,4 +62,25 @@ same(world(probe, posC, pc, q, s), ref, 1e-12, 'preset switch moved the object')
 const foot = V(0.7, -1.25, -0.4)
 same(world(foot, V(-foot.x, -foot.y, -foot.z), foot, quat(0, 0, 0), 2 / 3.4), V(0, 0, 0), 1e-12, 'fit')
 
-console.log('pivot: 6/6 OK')
+// 7. Alt + rotate turns the ORIGIN: the group's q changes, the holder takes qh = q'^-1 * (q * qh),
+//    and the object stays put. The scene graph with the holder rotation is
+//    world(x) = G + q*s*qh*(x - p), so the pivot math sees the product q*qh.
+const qmul = ([ax, ay, az, aw], [bx, by, bz, bw]) => [
+  aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx,
+  aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz]
+const qinv = ([x, y, z, w]) => [-x, -y, -z, w]
+const worldH = (x, pos, pivot, q, qh, s) => world(x, pos, pivot, qmul(q, qh), s)
+const held = qmul(q, [0, 0, 0, 1])
+const q2 = quat(70, -15, 33)            // the gizmo turned the group
+const qh2 = qmul(qinv(q2), held)
+same(worldH(probe, pos, p0, q2, qh2, s), world(probe, pos, p0, q, s), 1e-12, 'origin turn moved the object')
+const badTurn = worldH(probe, pos, p0, q2, [0, 0, 0, 1], s)
+assert.ok(Math.hypot(badTurn.x - ref.x, badTurn.y - ref.y, badTurn.z - ref.z) > 1,
+  'control: turning the group without the holder must move the object')
+// ...and an Alt-move of the point afterwards still holds the object, given the product.
+const qe = qmul(q2, qh2)
+const baseH = objectBase(group(pos, p0), p0, qe, s)
+const pH = pivotFromGroup(V(0.9, 1.1, -0.3), baseH, qe, s)
+same(worldH(probe, objPosition(baseH, pH, qe, s), pH, q2, qh2, s), ref, 1e-12, 'move after turn')
+
+console.log('pivot: 7/7 OK')

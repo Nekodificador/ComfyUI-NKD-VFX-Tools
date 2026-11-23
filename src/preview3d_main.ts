@@ -98,15 +98,18 @@ function hashBytes(b: Uint8Array): string {
 }
 
 async function uploadShot(shot: any) {
-  const [image, object, depth, paint_mask, mask3dImage] = await Promise.all([
+  const [image, object, depth, lineart, paint_mask, mask3dImage, slice] = await Promise.all([
     uploadTempImage(shot.scene, 'scene'),
     uploadTempImage(shot.object, 'scene_object'),
     uploadTempImage(shot.depth, 'scene_depth'),
+    uploadTempImage(shot.lineart, 'scene_lineart'),
     shot.paintMask ? uploadTempImage(shot.paintMask, 'scene_paintmask') : Promise.resolve(undefined),
     shot.mask3d ? uploadTempImage(shot.mask3d.data, 'scene_mask3d') : Promise.resolve(undefined),
+    shot.slice ? uploadTempImage(shot.slice, 'scene_slice') : Promise.resolve(undefined),
   ])
-  const out: any = { image, object, depth, camera_info: shot.camera_info }
+  const out: any = { image, object, depth, lineart, camera_info: shot.camera_info }
   if (paint_mask) out.paint_mask = paint_mask
+  if (slice) out.slice = slice
   if (mask3dImage) out.mask3d = { image: mask3dImage, count: shot.mask3d.count }
   return JSON.stringify(out)
 }
@@ -411,7 +414,7 @@ comfyApp.registerExtension({
       // The painted mask is part of the export: a brush stroke has to re-run the node.
       const shotHash = async (shot: any, width: number, height: number) => hashBytes(new Uint8Array(
         await new Blob([`${width}x${height}|${JSON.stringify(shot.camera_info)}|`,
-                        shot.scene, shot.object, shot.depth, shot.paintMask ?? '']).arrayBuffer()))
+                        shot.scene, shot.object, shot.depth, shot.lineart, shot.paintMask ?? '', '|', shot.slice ?? '']).arrayBuffer()))
 
       const onScene = async (e: any) => {
         const d = e?.detail

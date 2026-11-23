@@ -419,6 +419,15 @@ class NKDPreview3D(io.ComfyNode):
                                           tooltip="The placement passed in, unchanged, so a "
                                                   "chained viewer or bake sits the model in the "
                                                   "same place."),
+                io.Image.Output(display_name="lineart",
+                                tooltip="The model's contours, white on black, for a canny or "
+                                        "lineart ControlNet: outline, parts covering parts and "
+                                        "sharp turns of the surface. Same lines as the camera "
+                                        "pins' ghost view; its Detail slider sets how many."),
+                io.Mask.Output(display_name="depth_slice",
+                               tooltip="The silhouette of the object slice: the object cut to a "
+                                       "band of its OWN depth, not the scene's (Occlude tab). "
+                                       "`image` shows it cut too; object and mask stay whole."),
             ],
             # unique_id targets this node's viewport; prompt tells whether anything reads
             # the outputs. Without declaring them here both read back None, silently.
@@ -506,14 +515,15 @@ class NKDPreview3D(io.ComfyNode):
                     "persists, the viewport failed to initialise — check the browser console."
                 )
             return io.NodeOutput(None, None, None, None, camera_info, None, mask3d_in,
-                                 _ref_to_file3d(model_ref), model_3d_info)
+                                 _ref_to_file3d(model_ref), model_3d_info, None, None)
 
         # Every file the capture names must live in ComfyUI's input / output / temp:
         # the capture is widget JSON, so it is checked before LoadImage resolves it.
         m3 = capture.get("mask3d")
         refs = {k: capture.get(k, "") for k in ("image", "object", "depth")}
-        if capture.get("paint_mask"):
-            refs["paint_mask"] = capture["paint_mask"]
+        for key in ("paint_mask", "lineart", "slice"):
+            if capture.get(key):
+                refs[key] = capture[key]
         if isinstance(m3, dict) and m3.get("image"):
             refs["mask3d"] = m3["image"]
         for key, ref in refs.items():
@@ -542,10 +552,20 @@ class NKDPreview3D(io.ComfyNode):
         if isinstance(m3, dict) and m3.get("image"):
             packed, _ = load_image.load_image(image=m3["image"])
             mask3d = _unpack_mask3d(packed, int(m3.get("count", 0)))
+        # A capture serialised before the lineart pass existed has none: black, same size.
+        if capture.get("lineart"):
+            lineart, _ = load_image.load_image(image=capture["lineart"])
+        else:
+            lineart = torch.zeros_like(output_image)
+        # The viewer renders the cut as its own pass; no cut (or an older capture) is the whole band.
+        depth_slice = output_mask
+        if capture.get("slice"):
+            _, inv = load_image.load_image(image=capture["slice"])
+            depth_slice = 1.0 - inv
         # The viewport's live camera wins: the user may have orbited since the solve.
         return io.NodeOutput(output_image, object_rgba, output_mask, depth_image,
                              capture.get("camera_info") or camera_info, paint_mask, mask3d,
-                             _ref_to_file3d(model_ref), model_3d_info)
+                             _ref_to_file3d(model_ref), model_3d_info, lineart, depth_slice)
 
 
 class NKDPreview3DExtension(ComfyExtension):

@@ -61,7 +61,7 @@ const comp = new THREE.ShaderMaterial({
     texel: { value: new THREE.Vector2(1 / W, 1 / H) }, thick: { value: 1 },
     opacity: { value: 0.35 }, depthThr: { value: 0 }, normalThr: { value: 0 },
     splat: { value: false }, logNear: { value: Math.log2(SPLAT_N + 1) }, logFar: { value: Math.log2(SPLAT_F + 1) },
-    edgeColor: { value: new THREE.Color(1, 0.85, 0) },
+    edgeColor: { value: new THREE.Color(1, 0.85, 0) }, lineart: { value: false },
   },
   vertexShader: COMPOSITE_VERT, fragmentShader: COMPOSITE_FRAG,
   transparent: true, depthTest: false, depthWrite: false,
@@ -70,12 +70,13 @@ const quad = new THREE.Scene(); quad.add(new THREE.Mesh(new THREE.PlaneGeometry(
 const qcam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
 
 const BACK = new THREE.Color(0.2, 0.05, 0.05) // stands in for the photo
-function draw({ detail = 0.5, normalThr, depthThr, splat = false, back = false } = {}) {
+function draw({ detail = 0.5, normalThr, depthThr, splat = false, back = false, lineart = false } = {}) {
   const t = edgeThresholds(detail)
   comp.uniforms.normalThr.value = normalThr ?? t.normalThr
   comp.uniforms.depthThr.value = depthThr ?? t.depthThr
   comp.uniforms.splat.value = splat
   comp.uniforms.back.value = back
+  comp.uniforms.lineart.value = lineart
   r.setClearColor(0, 0)
   r.setRenderTarget(ghostRT); r.clear(); r.render(scene, cam)
   scene.overrideMaterial = splat ? splatMat : auxMat
@@ -148,6 +149,22 @@ check(yellowNear(buf, crease) && !isYellow(px(buf, faceTop)), 'back on: the visi
 check(!blueNear(buf, sky, 3), 'back on: nothing hidden is drawn outside the object')
 buf = draw()
 check(!blueNear(buf, hiddenEdge), 'CONTROL: back off → the hidden edge is not drawn')
+
+// Lineart export: same lines, white on opaque black, no ghost, no backdrop, no hidden lines.
+const whiteNear = (buf, [x, y]) => {
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const [R, G, B] = px(buf, [x + dx, y + dy])
+    if (R > 200 && G > 200 && B > 200) return true
+  }
+  return false
+}
+buf = draw({ lineart: true, back: true })
+check(whiteNear(buf, crease) && whiteNear(buf, silhouette) && whiteNear(buf, occl), 'lineart: crease, silhouette and occlusion edge are white')
+check(px(buf, faceTop).join() === '0,0,0', `lineart: a flat face is pure black, no ghost ${px(buf, faceTop)}`)
+check(px(buf, sky).join() === '0,0,0', `lineart: empty space is black, not the backdrop ${px(buf, sky)}`)
+check(px(buf, hiddenEdge).join() === "0,0,0", `lineart: the hidden edge is not drawn even with back on ${px(buf, hiddenEdge)}`)
+buf = draw({ lineart: true, normalThr: 9, depthThr: 9 })
+check(!whiteNear(buf, crease) && !whiteNear(buf, silhouette), 'CONTROL: lineart with both tests off → all black')
 
 draw({ back: true }) // leave the view on screen for a look
 log('')

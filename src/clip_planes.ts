@@ -30,3 +30,15 @@ export function clipPlanesFor<T>(opts: {
   if (opts.floor) planes.push(opts.floorPlane)
   return planes.length ? planes : null
 }
+
+/** The depth_slice band, as view distances. The object's own range is [zNear, zFar] (its
+ *  nearest and farthest vertex along the view axis); the sliders read 1 = nearest, 0 = farthest
+ *  and may come in either order. Returns the distances to keep between, nearest first. */
+export function sliceDistances(zNear: number, zFar: number, a: number, b: number): [number, number] {
+  const span = zFar - zNear
+  const hi = Math.max(a, b), lo = Math.min(a, b)
+  return [zNear + (1 - hi) * span, zNear + (1 - lo) * span]
+}
+
+/** The default band keeps everything: nothing to cut, nothing to preview. */
+export const sliceIsWhole = (a: number, b: number) => Math.max(a, b) >= 1 && Math.min(a, b) <= 0

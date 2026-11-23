@@ -21,7 +21,7 @@ import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { solvePins } from './pin_solver'
 import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
 import { clampHalf, dragFace, unitFaces } from './crop_volume'
-import { clipPlanesFor, FLOOR_HALF_SPACE } from './clip_planes'
+import { clipPlanesFor, FLOOR_HALF_SPACE, sliceDistances, sliceIsWhole } from './clip_planes'
 import { AUX_FRAG, AUX_VERT, COMPOSITE_FRAG, COMPOSITE_VERT, edgeThresholds } from './ghost_edges'
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
@@ -188,6 +188,10 @@ const occlude = ref(false)
 const depthInvertUI = ref(false)
 const occFrom = ref(0.5)
 const occTo = ref(1.0)
+// Object slice: a band of the OBJECT's own depth (1 nearest, 0 farthest). The cut is real: the
+// viewer and the `image` composite show the object cut, and depth_slice is its silhouette.
+const sliceNear = ref(1.0)
+const sliceFar = ref(0.0)
 
 // Depth range. The values themselves belong to the node's scene_depth_near/far widgets, but
 // tuning them THERE costs a graph run per nudge — so the Depth tab drives them here (live
@@ -247,6 +251,10 @@ const pivotMode = ref<'bottom' | 'center' | 'origin' | 'custom'>('bottom')
 // arrive with their bbox nowhere near what you want to spin, and the three presets can't help.
 const pivotCustom = new THREE.Vector3()
 const pivotEdit = ref(false) // Alt held: the gizmo moves the PIVOT, leaving the object put
+// The origin's own orientation (Alt + rotate gizmo): the holder's rotation, so the group's axes
+// (= the gizmo's Local axes and the panel's Rot) can turn while the object stays put.
+// Object orientation in the world = group q · originQ.
+const originQ = new THREE.Quaternion()
 const gizmoMode = ref<'off' | 'translate' | 'rotate' | 'scale'>('off')
 // Which axes the gizmo hands you: the world's, or the object's own. three's own default is
 // 'world'. NOTE it has no say over Scale — TransformControls hard-codes `space = 'local'` for
@@ -286,6 +294,30 @@ const cropPlanes = [0, 0, 0, 0, 0, 0].map(() => new THREE.Plane())
 const floorPlane = new THREE.Plane(
   new THREE.Vector3(...FLOOR_HALF_SPACE.normal), FLOOR_HALF_SPACE.constant)
 let clipCount = 0 // how many planes the materials carry, so needsUpdate fires only on a change
+// Object slice: two planes square to the camera, on the model only. renderFrame decides per pass:
+// on with the backdrop (viewer, `image`) and for the depth_slice pass; off for object/mask.
+let sliceOn = false
+const slicePlanes = [new THREE.Plane(), new THREE.Plane()]
+const modelPlanes: THREE.Plane[] = []
+let modelClipCount = 0
+let sliceRangeKey = ''
+let sliceRange: [number, number] = [0, 1]
+// The cut keeps only the VISIBLE surface inside the band: where the front is cut away, the back of
+// the object must not show through. A depth pre-pass of the whole object (pushed back a hair so
+// its own surface still passes LessEqual), then the cut object marks the stencil where it wins.
+// The depth is cleared after, so the floor and its shadows behind the cut part still draw, and
+// the normal render draws the model only on marked pixels.
+const slicePreMat = new THREE.MeshBasicMaterial({
+  colorWrite: false, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+})
+const sliceMarkMat = new THREE.MeshBasicMaterial({
+  colorWrite: false, depthWrite: false, side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 1, stencilFunc: THREE.AlwaysStencilFunc,
+  stencilZPass: THREE.ReplaceStencilOp,
+})
+let slicePreCount = 0
+let sliceMarkCount = 0
 // Face drag in flight. The plane, the axis and the START size are all pinned at pointerdown:
 // deriving the face from where it began is what lets Shift be toggled mid-drag without a jump.
 let cropDrag: {
@@ -456,8 +488,7 @@ const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (
 const objectPanelOpen = computed(() => popped.value || activePanel.value === 'object')
 const lightPanelOpen = computed(() => popped.value || activePanel.value === 'light')
 const depthPanelOpen = computed(() => popped.value || activePanel.value === 'depth')
-const occludePanelOpen = computed(() =>
-  (popped.value && hasSceneDepth.value) || activePanel.value === 'occlude')
+const occludePanelOpen = computed(() => popped.value || activePanel.value === 'occlude')
 
 const DEPTH_FRAG = `
 uniform sampler2D depthMap;
@@ -1198,7 +1229,8 @@ function setOrthoView(on: boolean) {
   status.value = on ? 'Ortho view — moving the camera returns to the lens' : ''
 }
 
-function renderFrame(drawBackdrop = true) {
+function renderFrame(drawBackdrop = true, cut = drawBackdrop && sliceActive()) {
+  sliceOn = cut
   syncMaskOverlay()
   applyClipPlanes()
   // The grips are sized by their distance to the camera, so they have to be re-parked whenever
@@ -1213,22 +1245,28 @@ function renderFrame(drawBackdrop = true) {
     r.toneMapping = THREE.NoToneMapping
     r.render(bgScene, bgCamera)
     r.toneMapping = tone
-    if (occlude.value && sceneDepthTexture) layBackdropDepth()
   }
+  const occluding = drawBackdrop && occlude.value && !!sceneDepthTexture
+  if (occluding) layBackdropDepth()
+  const unmark = sliceMark(r, occluding)
   r.render(scene, viewCam())
-  if (!floorClip.value && model && !modelIsSplat) drawOverFloor(r)
+  if (!floorClip.value && model && !modelIsSplat) drawOverFloor(r, occluding)
+  unmark?.()
   r.autoClear = true
+  sliceOn = false
 }
 
 /** Repaint the scene on top of the floor layers, which is what puts the object back where they
  *  covered it. A splat skips this: drawing it twice would thicken its soft edges, and with the
  *  catcher's depth write off nothing covers it in the first place. */
-function drawOverFloor(r: THREE.WebGLRenderer) {
+function drawOverFloor(r: THREE.WebGLRenderer, occluding: boolean) {
   const floor = [grid, shadowCatcher, contactGroup].filter(Boolean) as THREE.Object3D[]
   const shown = floor.map((o) => o.visible)
   floor.forEach((o) => { o.visible = false })
   r.shadowMap.autoUpdate = false // same frame, same shadows
   r.clearDepth()
+  // The clear also wiped the photo's depth: lay it back, or the repaint ignores Occlude.
+  if (occluding) layBackdropDepth()
   r.render(scene, viewCam())
   r.shadowMap.autoUpdate = true
   floor.forEach((o, i) => { o.visible = shown[i] })
@@ -1252,7 +1290,7 @@ const ghostMat = new THREE.ShaderMaterial({
     tBack: { value: null }, back: { value: false }, backColor: { value: new THREE.Color(0.35, 0.75, 1) },
     thick: { value: 1 }, opacity: { value: 0.35 }, depthThr: { value: 0 }, normalThr: { value: 0 },
     splat: { value: false }, logNear: { value: 0 }, logFar: { value: 1 },
-    edgeColor: { value: new THREE.Color(1, 0.85, 0) },
+    edgeColor: { value: new THREE.Color(1, 0.85, 0) }, lineart: { value: false },
   },
   vertexShader: COMPOSITE_VERT, fragmentShader: COMPOSITE_FRAG,
   transparent: true, depthTest: false, depthWrite: false,
@@ -1354,6 +1392,79 @@ function disposeGhost() {
 // the view is up.
 watch(() => pinMode.value && ghostView.value, (on) => { if (!on) disposeGhost() })
 
+/** What the edges are measured on: auxRT (and backRT, the peeled layer, when `withBack`) for
+ *  the current camera. Shared by the ghost view and the lineart export, so the two lines are
+ *  the same lines. Returns the visible SplatMesh when the model is a splat. Leaves the render
+ *  target set to the last buffer; the caller resets it. */
+function renderEdgeBuffers(r: THREE.WebGLRenderer, size: THREE.Vector2, withBack: boolean) {
+  // The aux pass is the object and nothing else: a helper there would get outlined too.
+  const helpers = helpersVisible()
+  setHelpersVisible(false)
+  r.setRenderTarget(auxRT)
+  r.clear()
+  r.shadowMap.autoUpdate = false // same frame, same shadows: the colour pass already drew them
+  const sm: any = modelIsSplat ? model!.children.find((c: any) => c.packedSplats) : null
+  if (sm) renderSplatAux(r, sm)
+  else if (!modelIsSplat) {
+    const restore = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? auxMat : auxFlatMat))
+    r.render(scene, viewCam())
+    restore()
+    // Hidden contours: one depth peel. A splat has no depth buffer to peel against.
+    if (withBack) {
+      peelUniforms.tFront.value = auxRT!.texture
+      peelUniforms.peelTexel.value.set(1 / size.x, 1 / size.y)
+      // ponytail: 1% of the object's radius; a hidden part closer than that behind the skin is lost.
+      peelUniforms.peelSlack.value = 0.01 * modelBox().getBoundingSphere(new THREE.Sphere()).radius
+      r.setRenderTarget(backRT)
+      r.clear()
+      const undo = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? peelMat : peelFlatMat))
+      r.render(scene, viewCam())
+      undo()
+    }
+  }
+  r.shadowMap.autoUpdate = true
+  setHelpersVisible(helpers)
+  return sm
+}
+
+function setEdgeUniforms(size: THREE.Vector2, thick: number, sm: any) {
+  const u = ghostMat.uniforms
+  const t = edgeThresholds(ghostDetail.value)
+  u.tAux.value = auxRT!.texture
+  u.tBack.value = backRT!.texture
+  u.texel.value.set(1 / size.x, 1 / size.y)
+  u.thick.value = thick
+  u.depthThr.value = t.depthThr
+  u.normalThr.value = t.normalThr
+  u.splat.value = !!sm
+  return u
+}
+
+/** Lineart export: the ghost view's contours, white on an opaque black canvas, at the export
+ *  size — what a canny / lineart ControlNet wants. Visible edges only (canny never sees through
+ *  the object); thresholds follow the ghost view's Detail. Leaves the result on the canvas. */
+function renderLineart(r: THREE.WebGLRenderer, width: number, height: number) {
+  if (!model) { r.setClearColor(0x000000, 1); r.clear(); return }
+  const size = new THREE.Vector2(width, height)
+  sizeGhostTargets(width, height)
+  r.setClearColor(0x000000, 0)
+  const sm = renderEdgeBuffers(r, size, false)
+  r.setRenderTarget(null)
+  const u = setEdgeUniforms(size, 1, sm)
+  u.back.value = false
+  u.tGhost.value = null // not read in lineart mode; the old target may be disposed
+  u.lineart.value = true
+  r.setClearColor(0x000000, 1)
+  r.clear()
+  const tone = r.toneMapping
+  r.toneMapping = THREE.NoToneMapping
+  r.render(ghostQuad, bgCamera)
+  r.toneMapping = tone
+  u.lineart.value = false
+  // The buffers were sized for the export; the live ghost view re-sizes them on its next frame.
+  if (!(pinMode.value && ghostView.value)) disposeGhost()
+}
+
 /** Pin mode with the ghost on draws this instead of renderFrame. The floor layers stay out:
  *  the point is to see the photo, and a grid or a shadow ghosted over it is only noise. */
 function renderGhostView() {
@@ -1373,49 +1484,15 @@ function renderGhostView() {
   r.setRenderTarget(ghostRT)
   r.clear()
   r.render(scene, viewCam())
-  // The aux pass is the object and nothing else: a helper there would get outlined too.
-  const helpers = helpersVisible()
-  setHelpersVisible(false)
-  r.setRenderTarget(auxRT)
-  r.clear()
-  r.shadowMap.autoUpdate = false // same frame, same shadows: the ghost pass already drew them
-  const sm: any = modelIsSplat ? model.children.find((c: any) => c.packedSplats) : null
-  if (sm) renderSplatAux(r, sm)
-  else if (!modelIsSplat) {
-    const restore = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? auxMat : auxFlatMat))
-    r.render(scene, viewCam())
-    restore()
-    // Hidden contours: one depth peel. A splat has no depth buffer to peel against.
-    if (ghostBack.value) {
-      peelUniforms.tFront.value = auxRT!.texture
-      peelUniforms.peelTexel.value.set(1 / size.x, 1 / size.y)
-      // ponytail: 1% of the object's radius; a hidden part closer than that behind the skin is lost.
-      peelUniforms.peelSlack.value = 0.01 * modelBox().getBoundingSphere(new THREE.Sphere()).radius
-      r.setRenderTarget(backRT)
-      r.clear()
-      const undo = overrideModelMaterials((m) => (m.geometry.getAttribute('normal') ? peelMat : peelFlatMat))
-      r.render(scene, viewCam())
-      undo()
-    }
-  }
-  r.shadowMap.autoUpdate = true
-  setHelpersVisible(helpers)
+  const sm = renderEdgeBuffers(r, size, ghostBack.value)
   r.setRenderTarget(null)
   floor.forEach((o, i) => { o.visible = shown[i] })
   r.setClearColor(prevClear, prevAlpha)
 
-  const u = ghostMat.uniforms
-  const t = edgeThresholds(ghostDetail.value)
+  const u = setEdgeUniforms(size, Math.max(1, Math.round(r.getPixelRatio())), sm)
   u.tGhost.value = ghostRT!.texture
-  u.tAux.value = auxRT!.texture
-  u.tBack.value = backRT!.texture
   u.back.value = ghostBack.value && !modelIsSplat
-  u.texel.value.set(1 / size.x, 1 / size.y)
-  u.thick.value = Math.max(1, Math.round(r.getPixelRatio()))
   u.opacity.value = ghostOpacity.value
-  u.depthThr.value = t.depthThr
-  u.normalThr.value = t.normalThr
-  u.splat.value = !!sm
   r.autoClear = false
   r.clear()
   const tone = r.toneMapping
@@ -2010,6 +2087,7 @@ async function setModel(ref: { filename: string; type: string; subfolder: string
       model = null
     }
     proj = null
+    sliceRangeKey = ''
     model = loaded
     modelIsSplat = loadedIsSplat
     modelIsSplatRef.value = loadedIsSplat
@@ -2164,12 +2242,14 @@ function localBox(): THREE.Box3 | null {
   g.quaternion.identity()
   g.scale.set(1, 1, 1)
   modelHolder?.position.set(0, 0, 0)
+  modelHolder?.quaternion.identity()
   g.updateMatrixWorld(true)
   const box = modelBox()
   g.position.copy(saved.p)
   g.quaternion.copy(saved.q)
   g.scale.copy(saved.s)
   if (savedHolder) modelHolder!.position.copy(savedHolder)
+  modelHolder?.quaternion.copy(originQ)
   g.updateMatrixWorld(true)
   return box.isEmpty() ? null : box
 }
@@ -2206,7 +2286,9 @@ function applyObjectTransform() {
   g.scale.setScalar(s)
   // The group IS the pivot: it goes to the pivot's world place, the model hangs at -pivot.
   g.position.set(objPos.x + pivotP.x, objPos.y + pivotP.y, objPos.z + pivotP.z)
-  modelHolder?.position.copy(pivotP).multiplyScalar(-1)
+  // The holder turns the model by the origin's orientation about the pivot: -(originQ·p).
+  modelHolder?.quaternion.copy(originQ)
+  modelHolder?.position.copy(pivotP).applyQuaternion(originQ).multiplyScalar(-1)
   contactDirty = true // the footprint moved — re-bake the grounding shadow
   // The clip planes are WORLD space: the model just moved under them.
   if (cropOn.value) updateCrop()
@@ -2218,7 +2300,13 @@ function applyObjectTransform() {
 function objectBaseNow(): V3 | null {
   const g = pivotGroup
   if (!g) return null
-  return objectBase(g.position, pivotP, g.quaternion.toArray() as Quat, g.scale.x)
+  return objectBase(g.position, pivotP, objectQ(), g.scale.x)
+}
+
+/** The object's own world orientation: the group's (origin's) times the holder's. The pivot
+ *  math only ever needs this product — world(x) = q·originQ·s·(x − p) + p + t. */
+function objectQ(): Quat {
+  return pivotGroup!.quaternion.clone().multiply(originQ).toArray() as Quat
 }
 
 /** Re-derive Pos so the object stays exactly put after `mutate` has moved the pivot. */
@@ -2227,7 +2315,7 @@ function repivot(mutate: () => void) {
   const base = objectBaseNow()
   mutate()
   if (!g || !base) { applyObjectTransform(); return }
-  const o = objPosition(base, pivotP, g.quaternion.toArray() as Quat, g.scale.x)
+  const o = objPosition(base, pivotP, objectQ(), g.scale.x)
   objPos.x = +o.x.toFixed(4)
   objPos.y = +o.y.toFixed(4)
   objPos.z = +o.z.toFixed(4)
@@ -2246,23 +2334,30 @@ function setPivotMode(m: 'bottom' | 'center' | 'origin' | 'custom') {
  *  what pivot that implies (pivotFromGroup), and the holder's -pivot offset puts the model
  *  straight back where it was. Net effect: the gizmo moves, nothing else does.
  *
- *  Translate only: a pivot is a POINT, so rotating or scaling it is a no-op by definition. */
+ *  With the rotate gizmo, Alt turns the origin's AXES instead (Blender's "affect only origins"):
+ *  the group rotates, the holder takes the inverse, and the object stays where it was. Scale
+ *  has no origin equivalent, so Alt+scale falls back to moving the point. */
 let pivotDragBase: V3 | null = null
+let originDragQ: THREE.Quaternion | null = null // object orientation held while the origin turns
 function setPivotEdit(on: boolean) {
   if (on === pivotEdit.value) return
   if (gizmoDragging) return // switching what a live drag means tears the drag apart
   if (on && (gizmoMode.value === 'off' || gizmoLightId.value != null || gizmoTargetId.value != null)) return
   if (!transformControls || !pivotGroup) return
   pivotEdit.value = on
+  const spin = on && gizmoMode.value === 'rotate'
   pivotDragBase = on ? objectBaseNow() : null
-  transformControls.setMode(on ? 'translate' : (gizmoMode.value === 'off' ? 'translate' : gizmoMode.value))
-  status.value = on ? 'Alt — moving the object origin' : ''
+  originDragQ = spin ? new THREE.Quaternion().fromArray(objectQ()) : null
+  transformControls.setMode(on ? (spin ? 'rotate' : 'translate') : (gizmoMode.value === 'off' ? 'translate' : gizmoMode.value))
+  status.value = on ? (spin ? 'Alt — rotating the object origin' : 'Alt — moving the object origin') : ''
 }
 
 function resetTransform() {
   objPos.x = objPos.y = objPos.z = 0
   objRot.x = objRot.y = objRot.z = 0
   objScale.value = 1
+  // Unlike a hand-placed pivot, a turned origin DOES move the object at Rot 0 — so it goes too.
+  originQ.identity()
   applyObjectTransform() // the pivot is not a transform — a hand-placed one survives
 }
 
@@ -2277,6 +2372,7 @@ function fitToGround() {
   const maxd = Math.max(size.x, size.y, size.z)
   if (!(maxd > 0)) return
   objRot.x = objRot.y = objRot.z = 0
+  originQ.identity()
   objScale.value = FIT_SIZE / maxd
   pivotMode.value = 'bottom' // direct: repivot would preserve the placement we're replacing
   recomputePivot()
@@ -2326,8 +2422,20 @@ function readbackGizmo() {
   if (!g) return
   // Alt: the drag moved the pivot, not the object. Read the pivot it implies and undo the
   // group's move on the model side, so the object never budges.
+  // Alt + rotate: the group (the origin's axes) turned; give the holder the rest of the object's
+  // held orientation, so q·originQ — and with it every point of the object — is unchanged.
+  if (pivotEdit.value && originDragQ) {
+    const e = new THREE.Euler().setFromQuaternion(g.quaternion, 'XYZ')
+    objRot.x = +THREE.MathUtils.radToDeg(e.x).toFixed(2)
+    objRot.y = +THREE.MathUtils.radToDeg(e.y).toFixed(2)
+    objRot.z = +THREE.MathUtils.radToDeg(e.z).toFixed(2)
+    applyObjectTransform() // writes the ROUNDED Rot back, so derive the holder from that
+    originQ.copy(g.quaternion).invert().multiply(originDragQ)
+    applyObjectTransform()
+    return
+  }
   if (pivotEdit.value && pivotDragBase) {
-    const q = g.quaternion.toArray() as Quat
+    const q = objectQ()
     const np = pivotFromGroup(g.position, pivotDragBase, q, g.scale.x)
     pivotCustom.set(np.x, np.y, np.z)
     pivotMode.value = 'custom'
@@ -3209,20 +3317,112 @@ function applyClipPlanes() {
     crop: cropOn.value, floor: floorClip.value, isSplat: modelIsSplat,
   })
   const count = planes ? planes.length : 0
-  if (!count && !clipCount) return
-  const flip = count !== clipCount // the plane COUNT changed → the shader has to be rebuilt
-  const set = (m: THREE.Material | THREE.Material[] | null | undefined) => {
+  // The model also carries the depth_slice planes while they are on; nothing else does.
+  modelPlanes.length = 0
+  if (planes) modelPlanes.push(...planes)
+  if (sliceOn) { updateSlicePlanes(planes); modelPlanes.push(...slicePlanes) }
+  const mcount = modelPlanes.length
+  // A change in the plane COUNT means the shader has to be rebuilt.
+  const set = (m: THREE.Material | THREE.Material[] | null | undefined, p: THREE.Plane[] | null, flip: boolean) => {
     if (!m) return
     for (const one of Array.isArray(m) ? m : [m]) {
-      one.clippingPlanes = planes
+      one.clippingPlanes = p
       if (flip) one.needsUpdate = true
     }
   }
-  model?.traverse((c) => { if (c instanceof THREE.Mesh) set(c.material) })
-  set(linearDepthMaterial)
-  set(meshDepthMaterial)
-  set(contactDepthMat)
-  clipCount = count
+  if (mcount || modelClipCount) {
+    const p = mcount ? modelPlanes : null, flip = mcount !== modelClipCount
+    model?.traverse((c) => { if (c instanceof THREE.Mesh) set(c.material, p, flip) })
+    modelClipCount = mcount
+  }
+  if (count || clipCount) {
+    const flip = count !== clipCount
+    set(linearDepthMaterial, planes, flip)
+    set(meshDepthMaterial, planes, flip)
+    set(contactDepthMat, planes, flip)
+    clipCount = count
+  }
+  if (sliceOn) {
+    set(slicePreMat, planes, count !== slicePreCount); slicePreCount = count
+    set(sliceMarkMat, modelPlanes, mcount !== sliceMarkCount); sliceMarkCount = mcount
+  }
+}
+
+/** Place the two depth_slice planes for the current camera. The object's own range is its
+ *  nearest and farthest vertex along the view axis, counting only what the crop box and the
+ *  floor keep (a cropped MoGe scene would otherwise spend the slider on discarded geometry).
+ *  Cached until the camera, the model or those planes move.
+ *  ponytail: a full vertex scan per camera move while the preview is on; a BVH if it stutters. */
+function updateSlicePlanes(keep: THREE.Plane[] | null) {
+  if (!model) return
+  camera.updateMatrixWorld()
+  model.updateMatrixWorld(true)
+  const key = camera.matrixWorldInverse.elements.join(',') + '|' + model.matrixWorld.elements.join(',') +
+    '|' + (keep ?? []).map((q) => `${q.normal.x},${q.normal.y},${q.normal.z},${q.constant}`).join(';')
+  if (key !== sliceRangeKey) {
+    sliceRangeKey = key
+    let lo = Infinity, hi = -Infinity
+    const mv = new THREE.Matrix4()
+    model.traverse((c) => {
+      if (!(c instanceof THREE.Mesh)) return
+      const pos = c.geometry.getAttribute('position')
+      if (!pos) return
+      const e = mv.multiplyMatrices(camera.matrixWorldInverse, c.matrixWorld).elements
+      const W = c.matrixWorld.elements
+      vert: for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), y = pos.getY(i), zz = pos.getZ(i)
+        if (keep) {
+          const wx = W[0] * x + W[4] * y + W[8] * zz + W[12]
+          const wy = W[1] * x + W[5] * y + W[9] * zz + W[13]
+          const wz = W[2] * x + W[6] * y + W[10] * zz + W[14]
+          for (const q of keep) if (q.normal.x * wx + q.normal.y * wy + q.normal.z * wz + q.constant < 0) continue vert
+        }
+        const z = -(e[2] * x + e[6] * y + e[10] * zz + e[14])
+        if (z < lo) lo = z
+        if (z > hi) hi = z
+      }
+    })
+    if (lo < hi) sliceRange = [lo, hi]
+  }
+  const [a, b] = sliceDistances(sliceRange[0], sliceRange[1], sliceNear.value, sliceFar.value)
+  const d = camera.getWorldDirection(new THREE.Vector3())
+  const dc = d.dot(camera.getWorldPosition(new THREE.Vector3()))
+  slicePlanes[0].set(d, -(dc + a))               // keeps view distance >= a
+  slicePlanes[1].set(d.clone().negate(), dc + b) // keeps view distance <= b
+}
+
+/** There is a cut to make: a band narrower than the whole object, on a mesh. */
+const sliceActive = () => !!model && !modelIsSplat && !sliceIsWhole(sliceNear.value, sliceFar.value)
+
+/** Mark in the stencil where the cut object is the visible surface, then leave the depth as it
+ *  was before (cleared, plus the photo's when Occlude is on) and make the model's materials draw
+ *  only on the mark. Returns the undo for the materials. */
+function sliceMark(r: THREE.WebGLRenderer, occluding: boolean): (() => void) | null {
+  if (!sliceOn || !pivotGroup || !model) return null
+  const auto = r.shadowMap.autoUpdate
+  r.shadowMap.autoUpdate = false
+  for (const mat of [slicePreMat, sliceMarkMat]) {
+    const restore = overrideModelMaterials(() => mat)
+    r.render(pivotGroup, viewCam())
+    restore()
+  }
+  r.shadowMap.autoUpdate = auto
+  r.clearDepth()
+  if (occluding) layBackdropDepth()
+  const saved: [THREE.Material, boolean, number, number, number][] = []
+  model.traverse((c) => {
+    if (!(c instanceof THREE.Mesh)) return
+    for (const m of Array.isArray(c.material) ? c.material : [c.material]) {
+      saved.push([m, m.stencilWrite, m.stencilFunc, m.stencilRef, m.stencilZPass])
+      m.stencilWrite = true // three only runs the stencil test with this set
+      m.stencilFunc = THREE.EqualStencilFunc
+      m.stencilRef = 1
+      m.stencilZPass = THREE.KeepStencilOp
+    }
+  })
+  return () => saved.forEach(([m, w, f, ref, z]) => {
+    m.stencilWrite = w; m.stencilFunc = f as THREE.StencilFunc; m.stencilRef = ref; m.stencilZPass = z as THREE.StencilOp
+  })
 }
 
 /** The crop's eight corners as a world-space box. A rotated crop has no axis-aligned form, so
@@ -3490,6 +3690,14 @@ async function capture(width: number, height: number) {
   renderFrame(false)
   const object = canvasPng(r.domElement)
 
+  // 2b. depth_slice: the same pass with the object cut to its depth band. Only when there is a
+  //     cut; without one Python hands on `mask`, which is what the whole band would render.
+  let slice: Promise<Blob> | undefined
+  if (sliceActive()) {
+    renderFrame(false, true)
+    slice = canvasPng(r.domElement)
+  }
+
   // 3. Depth — the exact pass the Depth tab previews, gizmo excluded.
   renderDepthPass(true)
   const depth = canvasPng(r.domElement)
@@ -3506,6 +3714,10 @@ async function capture(width: number, height: number) {
     mask3d = packMask3d()
   }
 
+  // 5. Lineart: the ghost view's contour detector, white on black (canny / lineart ControlNet).
+  renderLineart(r, width, height)
+  const lineart = canvasPng(r.domElement)
+
   if (shadowCatcher) shadowCatcher.visible = catcherWasVisible
   if (contactGroup) contactGroup.visible = contactWasVisible
   if (grid) grid.visible = gridWasVisible
@@ -3520,8 +3732,8 @@ async function capture(width: number, height: number) {
   fitBackground()
   wake() // the canvas is left holding the last export pass
 
-  const [sceneBlob, objectBlob, depthBlob, paintBlob] = await Promise.all([scene_, object, depth, paintMask])
-  return { scene: sceneBlob, object: objectBlob, depth: depthBlob, paintMask: paintBlob, mask3d,
+  const [sceneBlob, objectBlob, depthBlob, paintBlob, lineartBlob, sliceBlob] = await Promise.all([scene_, object, depth, paintMask, lineart, slice])
+  return { scene: sceneBlob, object: objectBlob, depth: depthBlob, paintMask: paintBlob, lineart: lineartBlob, slice: sliceBlob, mask3d,
            camera_info: cameraInfo() }
 }
 
@@ -3923,6 +4135,8 @@ function serialise(): string {
     occlude: occlude.value,
     occFrom: occFrom.value,
     occTo: occTo.value,
+    sliceNear: sliceNear.value,
+    sliceFar: sliceFar.value,
     depthView: depthView.value,
     showRange: showRange.value,
     depthManual: depthManual.value,
@@ -3945,6 +4159,7 @@ function serialise(): string {
       scale: objScale.value,
       pivot: pivotMode.value,
       pivotC: { x: pivotCustom.x, y: pivotCustom.y, z: pivotCustom.z },
+      originQ: originQ.toArray(),
       gizmoSpace: gizmoSpace.value,
       mirrorGuide: mirrorGuide.value,
       // The box's own transform IS the state: centre, orientation and half-extents.
@@ -4020,6 +4235,8 @@ function deserialise(json: string) {
     if (typeof s.depthInverseSpace === 'boolean') setDepthSpace(s.depthInverseSpace)
     if (typeof s.occFrom === 'number') setOccFrom(s.occFrom)
     if (typeof s.occTo === 'number') setOccTo(s.occTo)
+    if (typeof s.sliceNear === 'number') sliceNear.value = s.sliceNear
+    if (typeof s.sliceFar === 'number') sliceFar.value = s.sliceFar
     if (typeof s.depthView === 'boolean') depthView.value = s.depthView
     if (typeof s.showRange === 'boolean') showRange.value = s.showRange
     if (typeof s.depthManual === 'boolean') depthManual.value = s.depthManual
@@ -4063,6 +4280,9 @@ function deserialise(json: string) {
       if (o.rot) Object.assign(objRot, o.rot)
       if (typeof o.scale === 'number') objScale.value = o.scale
       if (o.pivotC) pivotCustom.set(o.pivotC.x ?? 0, o.pivotC.y ?? 0, o.pivotC.z ?? 0)
+      // Absent before origin rotation existed: identity, the old behaviour.
+      if (Array.isArray(o.originQ) && o.originQ.length === 4 && o.originQ.every((n: any) => Number.isFinite(n))) originQ.fromArray(o.originQ).normalize()
+      else originQ.identity()
       if (o.pivot === 'bottom' || o.pivot === 'center' || o.pivot === 'origin' || o.pivot === 'custom') pivotMode.value = o.pivot
       // Absent in workflows saved before the toggle existed: those keep three's default, world.
       if (o.gizmoSpace === 'world' || o.gizmoSpace === 'local') setGizmoSpace(o.gizmoSpace)
@@ -4201,7 +4421,8 @@ function cleanup() {
 
 onMounted(() => {
   const el = host.value!
-  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true })
+  // stencil: the object slice marks where the cut surface is the visible one (sliceMark).
+  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true, stencil: true })
   r.setPixelRatio(Math.max(window.devicePixelRatio, 2)) // resize() refines this with the canvas zoom
   r.setClearColor(0x000000, 0)
   r.shadowMap.enabled = true
@@ -4343,8 +4564,8 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
         <button :class="{ on: activePanel === 'depth' }" @click="togglePanel('depth')"
           title="Depth output: near/far range, live preview and Auto Z">Depth</button>
-        <button v-if="hasSceneDepth" :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
-          title="Depth occlusion: key out foreground from the injected depth map">Occlude</button>
+        <button :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
+          title="Occlusion: the scene's depth hiding the object, and the depth_slice mask of the object's own depth">Occlude</button>
       </template>
       <label class="nkd-barfield" :title="hasCamera
         ? 'Focal length, 35mm-equivalent. A solved camera drives this — the next run puts its lens back.'
@@ -4541,10 +4762,17 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
     </div>
     <div v-if="occludePanelOpen" class="nkd-panel" @pointerdown.stop @wheel.stop>
       <div class="nkd-sliders">
+        <div class="nkd-subhead">Scene — the photo's depth hides the object</div>
+        <span v-if="!hasSceneDepth" class="nkd-depth-warn">connect scene_depth to use it</span>
+        <template v-else>
         <label class="nkd-check"><input type="checkbox" v-model="occlude"> Occlusion (depth-key matte)</label>
         <label title="Front of the occluding grey band. Near reads as white, so a band ending at 1 keys out the foreground">From<input type="range" min="0" max="1" step="0.01" v-model.number="occFrom" :disabled="!occlude" @input="setOccFrom(occFrom)"><span>{{ occFrom.toFixed(2) }}</span></label>
         <label title="Back of the occluding grey band. Everything between From and To hides the object">To<input type="range" min="0" max="1" step="0.01" v-model.number="occTo" :disabled="!occlude" @input="setOccTo(occTo)"><span>{{ occTo.toFixed(2) }}</span></label>
         <label class="nkd-check"><input type="checkbox" :checked="depthInvertUI" @change="setDepthInvertUI(($event.target as HTMLInputElement).checked)"> Invert depth map</label>
+        </template>
+        <div class="nkd-subhead" title="Cuts the object in the viewer and in `image`; depth_slice is the cut silhouette. object, mask and depth stay whole.">Object — cut to a band of its own depth</div>
+        <label title="Near end of the band. 1 is the object's nearest point, 0 its farthest">Near<input type="range" min="0" max="1" step="0.01" data-default="1" v-model.number="sliceNear" @change="notifyStateChanged()"><span>{{ sliceNear.toFixed(2) }}</span></label>
+        <label title="Far end of the band. Near 1 / Far 0 keeps the whole silhouette; 1 / 0.5 only its front half">Far<input type="range" min="0" max="1" step="0.01" data-default="0" v-model.number="sliceFar" @change="notifyStateChanged()"><span>{{ sliceFar.toFixed(2) }}</span></label>
       </div>
     </div>
     </div>
@@ -4792,6 +5020,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-gizmo-icon { flex: 0 0 auto; width: 26px; }
 .nkd-depth-info { color: rgba(255, 255, 255, 0.45); font-size: 10px; gap: 10px; }
 .nkd-depth-warn { color: #ffd166; }
+.nkd-subhead { font-size: 11px; opacity: 0.7; margin-top: 4px; border-bottom: 1px solid var(--border-color, #444); }
 /* Light rig: the panel goes column so the extra-lights list sits under the key controls. */
 .nkd-panel-col { flex-direction: column; align-items: stretch; }
 .nkd-light-main { display: flex; align-items: center; gap: 10px; width: 100%; }

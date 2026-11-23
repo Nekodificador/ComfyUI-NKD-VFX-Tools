@@ -60,6 +60,7 @@ uniform bool splat;
 uniform float logNear;    // log2(near + 1), the range Spark normalised the splat depth with
 uniform float logFar;
 uniform vec3 edgeColor;
+uniform bool lineart;     // export: white contours on opaque black, nothing else
 varying vec2 vUv;
 
 // 1/z at a texel, 0 where there is no object.
@@ -94,6 +95,10 @@ float edgesOf(sampler2D t, bool sp) {
 
 void main() {
   float edge = edgesOf(tAux, splat);
+  if (lineart) {
+    gl_FragColor = vec4(vec3(edge), 1.0);
+    return;
+  }
   // Hidden contours: the same test on the peeled layer, dashed (diagonal stripes read as dashes
   // on a line of any direction) and dimmer, and never over a visible one.
   float hidden = 0.0;

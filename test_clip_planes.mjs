@@ -4,7 +4,7 @@
 // three bakes the plane COUNT into the shader, so the shape of the answer matters as much as
 // its contents: null when nothing clips, never an empty array.
 import assert from 'node:assert'
-import { clipPlanesFor } from './web/js/nkd_clip_planes.js'
+import { clipPlanesFor, sliceDistances, sliceIsWhole } from './web/js/nkd_clip_planes.js'
 
 const CROP = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5']
 const FLOOR = 'floor'
@@ -59,3 +59,10 @@ assert.ok(side(1) > 0, 'a point above the floor is kept')
 assert.ok(side(-1) < 0, 'a point below the floor is clipped')
 assert.strictEqual(side(0), 0, 'the floor itself is the boundary')
 console.log('test_clip_planes: floor sign ok')
+
+// depth_slice: 1 is the nearest point, 0 the farthest, either order.
+assert.deepStrictEqual(sliceDistances(2, 6, 1, 0), [2, 6], 'whole band = whole range')
+assert.deepStrictEqual(sliceDistances(2, 6, 1, 0.5), [2, 4], 'front half is the NEAR half')
+assert.deepStrictEqual(sliceDistances(2, 6, 0.5, 1), [2, 4], 'order does not matter')
+assert.ok(sliceIsWhole(1, 0) && sliceIsWhole(0, 1) && !sliceIsWhole(1, 0.5), 'default is whole')
+console.log('test_clip_planes: slice ok')

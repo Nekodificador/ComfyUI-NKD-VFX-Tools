@@ -1,0 +1,116 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NKD object slice — GPU self-check</title>
+<!--
+  Self-check for the Preview 3D's object slice (the cut in `image`, and the depth_slice mask).
+  Needs a real GL context.
+
+    npm run build                 # nkd_clip_planes.js is imported built
+    python -m http.server 8791    # from the repo root, so ./node_modules/three resolves
+    open http://127.0.0.1:8791/test_depth_slice.html
+
+  Rebuilds updateSlicePlanes()'s planes and sliceMark() from src/Preview3DWidget.vue and reads
+  pixels back. Keep the marked block in sync.
+-->
+<body style="background:#14171c;color:#d6dae0;font:13px/1.55 ui-monospace,Consolas,monospace;padding:18px">
+<pre id="out">running…</pre>
+<script type="module">
+import * as THREE from './node_modules/three/build/three.module.js'
+import { sliceDistances } from './web/js/nkd_clip_planes.js'
+
+const W = 64, H = 64
+const L = [], out = document.getElementById('out')
+const log = (s = '') => { L.push(s); out.textContent = L.join('\n') }
+let failed = 0
+const check = (ok, msg) => { if (!ok) failed++; log(`${ok ? '  ok  ' : ' FAIL '} ${msg}`) }
+
+const r = new THREE.WebGLRenderer({ preserveDrawingBuffer: true, stencil: true })
+r.setSize(W, H, false)
+r.localClippingEnabled = true
+const scene = new THREE.Scene()
+const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100)
+camera.updateMatrixWorld()
+
+// The "object": a FRONT plate at distance 2 over the left half, a BACK plate at distance 4 over
+// everything. Range 2..4. Behind both, NOT part of the object, a green "floor" at distance 6.
+const pivotGroup = new THREE.Group()
+scene.add(pivotGroup)
+const plate = (w, h, x, z, color) => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color }))
+  m.position.set(x, 0, z)
+  return m
+}
+const front = plate(4, 6, -2, -2, 0xff0000)
+const back = plate(40, 40, 0, -4, 0x0000ff)
+pivotGroup.add(front, back)
+scene.add(plate(80, 80, 0, -6, 0x00ff00))
+const meshes = [front, back]
+
+// ── keep in sync with updateSlicePlanes / sliceMark / renderFrame ──
+const slicePlanes = [new THREE.Plane(), new THREE.Plane()]
+const slicePreMat = new THREE.MeshBasicMaterial({
+  colorWrite: false, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+})
+const sliceMarkMat = new THREE.MeshBasicMaterial({
+  colorWrite: false, depthWrite: false, side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 1, stencilFunc: THREE.AlwaysStencilFunc,
+  stencilZPass: THREE.ReplaceStencilOp,
+})
+function placePlanes(near, far) {
+  const [a, b] = sliceDistances(2, 4, near, far)
+  const d = camera.getWorldDirection(new THREE.Vector3())
+  const dc = d.dot(camera.getWorldPosition(new THREE.Vector3()))
+  slicePlanes[0].set(d, -(dc + a))
+  slicePlanes[1].set(d.clone().negate(), dc + b)
+}
+const override = (mat) => {
+  const mats = meshes.map((m) => m.material)
+  meshes.forEach((m) => { m.material = mat })
+  return () => meshes.forEach((m, i) => { m.material = mats[i] })
+}
+function render(near, far, mark) {
+  placePlanes(near, far)
+  for (const m of [...meshes.map((x) => x.material), sliceMarkMat]) { m.clippingPlanes = slicePlanes; m.needsUpdate = true }
+  r.setClearColor(0x000000, 1)
+  r.autoClear = false
+  r.clear()
+  let saved = null
+  if (mark) {
+    for (const mat of [slicePreMat, sliceMarkMat]) { const undo = override(mat); r.render(pivotGroup, camera); undo() }
+    r.clearDepth()
+    saved = meshes.map((m) => m.material)
+    for (const m of saved) {
+      m.stencilWrite = true; m.stencilFunc = THREE.EqualStencilFunc; m.stencilRef = 1; m.stencilZPass = THREE.KeepStencilOp
+    }
+  }
+  r.render(scene, camera)
+  if (saved) for (const m of saved) { m.stencilWrite = false; m.stencilFunc = THREE.AlwaysStencilFunc; m.stencilRef = 0 }
+  r.autoClear = true
+}
+// ─────────────────────────────────────────────────────────────
+
+const px = (x, y) => {
+  const gl = r.getContext(), p = new Uint8Array(4)
+  gl.readPixels(x, H - 1 - y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p)
+  return `${p[0] > 128 ? 'R' : ''}${p[1] > 128 ? 'G' : ''}${p[2] > 128 ? 'B' : ''}` || '-'
+}
+const LEFT = [16, 32], RIGHT = [48, 32]
+
+render(1, 0, true)
+check(px(...LEFT) === 'R' && px(...RIGHT) === 'B', `whole band: front on the left, back on the right (${px(...LEFT)}/${px(...RIGHT)})`)
+
+render(1, 0.5, true)   // near half: distances 2..3 → only the front plate
+check(px(...LEFT) === 'R', `front half keeps the near plate (${px(...LEFT)})`)
+check(px(...RIGHT) === 'G', `front half drops the far plate, the floor behind shows (${px(...RIGHT)})`)
+
+render(0.5, 0, true)   // far half: 3..4 → the back plate, but NOT where the front plate hid it
+check(px(...RIGHT) === 'B', `back half keeps the far plate where it is visible (${px(...RIGHT)})`)
+check(px(...LEFT) === 'G', `back half: the object's hidden back stays hidden, the floor behind it shows (${px(...LEFT)})`)
+
+render(0.5, 0, false)  // CONTROL: without the mark the hidden back plate shows through
+check(px(...LEFT) === 'B', `control: without the stencil mark the back plate shows through (${px(...LEFT)})`)
+
+log(failed ? `\n${failed} FAILED` : '\nall passed')
+document.title = failed ? `FAIL (${failed})` : 'PASS'
+</script>
