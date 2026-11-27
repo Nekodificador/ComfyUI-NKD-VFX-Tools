@@ -119,7 +119,7 @@ comfyApp.registerExtension({
         // State is written live through onChange, so every exit path is a save.
         modal = openNkdModal({
           title: "😺 fSpy Camera",
-          hint: "drag the handles along two orthogonal directions",
+          hint: "drag the handles along two orthogonal directions · ? for the shortcuts",
           onClose: () => { setStatus(summary); teardown(); },
         });
         vueApp = createApp(FSpyWidget, {
@@ -127,6 +127,7 @@ comfyApp.registerExtension({
           initialState: stateWidget?.value || "",
           footerLeft: modal.footerLeft,
           footerRight: modal.footerRight,
+          modal,
           onChange: (json: string) => { if (stateWidget) stateWidget.value = json; self.setDirtyCanvas(true); },
           onSummary: (s: { ok: boolean; fovV: number; focal: number }) => { summary = s; },
         });
@@ -137,9 +138,9 @@ comfyApp.registerExtension({
         modal.addPrimary("Save & close");
       }
 
-      // No emoji: LiteGraph draws node buttons as canvas text, so an icon font is
-      // not an option here — plain text beats a colour sticker.
-      this.addWidget("button", "Open fSpy Viewer", null, openViewer);
+      // A native button, not the pill: the pill belongs over a preview, and this node has none.
+      // No emoji or symbol in the label — LiteGraph draws it as canvas text.
+      this.addWidget("button", "Open Editor", null, openViewer);
 
       const origRemoved = this.onRemoved;
       this.onRemoved = function (this: any) {

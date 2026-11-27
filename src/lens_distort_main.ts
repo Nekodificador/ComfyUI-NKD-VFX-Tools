@@ -125,7 +125,7 @@ comfyApp.registerExtension({
 
         modal = openNkdModal({
           title: "😺 Lens Distort — plumb lines",
-          hint: "click along something straight (3+ points) · double-click ends a trace · shift-click removes a point · right-drag pans · scroll zooms",
+          hint: "click along something straight (3+ points) · double-click ends a trace · ? for the shortcuts",
           onClose: () => {
             const rerun = solved();
             teardown();
@@ -141,6 +141,7 @@ comfyApp.registerExtension({
           params,
           footerLeft: modal.footerLeft,
           footerRight: modal.footerRight,
+          modal,
           onChange: (json: string) => { if (stateWidget) stateWidget.value = json; self.setDirtyCanvas(true); },
           // The editor never owns the coefficients — it drives the node's widgets.
           onParam: (name: string, value: any) => {
@@ -157,7 +158,9 @@ comfyApp.registerExtension({
         modal.addPrimary("Apply & close");
       }
 
-      this.addWidget("button", "⌖ Open Lens Editor", null, openEditor);
+      // A native button, not the pill: the pill belongs over a preview, and this node has none.
+      // No emoji or symbol in the label — LiteGraph draws it as canvas text.
+      this.addWidget("button", "Open Editor", null, openEditor);
 
       const origRemoved = this.onRemoved;
       this.onRemoved = function (this: any) {

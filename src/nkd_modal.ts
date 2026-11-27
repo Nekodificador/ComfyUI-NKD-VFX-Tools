@@ -69,6 +69,8 @@ export interface NkdModal {
   /** Appends the accented primary button. Convention: always present, always last. */
   addPrimary(label: string, onClick?: () => void): HTMLButtonElement;
   close(reason?: NkdModalCloseReason): void;
+  /** Asked before Esc closes the modal: return true to swallow it (e.g. to shut a sheet first). */
+  beforeEsc?: () => boolean;
 }
 
 const STYLE_ID = "nkd-modal-styles";
@@ -302,6 +304,7 @@ export function openNkdModal(opts: NkdModalOptions): NkdModal {
     if (e.key !== "Escape") return;
     e.stopPropagation();              // or ComfyUI also acts on it
     e.preventDefault();
+    if (api.beforeEsc?.()) return;
     close("dismiss");
   }
 
@@ -315,7 +318,7 @@ export function openNkdModal(opts: NkdModalOptions): NkdModal {
     });
   }
 
-  return {
+  const api: NkdModal = {
     overlay, panel, head, body, footer, footerLeft, footerRight,
     setTitle: (t) => { titleEl.textContent = t; },
     setHint: (h) => { hintEl.textContent = h; },
@@ -327,6 +330,7 @@ export function openNkdModal(opts: NkdModalOptions): NkdModal {
     },
     close,
   };
+  return api;
 }
 
 /* ── Control factories ─────────────────────────────────────────────────────
@@ -407,6 +411,96 @@ export function nkdPopOut(modal: NkdModal, container: HTMLElement,
       ph.remove();
     },
   };
+}
+
+/* ── UI-kit builders ──────────────────────────────────────────────────────── */
+
+/** A round icon button for a `.nkd-ui-float` group. `icon` is a PrimeIcons name without the
+ *  `pi-` prefix (verify it exists in the frontend's stylesheet), or plain text when `text`. */
+export function nkdIcon(icon: string, title: string, onClick: (e: MouseEvent) => void,
+                        text = false): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.title = title;
+  if (text) { b.className = "txt"; b.textContent = icon; }
+  else { const i = document.createElement("i"); i.className = `pi pi-${icon}`; b.appendChild(i); }
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+/** A floating group on `stage` (which must be positioned). `place` is its CSS position, e.g.
+ *  "left:14px;top:50%;transform:translateY(-50%)". Children may include `nkdSep()`. */
+export function nkdFloat(stage: HTMLElement, place: string, column: boolean,
+                         ...children: HTMLElement[]): HTMLDivElement {
+  const f = div("nkd-ui nkd-ui-float" + (column ? " col" : ""));
+  f.style.cssText = place;
+  // The stage under it pans, zooms and places points: a press on a float is not one of those.
+  for (const ev of ["pointerdown", "mousedown", "wheel", "dblclick"]) f.addEventListener(ev, (e) => e.stopPropagation());
+  f.append(...children);
+  stage.appendChild(f);
+  return f;
+}
+export function nkdSep(): HTMLSpanElement {
+  const s = document.createElement("span");
+  s.className = "nkd-ui-sep";
+  return s;
+}
+
+/** [section title, [what, keys, note][]] — list only what the editor really does. */
+export type NkdShortcuts = [string, [string, string[], string?][]][];
+
+/**
+ * The shortcuts sheet: a `?` button for the editor's right-hand column, the `?` key, and Esc
+ * closing the sheet before the editor (through the modal's `beforeEsc`). The sheet covers
+ * `stage`, which must be positioned. Returns the button to put in a float.
+ */
+export function nkdHelp(modal: NkdModal, stage: HTMLElement, sections: NkdShortcuts): HTMLButtonElement {
+  const sheet = div("nkd-ui nkd-ui-help");
+  sheet.style.cssText = "inset:14px 66px 14px 14px;display:none";
+  const head = div("nkd-ui-help-head");
+  head.innerHTML = "<b>Shortcuts</b><span><kbd>?</kbd> or <kbd>Esc</kbd> to close</span>";
+  const cols = div("nkd-ui-help-cols");
+  for (const [title, rows] of sections) {
+    const sec = document.createElement("section");
+    const h = document.createElement("h4");
+    h.textContent = title;
+    sec.appendChild(h);
+    for (const [what, keys, note] of rows) {
+      const row = div("nkd-ui-help-row");
+      const a = document.createElement("span");
+      a.textContent = what;
+      const b = document.createElement("span");
+      keys.forEach((k, i) => {
+        if (i) b.append("+");
+        const kbd = document.createElement("kbd");
+        kbd.textContent = k;
+        b.appendChild(kbd);
+      });
+      if (note) b.append(note);
+      row.append(a, b);
+      sec.appendChild(row);
+    }
+    cols.appendChild(sec);
+  }
+  sheet.append(head, cols);
+  for (const ev of ["pointerdown", "mousedown", "wheel", "dblclick"]) sheet.addEventListener(ev, (e) => e.stopPropagation());
+  stage.appendChild(sheet);
+
+  let open = false;
+  const btn = nkdIcon("question", "Shortcuts — ?", () => set(!open));
+  const set = (v: boolean) => { open = v; sheet.style.display = v ? "" : "none"; btn.classList.toggle("on", v); };
+  modal.beforeEsc = () => { if (!open) return false; set(false); return true; };
+  const onKey = (e: KeyboardEvent) => {
+    if (!modal.overlay.isConnected) { window.removeEventListener("keydown", onKey, true); return; }
+    if (e.key !== "?" || e.repeat) return;
+    const a = document.activeElement as HTMLElement | null;
+    if (a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) && (a as HTMLInputElement).type !== "range") return;
+    e.preventDefault();
+    e.stopPropagation();
+    set(!open);
+  };
+  window.addEventListener("keydown", onKey, true);
+  return btn;
 }
 
 export function nkdButton(label: string, onClick: () => void, title?: string): HTMLButtonElement {

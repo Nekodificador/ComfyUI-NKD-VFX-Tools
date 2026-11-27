@@ -3,6 +3,7 @@ import { onMounted, onBeforeUnmount, nextTick, reactive, ref } from "vue";
 import { solve2vp, makeProjector, snapshotLines, reaimLines, slideAlong,
          spreadVanishingPoints, type FSpyState, type LineSnap } from "./solver";
 import { attachFineRange, isFine, FINE_GAIN } from "./fine_drag";
+import { nkdHelp, type NkdModal, type NkdShortcuts } from "./nkd_modal";
 
 const props = defineProps<{
   initialUrl?: string;
@@ -13,6 +14,7 @@ const props = defineProps<{
   // footer slots. It reports the solve upward instead of closing itself.
   footerLeft?: HTMLElement;
   footerRight?: HTMLElement;
+  modal?: NkdModal;   // for the shortcuts sheet
   onSummary?: (summary: { ok: boolean; fovV: number; focal: number }) => void;
 }>();
 
@@ -35,6 +37,22 @@ const showGrid = ref(true);
 const showAxes = ref(true);
 const showBox = ref(false);
 const showHorizon = ref(true);
+const rightFloat = ref<HTMLDivElement | null>(null);
+const BOX_NAMES = { w: "Width", h: "Height", d: "Depth" } as const;
+const SHORTCUTS: NkdShortcuts = [
+  ["Perspective", [
+    ["Aim a vanishing line", [], "drag its handles"],
+    ["Raise or lower the camera pitch", [], "drag the horizon"],
+    ["Slide one vanishing point", [], "drag its grip on the horizon"],
+    ["Place the world origin", [], "drag the green diamond"],
+  ]],
+  ["Reference box", [
+    ["Resize it", [], "drag a face handle"],
+  ]],
+  ["Sliders", [
+    ["Fine steps (×0.1)", ["Shift"], "drag"],
+  ]],
+];
 const dim = ref(0);        // darken the background image beneath the overlays (0..0.8)
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -437,6 +455,7 @@ onMounted(() => {
   // Attached to the whole modal because the controls live in its footer, not here.
   detachFine = attachFineRange(
     (props.footerRight?.closest('.nkd-modal-panel') as HTMLElement) ?? document.body);
+  if (props.modal && wrap.value && rightFloat.value) rightFloat.value.appendChild(nkdHelp(props.modal, wrap.value, SHORTCUTS));
 });
 onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 </script>
@@ -444,8 +463,71 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 <template>
   <!-- Mounted into the shared chrome's body; the panel, title bar, Esc handling
        and the Save & close button all belong to src/nkd_modal.ts. -->
-  <div class="nkd-fspy-wrap" ref="wrap">
+  <div class="nkd-fspy-wrap nkd-ui" ref="wrap">
     <canvas ref="canvas" @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointerleave="onUp" @contextmenu.prevent />
+    <div class="nkd-ui-float col nkd-fspy-l">
+      <button @click="resetPoints"
+              title="Put the vanishing-line handles, the origin and the reference box back to their starting positions"><i class="pi pi-replay" /></button>
+    </div>
+    <!-- What gets drawn over the photo. The shortcuts button is appended here on mount. -->
+    <div class="nkd-ui-float col nkd-fspy-r" ref="rightFloat">
+      <button :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()" title="Ground grid"><i class="pi pi-th-large" /></button>
+      <button :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()" title="World axes"><i class="pi pi-compass" /></button>
+      <button :class="{ on: showBox }" @click="showBox = !showBox; redraw()" title="Reference box"><i class="pi pi-box" /></button>
+      <button :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch. Drag a coloured ⇔ grip sideways to slide that vanishing point along the horizon: toward the centre stretches the perspective (wider lens), outward compresses it (longer lens)."><i class="pi pi-minus" /></button>
+      <span class="nkd-ui-sep" />
+    </div>
+    <label class="nkd-ui-float nkd-fspy-br" title="Darken the image beneath the overlay">Darken
+      <input type="range" class="nkd-ui-range" min="0" max="0.8" step="0.05"
+             :style="{ '--nkd-pct': (dim / 0.8) * 100 + '%' }" v-model.number="dim" @input="redraw" />
+    </label>
+  </div>
+
+  <div class="nkd-ui nkd-ui-side nkd-fspy-side">
+    <div class="nkd-ui-card">
+      <div class="nkd-ui-cardhead"><i class="pi pi-compass" />Axes</div>
+      <div class="nkd-ui-cardbody">
+        <div class="nkd-ui-row wide" title="World axis VP1 maps to — its handles take that axis' colour">
+          <span :style="{ color: vpColor('vp1') }">VP1 →</span>
+          <select v-model="state.vp1Axis" class="nkd-ui-sel" @change="onAxis">
+            <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
+          </select>
+        </div>
+        <div class="nkd-ui-row wide" title="World axis VP2 maps to — its handles take that axis' colour">
+          <span :style="{ color: vpColor('vp2') }">VP2 →</span>
+          <select v-model="state.vp2Axis" class="nkd-ui-sel" @change="onAxis">
+            <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="nkd-ui-card">
+      <div class="nkd-ui-cardhead"><i class="pi pi-arrows-h" />Perspective</div>
+      <div class="nkd-ui-cardbody" :class="{ off: !hud.ok }">
+        <label class="nkd-ui-row" title="Spread the two vanishing points apart or squeeze them together along the horizon, about the principal point — apart compresses the perspective (longer lens), together stretches it (wider). Relative: it springs back to 1× on release so you can keep nudging. Shift for fine steps.">
+          <span>Spread</span>
+          <input type="range" class="nkd-ui-range" min="-1" max="1" step="0.005"
+                 :style="{ '--nkd-pct': (spread + 1) * 50 + '%' }"
+                 v-model.number="spread" :disabled="!hud.ok"
+                 @input="onSpread" @pointerup="endSpread" @pointercancel="endSpread" @change="endSpread" />
+          <span>{{ Math.pow(2, spread).toFixed(2) }}×</span>
+        </label>
+        <div class="nkd-ui-note">Relative: it springs back to the centre when you let go.</div>
+      </div>
+    </div>
+    <div class="nkd-ui-card" v-if="showBox">
+      <div class="nkd-ui-cardhead"><i class="pi pi-box" />Reference box</div>
+      <div class="nkd-ui-cardbody">
+        <label class="nkd-ui-row" v-for="ax in BOX_AXES" :key="ax.k" :title="ax.tip">
+          <span>{{ BOX_NAMES[ax.k] }}</span>
+          <input type="range" class="nkd-ui-range" min="0.1" max="20" step="0.05"
+                 :style="{ '--nkd-pct': ((boxDims()[ax.k] - 0.1) / 19.9) * 100 + '%' }"
+                 :value="boxDims()[ax.k]"
+                 @input="setBox(ax.k, parseFloat(($event.target as HTMLInputElement).value))" />
+          <span>{{ boxDims()[ax.k].toFixed(2) }}</span>
+        </label>
+      </div>
+    </div>
   </div>
 
   <Teleport v-if="footerLeft" :to="footerLeft">
@@ -454,52 +536,16 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
       <template v-else>degenerate lines — adjust the handles</template>
     </span>
   </Teleport>
-
-  <Teleport v-if="footerRight" :to="footerRight">
-    <button class="nkd-modal-btn" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
-    <button class="nkd-modal-btn" :class="{ on: showAxes }" @click="showAxes = !showAxes; redraw()">Axes</button>
-    <button class="nkd-modal-btn" :class="{ on: showBox }" @click="showBox = !showBox; redraw()">Box</button>
-    <button class="nkd-modal-btn" :class="{ on: showHorizon }" @click="showHorizon = !showHorizon; redraw()" title="Drag the yellow horizon up/down to raise/lower the camera pitch. Drag a coloured ⇔ grip sideways to slide that vanishing point along the horizon: toward the centre stretches the perspective (wider lens), outward compresses it (longer lens).">Horizon</button>
-    <template v-if="showBox">
-      <label class="nkd-modal-lbl" v-for="ax in BOX_AXES" :key="ax.k" :title="ax.tip">{{ ax.label }}
-        <input type="range" class="nkd-modal-rng nkd-fspy-box" min="0.1" max="20" step="0.05"
-               :value="boxDims()[ax.k]"
-               @input="setBox(ax.k, parseFloat(($event.target as HTMLInputElement).value))" />
-        <span class="nkd-fspy-num">{{ boxDims()[ax.k].toFixed(2) }}</span>
-      </label>
-    </template>
-    <label class="nkd-modal-lbl" :class="{ off: !hud.ok }"
-           title="Spread the two vanishing points apart or squeeze them together along the horizon, about the principal point — apart compresses the perspective (longer lens), together stretches it (wider). Relative: it springs back to 1× on release so you can keep nudging. Shift for fine steps.">Spread
-      <input type="range" class="nkd-modal-rng nkd-fspy-box" min="-1" max="1" step="0.005"
-             v-model.number="spread" :disabled="!hud.ok"
-             @input="onSpread" @pointerup="endSpread" @pointercancel="endSpread" @change="endSpread" />
-      <span class="nkd-fspy-num">{{ Math.pow(2, spread).toFixed(2) }}×</span>
-    </label>
-    <label class="nkd-modal-lbl" title="Darken the image beneath the overlay">Darken
-      <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" v-model.number="dim" @input="redraw" />
-    </label>
-    <label class="nkd-modal-lbl" :style="{ color: vpColor('vp1') }" title="World axis VP1 maps to — its handles take that axis' colour">VP1→
-      <select v-model="state.vp1Axis" class="nkd-modal-sel" @change="onAxis">
-        <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
-      </select>
-    </label>
-    <button class="nkd-modal-btn" @click="resetPoints"
-            title="Put the vanishing-line handles, the origin and the reference box back to their starting positions">↺ Reset points</button>
-    <label class="nkd-modal-lbl" :style="{ color: vpColor('vp2') }" title="World axis VP2 maps to — its handles take that axis' colour">VP2→
-      <select v-model="state.vp2Axis" class="nkd-modal-sel" @change="onAxis">
-        <option value="x+">+X</option><option value="x-">−X</option><option value="y+">+Y</option><option value="y-">−Y</option><option value="z+">+Z</option><option value="z-">−Z</option>
-      </select>
-    </label>
-  </Teleport>
 </template>
 
 <style scoped>
-/* Only what is specific to this editor — the chrome's own look lives in the
-   shared stylesheet injected by src/nkd_modal.ts (.nkd-modal-*). */
-.nkd-fspy-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+/* Only what is specific to this editor — chrome and controls come from the shared
+   stylesheet injected by src/nkd_modal.ts (.nkd-modal-*, .nkd-ui-*). */
+.nkd-fspy-wrap { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; }
 .nkd-fspy-wrap canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
-.nkd-fspy-box { width: 64px; }
-.nkd-fspy-num { color: #4ab4ff; font-variant-numeric: tabular-nums; min-width: 30px; text-align: right; }
-/* Spread needs a valid solve to have vanishing points to move. */
-.nkd-modal-lbl.off { opacity: 0.4; }
+.nkd-fspy-l { left: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-fspy-r { right: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-fspy-br { right: 14px; bottom: 14px; padding: 5px 12px; gap: 8px; }
+.nkd-fspy-br input { width: 110px; }
+.nkd-fspy-side { flex: 0 0 320px; }
 </style>

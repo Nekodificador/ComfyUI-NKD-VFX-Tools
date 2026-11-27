@@ -24,6 +24,7 @@ import { onMounted, onBeforeUnmount, reactive, ref, computed } from "vue";
 import { solvePlumbLines, toNorm, foldRadius, undistortNorm, distortNorm,
          type PlumbLine } from "./plumbline";
 import { attachFineRange } from "./fine_drag";
+import { nkdHelp, type NkdModal, type NkdShortcuts } from "./nkd_modal";
 
 const props = defineProps<{
   initialUrl?: string;
@@ -31,6 +32,7 @@ const props = defineProps<{
   params?: Record<string, any>;                         // the node's widget values
   footerLeft?: HTMLElement;
   footerRight?: HTMLElement;
+  modal?: NkdModal;                                     // for the shortcuts sheet
   onChange?: (json: string) => void;                    // persist the traces
   onParam?: (name: string, value: any) => void;         // live write-back
 }>();
@@ -69,7 +71,30 @@ const fitK2 = ref(false);
 const showPreview = ref(true);
 const showGrid = ref(false);
 const showFrame = ref(true);
-const showPanel = ref(true);
+const rightFloat = ref<HTMLDivElement | null>(null);
+// The sidebar's cards: the same SLIDERS table, grouped by what they act on.
+const GROUPS = [
+  { title: "Lens", icon: "pi-sliders-h", keys: ["k1", "k2", "k3", "p1", "p2"] },
+  { title: "Framing", icon: "pi-expand", keys: ["center_x", "center_y", "squeeze", "zoom"] },
+  { title: "Aberration & vignette", icon: "pi-sun", keys: ["ca_red", "ca_blue", "ca_falloff", "vignette_amount", "vignette_falloff"] },
+].map((g) => ({ ...g, rows: SLIDERS.filter((f) => g.keys.includes(f.k)) }));
+const pct = (f: { k: string; min: number; max: number }) =>
+  ({ "--nkd-pct": Math.max(0, Math.min(100, (((P as any)[f.k] - f.min) / (f.max - f.min)) * 100)) + "%" });
+const SHORTCUTS: NkdShortcuts = [
+  ["Traces", [
+    ["Place a point", [], "click along something straight"],
+    ["End a trace", [], "double-click"],
+    ["Remove a point", ["Shift"], "click it"],
+  ]],
+  ["View", [
+    ["Zoom", [], "wheel"],
+    ["Pan", [], "right-drag"],
+  ]],
+  ["Sliders", [
+    ["Fine steps (×0.1)", ["Shift"], "drag"],
+    ["Reset to default", [], "double-click"],
+  ]],
+];
 const dim = ref(0);
 const report = ref("trace 3+ points along something straight");
 
@@ -596,6 +621,7 @@ onMounted(() => {
   if (wrap.value) ro.observe(wrap.value);
   // Hold Shift for tenth-speed dragging on every slider in the panel.
   detachFine = attachFineRange(wrap.value?.parentElement ?? document.body);
+  if (props.modal && wrap.value && rightFloat.value) rightFloat.value.appendChild(nkdHelp(props.modal, wrap.value, SHORTCUTS));
 });
 onBeforeUnmount(() => {
   ro?.disconnect();
@@ -607,40 +633,71 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="nkd-ld-wrap" ref="wrap">
+  <div class="nkd-ld-wrap nkd-ui" ref="wrap">
     <canvas ref="glCanvas" class="nkd-ld-layer" />
     <canvas ref="uiCanvas" class="nkd-ld-layer nkd-ld-ui"
             @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp"
             @pointerleave="onUp" @wheel="onWheel" @dblclick="finishLine"
             @contextmenu.prevent />
+    <!-- Left: what you do with the traces, then the solve. -->
+    <div class="nkd-ui-float col nkd-ld-l">
+      <button title="Start a new trace" @click="newLine"><i class="pi pi-plus" /></button>
+      <button title="End this trace (or double-click)" @click="finishLine"><i class="pi pi-check" /></button>
+      <button title="Remove the last point" @click="undo"><i class="pi pi-undo" /></button>
+      <button title="Clear every trace" @click="clearAll"><i class="pi pi-trash" /></button>
+      <span class="nkd-ui-sep" />
+      <button title="Solve: find the k that straightens the traces" @click="solve"><i class="pi pi-bullseye" /></button>
+      <button class="txt nkd-ld-k2" :class="{ on: fitK2 }" @click="fitK2 = !fitK2"
+              title="Also fit k2. Needs traces at several distances from the centre, otherwise it overfits.">k2</button>
+    </div>
+    <!-- Right: what you see. The shortcuts button is appended here on mount. -->
+    <div class="nkd-ui-float col nkd-ld-r" ref="rightFloat">
+      <button :class="{ on: showPreview }" @click="showPreview = !showPreview; redraw()"
+              title="Lens preview — off shows the untouched photo"><i class="pi pi-eye" /></button>
+      <button :class="{ on: showFrame }" @click="showFrame = !showFrame; redraw()"
+              title="Outline the output frame and flag the corners the warp leaves empty"><i class="pi pi-stop" /></button>
+      <button :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()" title="Grid"><i class="pi pi-th-large" /></button>
+      <button @click="resetView" title="Reset view"><i class="pi pi-home" /></button>
+      <span class="nkd-ui-sep" />
+    </div>
+    <label class="nkd-ui-float nkd-ld-br" title="Darken the photo beneath the traces">Dim
+      <input type="range" class="nkd-ui-range" min="0" max="0.8" step="0.05" data-default="0"
+             :style="{ '--nkd-pct': (dim / 0.8) * 100 + '%' }" v-model.number="dim" @input="redraw" />
+    </label>
   </div>
 
-  <div class="nkd-ld-panel" v-show="showPanel">
-    <div class="nkd-ld-row">
-      <span class="nkd-ld-lbl">Mode</span>
-      <select class="nkd-modal-sel nkd-ld-grow" :value="P.mode"
-              @change="setParam('mode', ($event.target as HTMLSelectElement).value)">
-        <option value="distort">distort</option>
-        <option value="undistort">undistort</option>
-      </select>
-    </div>
-    <div class="nkd-ld-row" v-for="f in SLIDERS" :key="f.k" :title="tipFor(f.k)">
-      <span class="nkd-ld-lbl">{{ labelFor(f) }}</span>
-      <input type="range" class="nkd-modal-rng nkd-ld-grow"
-             :min="f.min" :max="f.max" :step="f.step" :value="(P as any)[f.k]"
-             :data-default="f.def"
-             @input="setParam(f.k, parseFloat(($event.target as HTMLInputElement).value))" />
-      <span class="nkd-ld-val">{{ Number((P as any)[f.k]).toFixed(f.dp) }}</span>
-    </div>
-    <div class="nkd-ld-row">
-      <span class="nkd-ld-lbl">Edges</span>
-      <select class="nkd-modal-sel nkd-ld-grow" :value="P.edge_mode"
-              @change="setParam('edge_mode', ($event.target as HTMLSelectElement).value)">
-        <option v-for="e in EDGES" :key="e" :value="e">{{ e }}</option>
-      </select>
-    </div>
-    <div class="nkd-ld-row nkd-ld-end">
-      <button class="nkd-modal-btn" @click="resetLens">↺ Reset lens</button>
+  <div class="nkd-ui nkd-ui-side nkd-ld-side">
+    <div class="nkd-ui-card" v-for="(g, gi) in GROUPS" :key="g.title">
+      <div class="nkd-ui-cardhead"><i class="pi" :class="g.icon" />{{ g.title }}
+        <template v-if="gi === 0"><span class="grow" />
+          <button class="nkd-ui-btn round" @click="resetLens" title="Every lens setting back to its default">Reset</button>
+        </template>
+      </div>
+      <div class="nkd-ui-cardbody">
+        <div class="nkd-ui-row wide" v-if="gi === 0">
+          <span>Mode</span>
+          <select class="nkd-ui-sel" :value="P.mode"
+                  @change="setParam('mode', ($event.target as HTMLSelectElement).value)">
+            <option value="distort">distort</option>
+            <option value="undistort">undistort</option>
+          </select>
+        </div>
+        <label class="nkd-ui-row" v-for="f in g.rows" :key="f.k" :title="tipFor(f.k)">
+          <span>{{ labelFor(f) }}</span>
+          <input type="range" class="nkd-ui-range" :style="pct(f)"
+                 :min="f.min" :max="f.max" :step="f.step" :value="(P as any)[f.k]"
+                 :data-default="f.def"
+                 @input="setParam(f.k, parseFloat(($event.target as HTMLInputElement).value))" />
+          <span>{{ Number((P as any)[f.k]).toFixed(f.dp) }}</span>
+        </label>
+        <div class="nkd-ui-row wide" v-if="gi === 1">
+          <span>Edges</span>
+          <select class="nkd-ui-sel" :value="P.edge_mode"
+                  @change="setParam('edge_mode', ($event.target as HTMLSelectElement).value)">
+            <option v-for="e in EDGES" :key="e" :value="e">{{ e }}</option>
+          </select>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -649,47 +706,20 @@ onBeforeUnmount(() => {
       {{ report }}
     </span>
   </Teleport>
-
-  <Teleport v-if="footerRight" :to="footerRight">
-    <button class="nkd-modal-btn" @click="undo" title="Remove the last point">↶ Undo</button>
-    <button class="nkd-modal-btn" @click="finishLine" title="End this trace (or double-click)">Finish trace</button>
-    <button class="nkd-modal-btn" @click="newLine">+ New</button>
-    <button class="nkd-modal-btn" @click="clearAll">Clear</button>
-    <button class="nkd-modal-btn" :class="{ on: showFrame }" @click="showFrame = !showFrame; redraw()"
-            title="Outline the output frame and flag the corners the warp leaves empty">Frame</button>
-    <button class="nkd-modal-btn" :class="{ on: showGrid }" @click="showGrid = !showGrid; redraw()">Grid</button>
-    <button class="nkd-modal-btn" :class="{ on: showPreview }" @click="showPreview = !showPreview; redraw()"
-            title="Toggle the lens preview — off shows the untouched photo">Preview</button>
-    <label class="nkd-modal-lbl" title="Darken the photo beneath the traces">Dim
-      <input type="range" class="nkd-modal-rng" min="0" max="0.8" step="0.05" data-default="0"
-             v-model.number="dim" @input="redraw" />
-    </label>
-    <button class="nkd-modal-btn" @click="resetView">Reset view</button>
-    <button class="nkd-modal-btn" :class="{ on: showPanel }" @click="showPanel = !showPanel">Params</button>
-    <button class="nkd-modal-btn" :class="{ on: fitK2 }" @click="fitK2 = !fitK2"
-            title="Also fit k2. Needs traces at several distances from the centre, otherwise it overfits.">+k2</button>
-    <button class="nkd-modal-btn" @click="solve" title="Find the k that straightens the traces">⌖ Solve</button>
-  </Teleport>
 </template>
 
 <style scoped>
-/* Chrome styling lives in the shared stylesheet (.nkd-modal-*). */
-.nkd-ld-wrap { position: relative; flex: 1 1 auto; min-height: 0; }
+/* Chrome and controls come from the shared stylesheet (.nkd-modal-*, .nkd-ui-*). */
+.nkd-ld-wrap { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; }
 .nkd-ld-layer { position: absolute; inset: 0; display: block; }
 .nkd-ld-ui { cursor: crosshair; touch-action: none; }
-
-.nkd-ld-panel {
-  flex: 0 0 250px; overflow-y: auto;
-  background: #1a1c22; border-left: 1px solid rgba(255,255,255,0.07);
-  padding: 8px 10px; display: flex; flex-direction: column; gap: 5px;
-}
-.nkd-ld-row { display: flex; align-items: center; gap: 8px; }
-.nkd-ld-end { justify-content: flex-end; margin-top: 4px; }
-/* 96px, not 82: the zoom label carries a direction arrow and must not wrap. */
-.nkd-ld-lbl { color: rgba(255,255,255,0.55); flex: 0 0 96px; font-size: 11px; }
-.nkd-ld-grow { flex: 1 1 auto; width: auto; min-width: 0; }
-.nkd-ld-val {
-  flex: 0 0 46px; text-align: right; color: #4ab4ff;
-  font-variant-numeric: tabular-nums; font-size: 11px;
-}
+.nkd-ld-l { left: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-ld-r { right: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-ld-br { right: 14px; bottom: 14px; padding: 5px 12px; gap: 8px; }
+.nkd-ld-br input { width: 110px; }
+.nkd-ld-k2 { padding: 0 !important; }
+/* Wider label and value columns than the kit's: "p1 tangential" and four-decimal values. */
+.nkd-ld-side { flex: 0 0 320px; --nkd-lab: 84px; }
+.nkd-ld-side .nkd-ui-row { grid-template-columns: var(--nkd-lab) minmax(0, 1fr) 44px; }
+.nkd-ld-side .nkd-ui-row.wide { grid-template-columns: var(--nkd-lab) minmax(0, 1fr); }
 </style>

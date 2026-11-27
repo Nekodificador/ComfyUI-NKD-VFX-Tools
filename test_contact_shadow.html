@@ -15,6 +15,7 @@
 <pre id="out">running…</pre>
 <script type="module">
 import * as THREE from './node_modules/three/build/three.module.js'
+import { contactRange, CONTACT_FRAG, CONTACT_FRAG_FIND, CONTACT_FRAG_UNIFORMS } from './web/js/nkd_contact_shadow.js'
 
 const RES = 512, DARK = 0.8
 const L = [], out = document.getElementById('out')
@@ -46,7 +47,7 @@ function sword() {
 }
 
 function capture({ depthTest = true, farFromBase = true, lift = 0, slab: slabWanted = 0.05,
-                   build = figure } = {}) {
+                   build = figure, backFaces = true } = {}) {
   const r = new THREE.WebGLRenderer({ canvas: document.createElement('canvas'), alpha: true })
   r.setSize(8, 8)
   const scene = new THREE.Scene()
@@ -56,12 +57,11 @@ function capture({ depthTest = true, farFromBase = true, lift = 0, slab: slabWan
   const mat = new THREE.MeshDepthMaterial()
   mat.depthTest = depthTest
   mat.depthWrite = depthTest
-  const darkness = { value: DARK }
+  mat.side = THREE.DoubleSide
+  const darkness = { value: DARK }, slabN = { value: 1 }, sunk = { value: 0 }
   mat.onBeforeCompile = (sh) => {
-    sh.uniforms.darkness = darkness
-    sh.fragmentShader = 'uniform float darkness;\n' + sh.fragmentShader.replace(
-      'gl_FragColor = vec4( vec3( 1.0 - fragCoordZ ), opacity );',
-      'gl_FragColor = vec4( vec3( 0.0 ), ( 1.0 - fragCoordZ ) * darkness );')
+    Object.assign(sh.uniforms, { darkness, slabN, sunk })
+    sh.fragmentShader = CONTACT_FRAG_UNIFORMS + sh.fragmentShader.replace(CONTACT_FRAG_FIND, CONTACT_FRAG)
   }
 
   // ── updateContactBounds(), as in the widget ──────────────────────────────
@@ -69,8 +69,12 @@ function capture({ depthTest = true, farFromBase = true, lift = 0, slab: slabWan
   const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3())
   const foot = Math.max(size.x, size.z) * 1.15 + 0.02
   const slab = Math.min(Math.max(slabWanted, 1e-3), size.y || 1)
+  const range = contactRange(box.min.y, box.max.y, slabWanted)
+  // farFromBase:false rebuilds the old "slab from the floor" rig, for the control in block 3.
+  slabN.value = farFromBase ? range.slabN : 1
+  sunk.value = backFaces && range.sunk ? 1 : 0
   const cam = new THREE.OrthographicCamera(-foot / 2, foot / 2, foot / 2, -foot / 2, 0,
-    farFromBase ? Math.max(box.min.y, 0) + slab : slab)
+    farFromBase ? range.far : slab)
   cam.rotation.x = Math.PI / 2                        // look up from the floor
   const group = new THREE.Group()
   group.position.set(c.x, 0, c.z)                     // y stays on the fSpy floor
@@ -93,10 +97,10 @@ function capture({ depthTest = true, farFromBase = true, lift = 0, slab: slabWan
   for (let i = 3; i < all.length; i += 4) if (all[i] > 0) covered++
 
   const res = {
-    boots: at(0), capeOnly: at(140), covered,
-    expBoots: Math.round((1 - box.min.y / cam.far) * DARK * 255),
-    expCape: Math.round((1 - (0.4 + lift) / cam.far) * DARK * 255),
-    far: cam.far, foot,
+    boots: at(0), capeOnly: at(140), edge: at(250), covered,
+    expBoots: Math.round((1 - Math.max(box.min.y, 0) / (cam.far * slabN.value)) * DARK * 255),
+    expCape: Math.round((1 - (0.4 + lift) / (cam.far * slabN.value)) * DARK * 255),
+    far: cam.far * slabN.value, foot, full: Math.round(DARK * 255),
   }
   r.setRenderTarget(null); r.dispose()
   return res
@@ -138,6 +142,25 @@ log(`leaning blade · slab 0.050  footprint = ${pct(thin.covered)} of the map`)
 check(thin.covered * 3 < thick.covered,
   'a 10x thinner slab shrinks the blade footprint to the tip that actually touches')
 check(thin.covered > 0, 'the tip still casts something')
+
+// ── 5. an object that goes THROUGH the floor casts from its intersection ─────
+// A solid block sunk 0.3 into the floor. The camera starts inside it, so the only surfaces
+// within the slab are its side walls: without the back-face rule the middle is empty.
+log()
+const block = () => mesh(0.6, 1.0, 0.6, 0.2)          // y -0.3 … 0.7
+const hollow = capture({ build: block, backFaces: false })
+const filled = capture({ build: block })
+log(`sunk block · back faces ignored  centre texel = ${hollow.boots}   (the hollow ring)`)
+log(`sunk block · shipped             centre texel = ${filled.boots}   expected ${filled.full}`)
+check(hollow.boots === 0, 'CONTROL: ignoring back faces leaves the cut empty — the reported bug')
+check(Math.abs(filled.boots - filled.full) <= 1, 'the cut casts at full strength across the whole intersection')
+check(filled.edge === 0, 'and nothing is cast outside the object')
+// A blade whose tip dips 1 cm under the floor is seen from OUTSIDE almost everywhere: its far
+// side must not count as an intersection (that would stamp the whole silhouette).
+check(thin.covered * 3 < thick.covered, 'a tip barely under the floor does not turn the blade into a full silhouette')
+// Standing on the floor nothing may change: back faces are discarded there.
+const standing = capture({ slab: 0.5 })
+check(standing.boots === on.boots && standing.capeOnly === on.capeOnly, 'an object standing on the floor is untouched')
 
 log()
 log(failed ? `${failed} CHECK(S) FAILED` : 'all checks passed')

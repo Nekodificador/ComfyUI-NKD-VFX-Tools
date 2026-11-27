@@ -19,6 +19,7 @@ import { smoothNormalsByPosition } from './smooth_normals'
 import { objectBase, objPosition, pivotFromGroup, type Quat, type V3 } from './pivot'
 import { orthoFrustum, unscaledRect, unzoomedClient } from './view_gizmo'
 import { solvePins } from './pin_solver'
+import { contactRange, CONTACT_FRAG, CONTACT_FRAG_FIND, CONTACT_FRAG_UNIFORMS } from './contact_shadow'
 import { decodeMaskBits, encodeMaskBits, type MaskBlob } from './mask_codec'
 import { clampHalf, dragFace, unitFaces } from './crop_volume'
 import { clipPlanesFor, FLOOR_HALF_SPACE, sliceDistances, sliceIsWhole } from './clip_planes'
@@ -1030,16 +1031,17 @@ function initContactShadow() {
   // their contact and stamps its own faint silhouette instead (test_contact_shadow.html).
   contactDepthMat.depthTest = true
   contactDepthMat.depthWrite = true
+  // Both sides, because an object that goes THROUGH the floor is seen from inside by this
+  // camera: a back face first means the floor point is inside the object, i.e. the
+  // intersection, which is exactly what has to cast (src/contact_shadow.ts). Standing on the
+  // floor, back faces are discarded and nothing changes.
+  contactDepthMat.side = THREE.DoubleSide
   const darkness = { value: contactStr.value }
-  ;(contactDepthMat as any).userData.darkness = darkness
+  const slabN = { value: 1 }, sunk = { value: 0 }
+  Object.assign((contactDepthMat as any).userData, { darkness, slabN, sunk })
   contactDepthMat.onBeforeCompile = (shader) => {
-    shader.uniforms.darkness = darkness
-    shader.fragmentShader =
-      'uniform float darkness;\n' +
-      shader.fragmentShader.replace(
-        'gl_FragColor = vec4( vec3( 1.0 - fragCoordZ ), opacity );',
-        'gl_FragColor = vec4( vec3( 0.0 ), ( 1.0 - fragCoordZ ) * darkness );'
-      )
+    Object.assign(shader.uniforms, { darkness, slabN, sunk })
+    shader.fragmentShader = CONTACT_FRAG_UNIFORMS + shader.fragmentShader.replace(CONTACT_FRAG_FIND, CONTACT_FRAG)
   }
 
   const blurUniforms = () => ({ tDiffuse: { value: null }, amount: { value: 1 / CONTACT_RES } })
@@ -1064,11 +1066,13 @@ function updateContactBounds() {
   // more than the slab). Anchoring it to the base keeps the contact and lets it fade with
   // height, which is what leaving the ground should look like.
   // Capped at the model's own height: a slab taller than the object is just its full silhouette.
-  const slab = Math.min(Math.max(contactSlab.value, 1e-3), size.y || 1)
+  const range = contactRange(box.min.y, box.max.y, contactSlab.value)
+  const u = (contactDepthMat as any)?.userData
+  if (u) { u.slabN.value = range.slabN; u.sunk.value = range.sunk ? 1 : 0 }
   contactGroup.position.set(c.x, 0, c.z)
   contactCam.left = -foot / 2; contactCam.right = foot / 2
   contactCam.top = foot / 2; contactCam.bottom = -foot / 2
-  contactCam.far = Math.max(box.min.y, 0) + slab
+  contactCam.far = range.far
   contactCam.updateProjectionMatrix()
   contactPlane.scale.set(foot, 1, foot)
   contactBlurPlane.scale.set(foot, 1, foot)

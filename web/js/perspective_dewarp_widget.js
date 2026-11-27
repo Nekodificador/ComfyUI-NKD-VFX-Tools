@@ -1,6 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { openNkdModal, nkdButton, nkdSlider } from "./nkd_modal.js";
+import { openNkdModal, nkdSlider, nkdFloat, nkdIcon, nkdSep, nkdHelp } from "./nkd_modal.js";
 
 const NODE = "NKDPerspectiveUnwarp";
 const EXT = "NKD.PerspectiveDewarp";
@@ -214,26 +214,48 @@ function openModal(node, cornersWidget) {
   // so the modal's own dismiss (Esc / backdrop / ✕) is wired to commit() too.
   const modal = openNkdModal({
     title: "😺 Perspective Unwarp",
-    hint: "corners distort · sides stretch · scroll zoom · drag empty to pan",
+    hint: "corners distort · sides stretch · ? for the shortcuts",
     onClose: () => commit(),
   });
 
+  // Floating groups around the plate (shared kit). Right: the grid density and the view.
+  // Left: the one that throws work away. Bottom right: Darken.
   const gridLbl = document.createElement("span");
-  gridLbl.style.cssText = "color:#8a92a4;min-width:56px;text-align:center";
-  const refreshGridLbl = () => { gridLbl.textContent = gridN > 0 ? `Grid ${gridN}` : "Grid off"; };
+  gridLbl.style.cssText = "height:22px;display:flex;align-items:center;font-weight:600;color:#dcdce0;font-variant-numeric:tabular-nums";
+  const refreshGridLbl = () => { gridLbl.textContent = gridN > 0 ? String(gridN) : "off"; gridLbl.title = "Grid divisions"; };
   refreshGridLbl();
-  const gridMinus = nkdButton("−", () => { gridN = Math.max(0, gridN - 1); refreshGridLbl(); draw(); });
-  const gridPlus = nkdButton("+", () => { gridN = Math.min(16, gridN + 1); refreshGridLbl(); draw(); });
-  const resetView_ = nkdButton("Reset view", () => { resetView(); draw(); });
-  const resetPts = nkdButton("↺ Reset points", () => {
-    state.corners = JSON.parse(JSON.stringify(DEFAULT.corners));
-    draw();
-  });
+  const stage = modal.body;
+  nkdFloat(stage, "left:14px;top:50%;transform:translateY(-50%)", true,
+    nkdIcon("replay", "Reset points: the four corners back to the plate's own", () => {
+      state.corners = JSON.parse(JSON.stringify(DEFAULT.corners));
+      draw();
+    }));
+  nkdFloat(stage, "right:14px;top:50%;transform:translateY(-50%)", true,
+    nkdIcon("plus", "More grid lines", () => { gridN = Math.min(16, gridN + 1); refreshGridLbl(); draw(); }),
+    gridLbl,
+    nkdIcon("minus", "Fewer grid lines (down to off)", () => { gridN = Math.max(0, gridN - 1); refreshGridLbl(); draw(); }),
+    nkdSep(),
+    nkdIcon("home", "Reset view", () => { resetView(); draw(); }),
+    nkdHelp(modal, stage, [
+      ["Plate", [
+        ["Distort", [], "drag a corner"],
+        ["Stretch", [], "drag a side"],
+        ["Slow, precise placement", ["Shift"], "while dragging"],
+      ]],
+      ["View", [
+        ["Zoom", [], "wheel"],
+        ["Pan", [], "drag empty space"],
+      ]],
+    ]));
   // Darken slider (like fSpy Camera): dims the photo so the quad and grid read clearly.
   const dimWrap = nkdSlider("Darken", { min: 0, max: 0.8, step: 0.05, value: dim },
                             (v) => { dim = v; draw(); },
                             "Darken the image beneath the overlay");
-  modal.footerRight.append(gridMinus, gridLbl, gridPlus, dimWrap, resetPts, resetView_);
+  dimWrap.className = "";
+  dimWrap.style.cssText = "display:flex;align-items:center;gap:8px";
+  const dimRng = dimWrap.querySelector("input[type=range]");
+  if (dimRng) { dimRng.className = "nkd-ui-range"; dimRng.style.width = "110px"; }
+  nkdFloat(stage, "right:14px;bottom:14px;padding:5px 12px", false, dimWrap);
   modal.addPrimary("Save & close");
 
   const wrap = modal.body;
@@ -380,8 +402,15 @@ function openModal(node, cornersWidget) {
     return [e.clientX - b.left, e.clientY - b.top];
   };
 
+  // Shift = fine: the POINTER is damped, never the corner. A virtual pointer follows the real one
+  // at a tenth of its speed while Shift is held, and the corner or side is placed from that —
+  // incremental, so pressing or releasing Shift mid-drag changes the speed without a jump.
+  let real = [0, 0], virt = [0, 0];
+  const FINE = 0.1;
+
   canvas.onpointerdown = (e) => {
     const [mx, my] = evScreen(e);
+    real = [mx, my]; virt = [mx, my];
     // Corners take priority over edges.
     for (let i = 0; i < 4; i++) {
       const [x, y] = toScreen(state.corners[i]);
@@ -403,7 +432,11 @@ function openModal(node, cornersWidget) {
 
   canvas.onpointermove = (e) => {
     if (!drag) return;
-    const [mx, my] = evScreen(e);
+    const [rx, ry] = evScreen(e);
+    const gain = e.shiftKey && drag.kind !== "pan" ? FINE : 1;
+    virt = [virt[0] + (rx - real[0]) * gain, virt[1] + (ry - real[1]) * gain];
+    real = [rx, ry];
+    const [mx, my] = virt;
     if (drag.kind === "corner") {
       state.corners[drag.i] = toRel(mx, my);   // unclamped: corners may sit off-image
     } else if (drag.kind === "edge") {
@@ -499,7 +532,8 @@ app.registerExtension({
       const idx = this.inputs?.findIndex((i) => i.name === "corners");
       if (idx !== undefined && idx >= 0) this.removeInput(idx);
       const node = this;
-      this.addWidget("button", "📐 Edit corners", null, () => {
+      // A native button, not the pill: the pill belongs over a preview, and this node has none.
+      this.addWidget("button", "Open Editor", null, () => {
         void (async () => {
           if (!sourceUrl(node)) await fetchStoredFrame(String(node.id));
           if (!sourceUrl(node)) {
