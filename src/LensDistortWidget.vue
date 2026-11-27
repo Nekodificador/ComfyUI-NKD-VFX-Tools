@@ -663,6 +663,7 @@ onBeforeUnmount(() => {
     <label class="nkd-ui-float nkd-ld-br" title="Darken the photo beneath the traces">Dim
       <input type="range" class="nkd-ui-range" min="0" max="0.8" step="0.05" data-default="0"
              :style="{ '--nkd-pct': (dim / 0.8) * 100 + '%' }" v-model.number="dim" @input="redraw" />
+      <span class="nkd-ld-num">{{ Math.round(dim * 100) }}%</span>
     </label>
   </div>
 
@@ -717,6 +718,7 @@ onBeforeUnmount(() => {
 .nkd-ld-r { right: 14px; top: 50%; transform: translateY(-50%); }
 .nkd-ld-br { right: 14px; bottom: 14px; padding: 5px 12px; gap: 8px; }
 .nkd-ld-br input { width: 110px; }
+.nkd-ld-num { min-width: 30px; text-align: right; color: #dcdce0; font-variant-numeric: tabular-nums; }
 .nkd-ld-k2 { padding: 0 !important; }
 /* Wider label and value columns than the kit's: "p1 tangential" and four-decimal values. */
 .nkd-ld-side { flex: 0 0 320px; --nkd-lab: 84px; }

@@ -248,13 +248,10 @@ function openModal(node, cornersWidget) {
       ]],
     ]));
   // Darken slider (like fSpy Camera): dims the photo so the quad and grid read clearly.
-  const dimWrap = nkdSlider("Darken", { min: 0, max: 0.8, step: 0.05, value: dim },
+  const dimWrap = nkdSlider("Darken", { min: 0, max: 0.8, step: 0.05, value: dim, def: 0.35, kit: "bar", width: 110,
+                                        format: (v) => `${Math.round(v * 100)}%` },
                             (v) => { dim = v; draw(); },
                             "Darken the image beneath the overlay");
-  dimWrap.className = "";
-  dimWrap.style.cssText = "display:flex;align-items:center;gap:8px";
-  const dimRng = dimWrap.querySelector("input[type=range]");
-  if (dimRng) { dimRng.className = "nkd-ui-range"; dimRng.style.width = "110px"; }
   nkdFloat(stage, "right:14px;bottom:14px;padding:5px 12px", false, dimWrap);
   modal.addPrimary("Save & close");
 

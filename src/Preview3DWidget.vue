@@ -4930,6 +4930,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <template v-if="maskPaint">
             <label class="nkd-ghostfield" :title="`Brush radius: ${brushRadius}px`">Brush
               <input class="nkd-brush" type="range" min="4" max="200" step="1" v-model.number="brushRadius" />
+              <span class="nkd-num">{{ brushRadius }} px</span>
             </label>
             <button :disabled="!maskHasPaint" @click="clearMask" title="Clear the 3D mask"><i class="pi pi-times" /></button>
           </template>
@@ -4960,9 +4961,11 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
               </button>
               <label class="nkd-ghostfield" title="How much of the object shows through.">Opacity
                 <input type="range" min="0" max="1" step="0.05" data-default="0.35" v-model.number="ghostOpacity" @change="notifyStateChanged()">
+                <span class="nkd-num">{{ ghostOpacity.toFixed(2) }}</span>
               </label>
               <label class="nkd-ghostfield" title="Which contours get a line. Low keeps the outline and the strong edges; high adds the subtle turns of the surface. Splats only have outlines and depth steps: they carry no surface to show a crease.">Detail
                 <input type="range" min="0" max="1" step="0.05" data-default="0.5" v-model.number="ghostDetail" @change="notifyStateChanged()">
+                <span class="nkd-num">{{ ghostDetail.toFixed(2) }}</span>
               </label>
             </template>
           </template>
@@ -5140,6 +5143,8 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-view.nkd-painting { cursor: crosshair; }
 .nkd-ghostfield { display: flex; align-items: center; gap: 3px; font-size: 10px; color: #8a93a6; }
 .nkd-ghostfield input { width: 56px; height: 14px; margin: 0; accent-color: #ffd900; }
+/* Every slider says its number: a track with no value is a guess. */
+.nkd-ghostfield .nkd-num { min-width: 30px; text-align: right; color: #dcdce0; font-variant-numeric: tabular-nums; }
 
 /* ── The look: floating parts are round, borderless and 86% opaque, sitting around the frame.
    Shape language after nomadoor's Panorama Studio (MIT); colours are this pack's own. ── */

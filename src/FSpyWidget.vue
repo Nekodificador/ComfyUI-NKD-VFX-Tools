@@ -480,6 +480,7 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
     <label class="nkd-ui-float nkd-fspy-br" title="Darken the image beneath the overlay">Darken
       <input type="range" class="nkd-ui-range" min="0" max="0.8" step="0.05"
              :style="{ '--nkd-pct': (dim / 0.8) * 100 + '%' }" v-model.number="dim" @input="redraw" />
+      <span class="nkd-fspy-num">{{ Math.round(dim * 100) }}%</span>
     </label>
   </div>
 
@@ -547,5 +548,6 @@ onBeforeUnmount(() => { ro?.disconnect(); detachFine?.(); });
 .nkd-fspy-r { right: 14px; top: 50%; transform: translateY(-50%); }
 .nkd-fspy-br { right: 14px; bottom: 14px; padding: 5px 12px; gap: 8px; }
 .nkd-fspy-br input { width: 110px; }
+.nkd-fspy-num { min-width: 30px; text-align: right; color: #dcdce0; font-variant-numeric: tabular-nums; }
 .nkd-fspy-side { flex: 0 0 320px; }
 </style>
