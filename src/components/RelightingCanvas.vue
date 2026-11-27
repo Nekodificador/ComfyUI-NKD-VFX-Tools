@@ -1,20 +1,5 @@
 <template>
-  <div class="rl-root" :class="{ 'rl-popped': popped }" ref="rootEl">
-    <!-- Tool row: compare against the untouched plate, open the large editor -->
-    <div class="rl-tools">
-      <button class="rl-tool" :class="{ on: comparing }" :disabled="!hasPasses"
-              title="Hold to see the original image without the relight"
-              @pointerdown.prevent="setCompare(true, $event)" @pointerup="setCompare(false)"
-              @pointercancel="setCompare(false)" @lostpointercapture="setCompare(false)">
-        <i class="pi pi-eye" /> Original
-      </button>
-      <span class="rl-tools-gap" />
-      <button v-if="!popped && props.onPopout" class="rl-tool" title="Open in a large editor — same node, nothing reloads"
-              @click="props.onPopout()">
-        <i class="pi pi-window-maximize" />
-      </button>
-    </div>
-
+  <div class="rl-root nkd-ui" :class="{ 'rl-popped': popped }" ref="rootEl">
     <!-- Preview canvas area (letterboxed in the stage when popped out) -->
     <div class="rl-stage" ref="stageEl">
     <div class="rl-canvas-wrap" :class="{ comparing }" ref="canvasWrap" :style="wrapStyle"
@@ -43,17 +28,64 @@
         </div>
       </Transition>
     </div>
+      <!-- Siblings of the canvas wrap, never children: it owns the light-drag mouse handlers. -->
+      <template v-if="popped">
+        <!-- Left: make lights, and hold to compare against the untouched plate. -->
+        <div class="nkd-ui-float col rl-at-l">
+          <button :disabled="lights.length >= MAX_LIGHTS" @click="addLight('point')" title="Add a point light">
+            <i class="pi pi-lightbulb" />
+          </button>
+          <button :disabled="lights.length >= MAX_LIGHTS" @click="addLight('directional')" title="Add a directional light">
+            <i class="pi pi-sun" />
+          </button>
+          <span class="nkd-ui-sep" />
+          <button :class="{ on: comparing }" :disabled="!hasPasses"
+                  title="Hold to see the original image without the relight"
+                  @pointerdown.prevent="setCompare(true, $event)" @pointerup="setCompare(false)"
+                  @pointercancel="setCompare(false)" @lostpointercapture="setCompare(false)">
+            <i class="pi pi-eye" />
+          </button>
+        </div>
+        <!-- Right: the two that throw work away, and the shortcuts. -->
+        <div class="nkd-ui-float col rl-at-r">
+          <button :disabled="lights.length === 0" @click="clearLights" title="Remove every light">
+            <i class="pi pi-trash" />
+          </button>
+          <button @click="resetAll" title="Remove the lights and put every setting back to its default">
+            <i class="pi pi-replay" />
+          </button>
+          <span class="nkd-ui-sep" />
+          <button :class="{ on: helpOpen }" @click="helpOpen = !helpOpen" title="Shortcuts — ?">
+            <i class="pi pi-question" />
+          </button>
+        </div>
+        <div v-if="helpOpen" class="nkd-ui-help rl-help" @mousedown.stop>
+          <div class="nkd-ui-help-head"><b>Shortcuts</b><span><kbd>?</kbd> or <kbd>Esc</kbd> to close</span></div>
+          <div class="nkd-ui-help-cols">
+            <section v-for="[title, rows] in SHORTCUTS" :key="title">
+              <h4>{{ title }}</h4>
+              <div v-for="[what, keys, note] in rows" :key="what" class="nkd-ui-help-row">
+                <span>{{ what }}</span>
+                <span><template v-for="(k, i) in keys" :key="k"><i v-if="i">+</i><kbd>{{ k }}</kbd></template>{{ note }}</span>
+              </div>
+            </section>
+          </div>
+        </div>
+      </template>
+      <button v-else-if="props.onPopout" class="nkd-ui-pill" @mousedown.stop @click.stop="props.onPopout()"
+              title="Open the editor: every control lives there. Same node, nothing reloads.">
+        <i class="pi pi-window-maximize" /><span>Open Editor</span>
+      </button>
+    </div>
+    <!-- On the node: one status line. Every control lives in the editor, so the node's height
+         is the picture plus this line and never moves. -->
+    <div v-if="!popped" class="nkd-ui-line">
+      <span><i class="pi pi-lightbulb" />{{ nodeLine }}</span>
+      <b>{{ passSize }}</b>
     </div>
 
-    <!-- Controls -->
-    <div class="rl-controls">
-      <!-- Light add buttons -->
-      <div class="rl-btnbar">
-        <button class="rl-btn" :disabled="lights.length >= MAX_LIGHTS" @click="addLight('point')">+ Point</button>
-        <button class="rl-btn" :disabled="lights.length >= MAX_LIGHTS" @click="addLight('directional')">+ Dir</button>
-        <button class="rl-btn rl-btn-ghost" :disabled="lights.length === 0" @click="clearLights">Clear</button>
-        <button class="rl-btn rl-btn-ghost" title="Remove the lights and put every setting back to its default" @click="resetAll">Reset</button>
-      </div>
+    <!-- Controls: the editor's sidebar, one card per light and per section, all open. -->
+    <div v-if="popped" class="rl-controls">
 
       <!-- Per-light collapsible rows -->
       <div
@@ -63,11 +95,10 @@
         :class="{ selected: light.id === selectedId }"
       >
         <div class="rl-sec-head" @click="selectLight(light.id)">
-          <span class="rl-chev" :class="{ open: popped || light.id === selectedId }">▸</span>
           <i class="pi rl-light-icon" :class="light.type === 'point' ? 'pi-lightbulb' : 'pi-sun'" />
           <span class="rl-sec-title">{{ light.type === 'point' ? 'Point' : 'Dir' }} {{ (idx as number) + 1 }}</span>
           <input class="rl-swatch" type="color" v-model="light.color" @input="emit" @click.stop />
-          <button class="rl-x" @click.stop="removeLight(light.id)">×</button>
+          <button class="rl-x" title="Delete this light" @click.stop="removeLight(light.id)"><i class="pi pi-times" /></button>
         </div>
 
         <div class="rl-sec-body" v-if="popped || light.id === selectedId">
@@ -185,7 +216,7 @@
       <!-- Ambient section -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('ambient')">
-          <span class="rl-chev" :class="{ open: secOpen('ambient') }">▸</span>
+          <i class="pi pi-circle rl-light-icon" />
           <span class="rl-sec-title">Ambient</span>
           <input class="rl-swatch" type="color" v-model="ambientColor" @input="emit" @click.stop />
         </div>
@@ -201,7 +232,7 @@
       <!-- Material section (only when albedo/roughness passes exist) -->
       <div class="rl-section" v-if="hasAlbedo || hasRoughness">
         <div class="rl-sec-head" @click="toggleSection('material')">
-          <span class="rl-chev" :class="{ open: secOpen('material') }">▸</span>
+          <i class="pi pi-box rl-light-icon" />
           <span class="rl-sec-title">Material</span>
         </div>
         <div class="rl-sec-body" v-if="secOpen('material')">
@@ -221,7 +252,7 @@
       <!-- Shadows section -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('shadows')">
-          <span class="rl-chev" :class="{ open: secOpen('shadows') }">▸</span>
+          <i class="pi pi-moon rl-light-icon" />
           <span class="rl-sec-title">Shadows</span>
           <label class="rl-switch" @click.stop>
             <input type="checkbox" v-model="shadowsEnabled" @change="emit" />
@@ -250,7 +281,7 @@
       <!-- Look section: post-process on the lit image (exposure, white balance, saturation, haze) -->
       <div class="rl-section">
         <div class="rl-sec-head" @click="toggleSection('look')">
-          <span class="rl-chev" :class="{ open: secOpen('look') }">▸</span>
+          <i class="pi pi-palette rl-light-icon" />
           <span class="rl-sec-title">Look</span>
         </div>
         <div class="rl-sec-body" v-if="secOpen('look')">
@@ -432,6 +463,29 @@ const stageEl           = ref<HTMLDivElement | null>(null);
 // section is open at once in a sidebar and the canvas is letterboxed into the stage — the
 // export aspect rules, so the preview is never stretched to the modal's shape.
 const popped = ref(false);
+const STAGE_MX = 68, STAGE_MY = 18;
+const helpOpen = ref(false);
+// [section, [what, keys, note][]] — only what the editor really does.
+const SHORTCUTS: [string, [string, string[], string][]][] = [
+  ["Lights", [
+    ["Move a point light", [], "drag its dot"],
+    ["Aim a directional light", [], "drag on the image or its arc"],
+    ["Select a light", [], "click its dot or its card"],
+    ["Delete a point light", ["Shift"], "click its dot"],
+    ["See the original", [], "hold the eye button"],
+  ]],
+  ["Sliders", [
+    ["Fine steps (×0.1)", ["Shift"], "drag"],
+    ["Reset to default", [], "double-click the slider"],
+    ["Type an exact value", [], "click the number"],
+  ]],
+  ["Editor", [
+    ["Shortcuts", ["?"], ""],
+    ["Close", ["Esc"], ""],
+  ]],
+];
+// The size of the passes the preview is drawn from, for the node's status line.
+const passSize = ref("");
 const fit = ref<{ w: number; h: number } | null>(null);
 const wrapStyle = computed(() =>
   popped.value && fit.value
@@ -440,7 +494,8 @@ const wrapStyle = computed(() =>
 function measureFit() {
   const st = stageEl.value;
   if (!popped.value || !st) { fit.value = null; return; }
-  const availW = st.clientWidth - 24, availH = st.clientHeight - 24;
+  // Margins for the floating columns either side: they sit around the picture, never on it.
+  const availW = st.clientWidth - 2 * STAGE_MX, availH = st.clientHeight - 2 * STAGE_MY;
   if (availW <= 0 || availH <= 0) return;
   const a = passAspect.value;
   const w = Math.min(availW, availH * a);
@@ -448,7 +503,24 @@ function measureFit() {
 }
 function setPopped(v: boolean) {
   popped.value = v;
+  if (!v) helpOpen.value = false;
   nextTick(() => { measureFit(); scheduleRedraw(); });
+}
+const nodeLine = computed(() => {
+  const n = lights.value.length;
+  return `${n} light${n === 1 ? "" : "s"} · shadows ${shadowsEnabled.value ? "on" : "off"}`;
+});
+// '?' toggles the shortcuts sheet and Esc closes IT, not the editor: this listener is added at
+// mount, before the modal adds its own Esc handler on the same target, so it runs first.
+function onHelpKey(e: KeyboardEvent) {
+  if (!popped.value || e.repeat) return;
+  const a = document.activeElement as HTMLElement | null;
+  if (a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) && e.key !== "Escape") return;
+  if (e.key === "?" || (e.key === "Escape" && helpOpen.value)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    helpOpen.value = e.key === "?" ? !helpOpen.value : false;
+  }
 }
 // Sections are independent toggles in the node; popped, they are all open.
 const secOpen = (k: "ambient" | "material" | "shadows" | "look") => popped.value || openSections.value[k];
@@ -1937,6 +2009,7 @@ function setPasses(data: PassData) {
   passW = data.width;
   passH = data.height;
   passAspect.value = passW / passH;
+  passSize.value = `${passW} × ${passH}`;
   hasPasses.value = true;
   if (popped.value) nextTick(measureFit);
 
@@ -2094,6 +2167,7 @@ function editReadout(e: MouseEvent) {
 
 onMounted(() => {
   rootEl.value?.addEventListener("click", editReadout);
+  window.addEventListener("keydown", onHelpKey, true);
   if (rootEl.value) detachFine = attachFineRange(rootEl.value);
   if (stageEl.value) { stageRO = new ResizeObserver(measureFit); stageRO.observe(stageEl.value); }
   if (canvasWrap.value) { wrapRO = new ResizeObserver(scheduleRedraw); wrapRO.observe(canvasWrap.value); }
@@ -2102,6 +2176,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   rootEl.value?.removeEventListener("click", editReadout);
+  window.removeEventListener("keydown", onHelpKey, true);
   stageRO?.disconnect();
   wrapRO?.disconnect();
   detachFine?.();
@@ -2127,52 +2202,23 @@ onUnmounted(() => {
   box-sizing: border-box;
 }
 
-/* ── Tool row ──────────────────────────────────────────────────────────────── */
-.rl-tools {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border-color, #374151);
-}
-.rl-tools-gap { flex: 1 1 auto; }
-.rl-tool {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  font-size: 11px;
-  border: 1px solid var(--border-color, #374151);
-  border-radius: 5px;
-  background: var(--comfy-input-bg, #1e293b);
-  color: var(--input-text, #e5e7eb);
-  cursor: pointer;
-  user-select: none;
-  touch-action: none;
-}
-.rl-tool .pi { font-size: 12px; }
-.rl-tool:hover:not(:disabled) { border-color: var(--p-primary-color, #3b82f6); }
-.rl-tool.on { border-color: var(--p-primary-color, #3b82f6); color: var(--p-primary-color, #3b82f6); }
-.rl-tool:disabled { opacity: 0.4; cursor: default; }
-
 /* ── Popped out: canvas left, every panel in a full-height sidebar ─────────── */
 .rl-popped {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
   border-radius: 0;
 }
-.rl-popped .rl-tools { grid-column: 1; grid-row: 1; }
 .rl-popped .rl-stage {
-  grid-column: 1; grid-row: 2;
+  grid-column: 1; grid-row: 1;
   display: flex; align-items: center; justify-content: center;
   min-width: 0; min-height: 0; overflow: hidden;
   background: #0b0d12;
 }
 .rl-popped .rl-canvas-wrap { flex: 0 0 auto; }
 .rl-popped .rl-controls {
-  grid-column: 2; grid-row: 1 / span 2;
+  grid-column: 2; grid-row: 1;
   overflow-y: auto;
   border-left: 1px solid var(--border-color, #374151);
 }
@@ -2239,28 +2285,6 @@ onUnmounted(() => {
   min-width: 0;
 }
 
-/* ── Light add buttons ─────────────────────────────────────────────────────── */
-.rl-btnbar {
-  display: flex;
-  gap: 6px;
-  min-width: 0;
-}
-.rl-btn {
-  flex: 1 1 0;
-  min-width: 0;
-  padding: 5px 6px;
-  font-size: 11px;
-  border: 1px solid var(--border-color, #374151);
-  border-radius: 5px;
-  background: var(--comfy-input-bg, #1e293b);
-  color: var(--input-text, #e5e7eb);
-  cursor: pointer;
-  transition: border-color 0.12s, background 0.12s;
-}
-.rl-btn:hover:not(:disabled) { border-color: var(--p-primary-color, #3b82f6); }
-.rl-btn:disabled { opacity: 0.4; cursor: default; }
-.rl-btn-ghost { background: transparent; }
-
 /* ── Collapsible sections ──────────────────────────────────────────────────── */
 .rl-section {
   flex-shrink: 0;  /* overflow:hidden lets a flex item shrink to nothing in the popped sidebar */
@@ -2282,14 +2306,6 @@ onUnmounted(() => {
   min-width: 0;
 }
 .rl-sec-head:hover { background: rgba(127, 127, 127, 0.08); }
-
-.rl-chev {
-  flex-shrink: 0;
-  font-size: 9px;
-  color: var(--descrip-text, #9ca3af);
-  transition: transform 0.15s;
-}
-.rl-chev.open { transform: rotate(90deg); }
 
 .rl-light-icon { flex-shrink: 0; font-size: 12px; color: var(--descrip-text, #9ca3af); }
 .rl-select {
@@ -2516,4 +2532,54 @@ onUnmounted(() => {
 /* Fade transition */
 .rl-fade-enter-active, .rl-fade-leave-active { transition: opacity 0.18s ease; }
 .rl-fade-enter-from,  .rl-fade-leave-to      { opacity: 0; }
+
+/* ── The editor look: the shared kit's numbers (nkd-ui-*, nkd_modal.ts) on this widget's own
+   class names. Floats, pill, status line and shortcuts sheet use the kit classes directly;
+   the sidebar keeps rl-* so its ~40 rows and the delegated readout editing are untouched. ── */
+.rl-root { background: #111318; }
+.rl-stage { position: relative; }
+.rl-at-l { left: 14px; top: 50%; transform: translateY(-50%); }
+.rl-at-r { right: 14px; top: 50%; transform: translateY(-50%); }
+.rl-help { inset: 14px 66px 14px 14px; }
+.rl-popped .rl-stage { background: #08090b; }
+.rl-popped .rl-canvas-wrap { outline: 1px solid rgba(255, 255, 255, 0.3); }
+.rl-controls { overflow: hidden auto; background: #1a1c22; border-left: 1px solid #2a2d36;
+  padding: 8px; gap: 8px; font: 11px/1.2 system-ui, sans-serif; }
+.rl-popped .rl-controls { border-left: 1px solid #2a2d36; }
+.rl-section { border: 0; border-radius: 12px; background: #202229; overflow: visible; }
+.rl-light.selected { box-shadow: inset 0 0 0 1px rgba(74, 180, 255, 0.55); }
+.rl-sec-head { padding: 9px 12px 0; gap: 7px; min-height: 33px; cursor: default; }
+.rl-light .rl-sec-head { cursor: pointer; }
+.rl-sec-head:hover { background: none; }
+.rl-sec-title { font: 600 13px/1 system-ui, sans-serif; color: #fff; }
+.rl-light-icon { color: #8a93a6; font-size: 12px; }
+.rl-sec-body { border-top: 0; padding: 8px 12px 12px; gap: 4px; }
+.rl-field { gap: 6px; min-height: 20px; }
+.rl-flabel { width: 64px; font-size: 11px; color: #9aa1b2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rl-fval { font-size: 11px; color: #dcdce0; }
+.rl-subhead { margin-top: 8px; padding: 0; min-height: 16px; color: #6f7686; letter-spacing: 0.04em; }
+.rl-subhead:first-child { margin-top: 0; }
+.rl-range { height: 16px; }
+.rl-range::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;
+  background: linear-gradient(to right, #7f8aa3 0 var(--rl-fill, 0%), #3a3d48 var(--rl-fill, 0%) 100%); }
+.rl-range::-webkit-slider-thumb { width: 12px; height: 12px; margin-top: -4px; background: #c8d0e0; border: 0; box-shadow: none; }
+.rl-range:hover::-webkit-slider-thumb { background: #fff; }
+.rl-range::-moz-range-track { height: 4px; background: #3a3d48; }
+.rl-range::-moz-range-progress { height: 4px; background: #7f8aa3; }
+.rl-range::-moz-range-thumb { width: 12px; height: 12px; background: #c8d0e0; border: 0; }
+.rl-range:disabled { opacity: 0.4; }
+.rl-select { height: 24px; border: 1px solid transparent; border-radius: 6px; background: #2c2e36;
+  color: #dcdce0; font-size: 11px; padding: 0 8px; cursor: pointer; }
+.rl-select:hover { background: #3a3d48; }
+.rl-select:focus { outline: none; border-color: #4ab4ff; }
+.rl-check { font-size: 11px; color: #dcdce0; gap: 6px; min-height: 20px; }
+.rl-check input { width: 14px; height: 14px; accent-color: #4ab4ff; cursor: pointer; }
+.rl-swatch { width: 28px; height: 20px; padding: 2px; border: 0; border-radius: 6px; background: #2c2e36; }
+.rl-x { width: 24px; height: 24px; border-radius: 6px; background: #2c2e36; color: #dcdce0; font-size: 10px;
+  display: flex; align-items: center; justify-content: center; }
+.rl-x .pi { font-size: 10px; }
+.rl-switch-track { background: #3a3d48; }
+.rl-switch input:checked + .rl-switch-track { background: #4ab4ff; }
+.rl-switch input:checked + .rl-switch-track .rl-switch-thumb { background: #0c0d10; }
+.rl-root :deep(.rl-fval-edit) { background: #17181d; color: #dcdce0; border: 1px solid #4ab4ff; border-radius: 6px; }
 </style>

@@ -135,6 +135,111 @@ const CSS = `
 }
 .nkd-modal-status { color: #4ab4ff; font-variant-numeric: tabular-nums; }
 .nkd-modal-status.bad { color: #ff6b6b; }
+
+/* ── UI kit (nkd-ui-*): the editor look every NKD modal shares. Round borderless floats around
+   the picture, a sidebar of cards on a 4/8px grid, a pill and a status line for the node.
+   Additive: nothing above changes, an editor opts in by using these classes. The pill and the
+   line live on the NODE, outside any modal, so a widget that uses them calls
+   ensureNkdModalStyles() when it mounts. Shape language after nomadoor's Panorama Studio (MIT);
+   reference implementation: Preview3DWidget.vue. ── */
+.nkd-ui { --nkd-row: 24px; --nkd-lab: 64px; --nkd-fill: #2c2e36; --nkd-fill-hi: #3a3d48;
+  --nkd-dim: #9aa1b2; --nkd-fg: #dcdce0; --nkd-note: #6f7686; --nkd-accent: #4ab4ff; --nkd-float: rgba(26,28,34,0.86); }
+.nkd-ui, .nkd-ui *, .nkd-ui *::before, .nkd-ui *::after { box-sizing: border-box; }
+
+/* On the node: the button that opens the editor, over the picture's bottom centre… */
+.nkd-ui-pill {
+  position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 3;
+  height: 30px; padding: 0 14px 0 11px; border: 0; border-radius: 999px;
+  background: rgba(26,28,34,0.86); color: #e6eaf2; cursor: pointer; white-space: nowrap;
+  font: 600 12px/1 system-ui, sans-serif; display: inline-flex; align-items: center; gap: 7px;
+  transition: background-color 120ms;
+}
+.nkd-ui-pill:hover { background: rgba(58,62,74,0.92); color: #fff; }
+.nkd-ui-pill .pi { font-size: 12px; }
+/* …and one status line under it: what the editor holds on the left, the size on the right. */
+.nkd-ui-line {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto;
+  height: 26px; padding: 0 8px; background: #1a1c22; font: 11px/1 system-ui, sans-serif; color: #8a93a6;
+}
+.nkd-ui-line > span { display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nkd-ui-line .pi { font-size: 11px; }
+.nkd-ui-line > b { flex: none; color: #dcdce0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* Floating groups: position them yourself (absolute, in the stage's margins — never on the picture). */
+.nkd-ui-float { position: absolute; z-index: 3; display: inline-flex; align-items: center; gap: 2px; padding: 5px;
+  background: var(--nkd-float, rgba(26,28,34,0.86)); border-radius: 999px; color: #c8d0e0; font: 11px/1 system-ui, sans-serif; }
+.nkd-ui-float.col { flex-direction: column; border-radius: 20px; }
+.nkd-ui-float button {
+  min-width: 30px; height: 30px; padding: 0; border: 0; border-radius: 999px; flex: 0 0 auto;
+  background: transparent; color: #c8d0e0; cursor: pointer; line-height: 1; font: inherit;
+  display: flex; align-items: center; justify-content: center; gap: 6px; transition: background-color 120ms;
+}
+.nkd-ui-float button.txt { padding: 0 12px; font-weight: 600; }
+.nkd-ui-float button .pi { font-size: 13px; line-height: 1; color: inherit; }
+.nkd-ui-float button:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.nkd-ui-float button.on { background: #4ab4ff; color: #0c0d10; }
+.nkd-ui-float button:disabled { opacity: 0.3; cursor: not-allowed; background: transparent; color: #c8d0e0; }
+.nkd-ui-sep { width: 1px; height: 16px; margin: 0 3px; background: rgba(255,255,255,0.14); flex: 0 0 auto; }
+.nkd-ui-float.col .nkd-ui-sep { width: 16px; height: 1px; margin: 3px 0; }
+
+/* Sidebar of cards. 4px between rows and between controls in a row, 8px between blocks. */
+.nkd-ui-side { min-height: 0; overflow: hidden auto; background: #1a1c22; border-left: 1px solid #2a2d36;
+  padding: 8px; display: flex; flex-direction: column; gap: 8px; font: 11px/1.2 system-ui, sans-serif; color: var(--nkd-dim); }
+.nkd-ui-card { background: #202229; border-radius: 12px; flex: 0 0 auto; }
+.nkd-ui-card.sel { box-shadow: inset 0 0 0 1px rgba(74,180,255,0.55); }
+.nkd-ui-cardhead { display: flex; align-items: center; gap: 7px; padding: 11px 12px 0; min-height: 33px;
+  color: #fff; font: 600 13px/1 system-ui, sans-serif; }
+.nkd-ui-cardhead > .pi { color: #8a93a6; font-size: 12px; }
+.nkd-ui-cardhead > .grow { flex: 1 1 auto; min-width: 0; }
+.nkd-ui-cardbody { padding: 10px 12px 12px; display: grid; grid-template-columns: minmax(0,1fr); gap: 4px; }
+.nkd-ui-cardbody.off { opacity: 0.4; }
+/* One row: label · control · value on the SAME columns in every card, so the tracks line up. */
+.nkd-ui-row { display: grid; grid-template-columns: var(--nkd-lab) minmax(0,1fr) 38px; align-items: center;
+  column-gap: 6px; min-height: 20px; }
+.nkd-ui-row > :first-child { color: var(--nkd-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nkd-ui-row > :last-child:not(:nth-child(2)) { color: var(--nkd-fg); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.nkd-ui-row.wide { grid-template-columns: var(--nkd-lab) minmax(0,1fr); min-height: var(--nkd-row); }
+.nkd-ui-sub { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--nkd-note);
+  margin-top: 8px; display: flex; align-items: center; gap: 6px; min-height: 16px; }
+.nkd-ui-sub:first-child { margin-top: 0; }
+.nkd-ui-note { font-size: 10px; color: var(--nkd-note); line-height: 1.3; }
+/* Fields, buttons and selects: one height, one fill, no outline until edited. */
+.nkd-ui-btn, .nkd-ui-sel, .nkd-ui-field { height: var(--nkd-row); border: 1px solid transparent; border-radius: 6px;
+  background: var(--nkd-fill); color: var(--nkd-fg); font: 11px/1 system-ui, sans-serif; padding: 0 8px; min-width: 0; }
+.nkd-ui-btn, .nkd-ui-sel { cursor: pointer; }
+.nkd-ui-btn:hover, .nkd-ui-sel:hover, .nkd-ui-field:hover { background: var(--nkd-fill-hi); }
+.nkd-ui-btn.on { background: #4ab4ff; color: #0c0d10; }
+.nkd-ui-btn.round { border-radius: 999px; padding: 0 12px; height: 22px; }
+.nkd-ui-btn.icon { width: var(--nkd-row); padding: 0; flex: 0 0 auto; }
+.nkd-ui-btn .pi { font-size: 10px; }
+.nkd-ui-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.nkd-ui-field:focus, .nkd-ui-sel:focus { outline: none; border-color: #4ab4ff; }
+.nkd-ui-swatch { width: 28px; height: 20px; padding: 2px; border: 0; border-radius: 6px; background: var(--nkd-fill); cursor: pointer; flex: 0 0 auto; }
+.nkd-ui-check { display: inline-flex; align-items: center; gap: 8px; min-height: 20px; color: var(--nkd-fg); cursor: pointer; }
+.nkd-ui-check input, .nkd-ui input[type='checkbox'].nkd-ui-box { width: 14px; height: 14px; margin: 0; flex: 0 0 auto; accent-color: #4ab4ff; cursor: pointer; }
+/* Sliders: thin track, small light thumb. Set --nkd-pct (0–100%) for a filled track. */
+.nkd-ui-range { -webkit-appearance: none; appearance: none; width: 100%; height: 16px; margin: 0; background: transparent; cursor: pointer; touch-action: none; }
+.nkd-ui-range::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;
+  background: linear-gradient(90deg, #7f8aa3 var(--nkd-pct, 0%), #3a3d48 var(--nkd-pct, 0%)); }
+.nkd-ui-range::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px; border-radius: 50%; background: #c8d0e0; border: 0; }
+.nkd-ui-range:hover::-webkit-slider-thumb { background: #fff; }
+.nkd-ui-range::-moz-range-track { height: 4px; border-radius: 2px; background: #3a3d48; }
+.nkd-ui-range::-moz-range-progress { height: 4px; border-radius: 2px; background: #7f8aa3; }
+.nkd-ui-range::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #c8d0e0; border: 0; }
+.nkd-ui-range:disabled { opacity: 0.3; cursor: default; }
+
+/* Shortcuts sheet, over the stage. */
+.nkd-ui-help { position: absolute; z-index: 4; overflow: auto; background: rgba(27,28,30,0.97); border-radius: 12px;
+  padding: 16px 20px; color: #dcdce0; font: 12px/1.3 system-ui, sans-serif; }
+.nkd-ui-help-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; color: #8e8f93; }
+.nkd-ui-help-head b { color: #fff; font-size: 15px; font-weight: 600; }
+.nkd-ui-help-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px 40px; }
+.nkd-ui-help h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
+.nkd-ui-help-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 6px 0; border-top: 1px solid #2a2b2d; }
+.nkd-ui-help-row > span:last-child { display: inline-flex; align-items: center; gap: 5px; color: #8e8f93; white-space: nowrap; }
+.nkd-ui-help kbd, .nkd-ui kbd { font: 600 11px/1 system-ui, sans-serif; color: #dcdce0; background: #2c2c2e;
+  border-radius: 5px; padding: 4px 7px; min-width: 22px; text-align: center; display: inline-block; }
 `;
 
 /** Injects the stylesheet once per document. Safe to call on every open. */
@@ -227,6 +332,82 @@ export function openNkdModal(opts: NkdModalOptions): NkdModal {
 /* ── Control factories ─────────────────────────────────────────────────────
    Only the controls both extracted editors actually used. Vue callers can skip
    these entirely and put the class names in their template. */
+
+/**
+ * Pop a node's DOM-widget container out into an open modal — and KEEP it there.
+ *
+ * Moving the mount container with appendChild keeps a WebGL context, the loaded scene and
+ * every setting (one live instance, no second renderer). Two things then go wrong unless they
+ * are guarded, both measured in Preview 3D and again in Relight:
+ *
+ *  1. Writing a node widget's value makes the frontend's DOM-widget host take the container
+ *     BACK into the node, and the modal is left an empty box. A MutationObserver on the modal
+ *     body takes it back, and remembers where the host had put it: that element (possibly a
+ *     re-created one) is where it has to return on close.
+ *  2. Re-parenting an element releases its pointer capture, so an editor that writes the widget
+ *     on every move of a drag loses the drag. Route those writes through `write()`: while a
+ *     button is down they are held (last one per key wins) and land once, on release.
+ *
+ * Call `restore()` from the modal's onClose, before the widget re-measures.
+ */
+export interface NkdPopOut {
+  /** Run `fn` now, or — while a pointer button is down — once on release. */
+  write(key: string, fn: () => void): void;
+  flush(): void;
+  restore(): void;
+}
+export function nkdPopOut(modal: NkdModal, container: HTMLElement,
+                          opts: { placeholder?: string; onReclaim?: () => void } = {}): NkdPopOut {
+  let slot = container.parentElement as HTMLElement | null;
+  // Something in the node's reserved row, or it reads as a broken empty box.
+  const ph = div("");
+  ph.textContent = opts.placeholder ?? "Open in the editor";
+  ph.style.cssText =
+    "display:flex;align-items:center;justify-content:center;width:100%;height:100%;" +
+    "box-sizing:border-box;color:rgba(255,255,255,0.35);font-size:11px;" +
+    "background:#111318;border:1px dashed #3a3d46;border-radius:4px;";
+  slot?.appendChild(ph);
+  container.style.height = "100%";   // the node sizes it by width × aspect; the modal body is a flex row
+  container.style.flex = "1 1 auto";
+  modal.body.appendChild(container);
+
+  let open = true;
+  let down = false;
+  const held = new Map<string, () => void>();
+  const flush = () => { const fns = [...held.values()]; held.clear(); for (const fn of fns) fn(); };
+  const reclaim = () => {
+    if (!open || container.parentElement === modal.body) return;
+    const at = container.parentElement as HTMLElement | null;
+    if (at) { slot = at; at.appendChild(ph); }
+    modal.body.appendChild(container);
+    opts.onReclaim?.();
+  };
+  const mo = new MutationObserver(reclaim);
+  mo.observe(modal.body, { childList: true });
+  const onDown = () => { down = true; };
+  const onUp = (e: PointerEvent) => { if (!e.buttons) { down = false; flush(); } };
+  window.addEventListener("pointerdown", onDown, true);
+  window.addEventListener("pointerup", onUp, true);
+  window.addEventListener("pointercancel", onUp, true);
+
+  return {
+    write(key, fn) { if (open && down) held.set(key, fn); else fn(); },
+    flush,
+    restore() {
+      if (!open) return;
+      open = false;
+      mo.disconnect();
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onUp, true);
+      flush();
+      if (slot && container.parentElement !== slot) slot.appendChild(container);
+      container.style.height = "";
+      container.style.flex = "";
+      ph.remove();
+    },
+  };
+}
 
 export function nkdButton(label: string, onClick: () => void, title?: string): HTMLButtonElement {
   const b = document.createElement("button");

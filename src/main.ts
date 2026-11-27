@@ -10,7 +10,7 @@ import { app as comfyApp } from "../../scripts/app.js";
 // @ts-ignore – resolved at runtime by ComfyUI
 import { api } from "../../scripts/api.js";
 import RelightingCanvas from "@/components/RelightingCanvas.vue";
-import { openNkdModal, nkdButton, type NkdModal } from "@/nkd_modal";
+import { openNkdModal, nkdButton, nkdPopOut, ensureNkdModalStyles, type NkdModal, type NkdPopOut } from "@/nkd_modal";
 import { queueNode } from "@/queueNode";
 
 const NODE_NAME = "RelightingNode";
@@ -124,9 +124,14 @@ comfyApp.registerExtension({
 
       // Callback: Vue component → hidden widget + dirty canvas.
       // Never force a resize here — the user controls node size manually.
+      // With the editor open the write goes through the pop-out guard: a light drag writes on
+      // every move, and each write would otherwise pull the editor back into the node.
       const onChange = (json: string) => {
-        if (configWidget) configWidget.value = json;
-        nodeRef.setDirtyCanvas(true);
+        const write = () => {
+          if (configWidget) configWidget.value = json;
+          nodeRef.setDirtyCanvas(true);
+        };
+        if (pop) pop.write("lights_config", write); else write();
       };
 
       // ── Pop-out ───────────────────────────────────────────────────────────
@@ -134,45 +139,21 @@ comfyApp.registerExtension({
       // context, the passes and every setting (same pattern as Preview 3D). The node keeps a
       // placeholder in its reserved row so it does not read as a broken empty box.
       let modal: NkdModal | null = null;
-      let placeholder: HTMLDivElement | null = null;
-      let nodeSlot: HTMLElement | null = null;
+      let pop: NkdPopOut | null = null;
       const popOut = () => {
         if (modal) return;
         modal = openNkdModal({
           title: "😺 NKD Relight",
           hint: "same node as the graph — drag lights on the image, tune everything on the right",
           onClose: () => {
-            if (nodeSlot && container.parentElement !== nodeSlot) nodeSlot.appendChild(container);
-            container.style.height = "";
-            container.style.flex = "";
-            placeholder?.remove();
-            placeholder = null;
+            pop?.restore();   // back into the node, held writes flushed
+            pop = null;
             modal = null;   // cleared before the widget re-measures: the observer ignores popped sizes
             instance.setPopped(false);
             requestAnimationFrame(() => nodeRef.setDirtyCanvas(true, true));
           },
         });
-        nodeSlot = container.parentElement as HTMLElement | null;
-        if (nodeSlot) {
-          placeholder = document.createElement("div");
-          placeholder.textContent = "Open in the editor";
-          placeholder.style.cssText =
-            "display:flex;align-items:center;justify-content:center;width:100%;height:100%;" +
-            "box-sizing:border-box;color:rgba(255,255,255,0.35);font-size:11px;" +
-            "background:#111318;border:1px dashed #3a3d46;border-radius:4px;";
-          nodeSlot.appendChild(placeholder);
-        }
-        container.style.height = "100%";
-        container.style.flex = "1 1 auto";
-        modal.body.appendChild(container);
-        // The frontend's DOM-widget host re-attaches its element on some re-layouts; if it
-        // takes the container back in the first moments, put it in the modal again.
-        const hold = (n: number) => {
-          if (!modal) return;
-          if (container.parentElement !== modal.body) modal.body.appendChild(container);
-          if (n > 0) requestAnimationFrame(() => hold(n - 1));
-        };
-        hold(90);
+        pop = nkdPopOut(modal, container, { placeholder: "Open in the editor — close it to come back" });
         // Light edits are live in the preview; this re-runs the node so the real output (and
         // everything downstream) matches what you see. Upstream stays cached.
         modal.footerLeft.appendChild(nkdButton("Run node", () => { void queueNode(nodeRef, "NKD Relight"); },
@@ -181,6 +162,9 @@ comfyApp.registerExtension({
         instance.setPopped(true);
       };
 
+      // The pill and the status line on the node are the shared kit's, which only gets its
+      // stylesheet injected when a modal opens — and the node is drawn long before that.
+      ensureNkdModalStyles();
       const vueApp = createApp(RelightingCanvas, { onChange, onPopout: popOut });
       const instance = vueApp.mount(container) as InstanceType<
         typeof RelightingCanvas

@@ -54,13 +54,15 @@ document.addEventListener('pointerdown', (e) => {
  * the host can collapse or balloon on selection/re-layout, and node.size[0] is the one
  * reference that survives. Height needs no keeper — it is deterministic (see below).
  */
-function keepDomWidgetSized(node: any, container: HTMLElement): () => void {
+function keepDomWidgetSized(node: any, container: HTMLElement, active: () => boolean): () => void {
   const MAX_MARGIN = 40
   let enforcingW = false
   let goodMargin = 15
   const vueMode = () => !!(window as any).LiteGraph?.vueNodesMode
   const clamp = () => {
     if (enforcingW) return
+    // Out in the viewer the parent is the modal, not the node: nothing to keep in step.
+    if (!active()) { if (container.style.width) container.style.width = ''; return }
     if (vueMode()) { if (container.style.width) container.style.width = ''; return }
     const nodeW = node.size?.[0]; if (!nodeW) return
     const host = container.parentElement
@@ -172,17 +174,33 @@ comfyApp.registerExtension({
         const w = node.widgets?.find((x: any) => x.name === name)
         if (w) w.value = value
       }
-      const onCalibrated = (near: number, far: number) => {
-        setWidget('scene_depth_near', near)
-        setWidget('scene_depth_far', far)
+      // Writing a node widget makes the frontend's host take the container back into the node;
+      // `reclaim` returns it to the viewer, but RE-PARENTING AN ELEMENT RELEASES ITS POINTER
+      // CAPTURE — so a Near/Far scrub that wrote on every move lost its drag the moment the
+      // pointer left the field. While a button is down in the open viewer the writes are held
+      // and land once, on release.
+      const held = new Map<string, unknown>()
+      let pointerDown = false
+      const flushHeld = () => {
+        if (!held.size) return
+        for (const [k, v] of held) setWidget(k, v)
+        held.clear()
         node.setDirtyCanvas(true, true)
       }
-      // Same fold-back for the depth controls that moved into the viewport: the widget stays
-      // the persisted value and what the next run executes, it just has no row on the node.
-      const onWidget = (name: string, value: unknown) => {
+      const writeWidget = (name: string, value: unknown) => {
+        if (modal && pointerDown) { held.set(name, value); return }
         setWidget(name, value)
         node.setDirtyCanvas(true, true)
       }
+      const onPtrDown = () => { pointerDown = true }
+      const onPtrUp = (e: PointerEvent) => { if (!e.buttons) { pointerDown = false; flushHeld() } }
+      const onCalibrated = (near: number, far: number) => {
+        writeWidget('scene_depth_near', near)
+        writeWidget('scene_depth_far', far)
+      }
+      // Same fold-back for the depth controls that moved into the viewport: the widget stays
+      // the persisted value and what the next run executes, it just has no row on the node.
+      const onWidget = writeWidget
       // ── Pop-out ────────────────────────────────────────────────────────────────────
       // ONE live instance, moved. Verified with a probe before building on it: re-parenting
       // the mount container with appendChild keeps the WebGL context (never lost), the loaded
@@ -195,12 +213,32 @@ comfyApp.registerExtension({
       let modal: NkdModal | null = null
       let placeholder: HTMLDivElement | null = null
       let nodeSlot: HTMLElement | null = null
+      // The frontend's DOM-widget host can take the container BACK into the node on a
+      // re-layout — writing a widget value does it (Auto Z, Near/Far, Invert all fold their
+      // value into the node's widgets), and the viewer is left an empty box. While the viewer
+      // is open the container belongs to it: take it back, and remember where the host put it,
+      // because that (possibly re-created) element is where it has to return on close.
+      let keepInModal: MutationObserver | null = null
+      const reclaim = () => {
+        if (!modal || container.parentElement === modal.body) return
+        const slot = container.parentElement as HTMLElement | null
+        if (slot) { nodeSlot = slot; if (placeholder) slot.appendChild(placeholder) }
+        modal.body.appendChild(container)
+        vp()?.forceResize()
+      }
       const popOut = () => {
         if (modal) return
         modal = openNkdModal({
           title: '😺 NKD Preview 3D',
-          hint: 'same scene as the node — orbit, light and frame it here',
+          hint: 'same scene as the node — press ? for the shortcuts',
           onClose: () => {
+            keepInModal?.disconnect()
+            keepInModal = null
+            window.removeEventListener('pointerdown', onPtrDown, true)
+            window.removeEventListener('pointerup', onPtrUp, true)
+            window.removeEventListener('pointercancel', onPtrUp, true)
+            pointerDown = false
+            flushHeld()
             // Put the viewport back before anything else: the node is left with a hole
             // otherwise, and the widget's height is still reserved for it.
             if (nodeSlot && container.parentElement !== nodeSlot) nodeSlot.appendChild(container)
@@ -217,7 +255,7 @@ comfyApp.registerExtension({
         nodeSlot = container.parentElement as HTMLElement | null
         if (nodeSlot) {
           placeholder = document.createElement('div')
-          placeholder.textContent = 'Open in the viewer'
+          placeholder.textContent = 'Open in the viewer — close it to come back'
           placeholder.style.cssText =
             'display:flex;align-items:center;justify-content:center;width:100%;height:100%;' +
             'box-sizing:border-box;color:rgba(255,255,255,0.35);font-size:11px;' +
@@ -230,6 +268,11 @@ comfyApp.registerExtension({
         container.style.height = '100%'
         container.style.flex = '1 1 auto'
         modal.body.appendChild(container)
+        keepInModal = new MutationObserver(reclaim)
+        keepInModal.observe(modal.body, { childList: true })
+        window.addEventListener('pointerdown', onPtrDown, true)
+        window.addEventListener('pointerup', onPtrUp, true)
+        window.addEventListener('pointercancel', onPtrUp, true)
         vp()?.setPopped(true)
       }
 
@@ -286,6 +329,7 @@ comfyApp.registerExtension({
         viewportWidget.serializeValue = async () => {
           const api_ = vp()
           if (!api_) return lastValue
+          flushHeld() // a queue fired mid-drag still runs with what the viewer shows
           const width = node.widgets?.find((w: any) => w.name === 'width')?.value ?? 1024
           const height = node.widgets?.find((w: any) => w.name === 'height')?.value ?? 1024
           try {
@@ -309,8 +353,8 @@ comfyApp.registerExtension({
       // litegraph reserves exactly that. The content resolves the same height naturally
       // from CSS (width:100% + aspect-ratio), so node and content agree by construction —
       // nothing depends on the host handing a height down, which is the chain that broke.
-      // chromeH = toolbar + light panel (when open) + border; measured from the real DOM.
-      let chromeH = 50 // safe overestimate until the first measure
+      // chromeH = the status line + border; measured from the real DOM.
+      let chromeH = 28 // the status line's CSS height + border, until the first measure
       const widgetHeight = () =>
         Math.round(((node.size?.[0] || VIEW_W) * aspect.h) / aspect.w) + chromeH + ROW_SAFETY
 
@@ -338,7 +382,7 @@ comfyApp.registerExtension({
         },
       })
 
-      const unclamp = keepDomWidgetSized(node, container)
+      const unclamp = keepDomWidgetSized(node, container, () => !modal)
 
       // Lock the node's height to the formula on every resize: the user drives the
       // width, the height follows. This is what keeps the border wrapping the content.
@@ -372,13 +416,11 @@ comfyApp.registerExtension({
         // feeding it to the node's height formula would inflate the node to the modal's size
         // while its row is showing a placeholder. The node keeps the height it had.
         if (modal) return
-        const bar = container.querySelector('.nkd-bar') as HTMLElement | null
-        const panel = container.querySelector('.nkd-panel') as HTMLElement | null
-        // The view tools are a row of their own now, not an overlay: they take height.
-        const tools = container.querySelector('.nkd-tools') as HTMLElement | null
-        const measured = (bar?.offsetHeight ?? 0) + (panel?.offsetHeight ?? 0)
-          + (tools?.offsetHeight ?? 0) + 2
-        if (bar && measured > 2 && measured !== chromeH) {
+        // Modal-first: on the node the only chrome is the status line under the view (every
+        // control lives in the viewer), so this settles once and the node stops resizing.
+        const line = container.querySelector('.nkd-nodeline') as HTMLElement | null
+        const measured = (line?.offsetHeight ?? 0) + 2
+        if (line && measured > 2 && measured !== chromeH) {
           chromeH = measured
           node.setSize([node.size[0], node.computeSize()[1]])
           node.setDirtyCanvas(true, true)

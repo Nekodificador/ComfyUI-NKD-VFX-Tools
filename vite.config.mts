@@ -62,6 +62,8 @@ export default defineConfig({
         // `node test_clip_planes.mjs` asserts on the shipped function.
         nkd_clip_planes:   "./src/clip_planes.ts",
         nkd_view_gizmo:    "./src/view_gizmo.ts",
+        // Likewise: the edge rulers' scale maths, for `node test_ruler.mjs`.
+        nkd_ruler:         "./src/ruler.ts",
         // Likewise: the pin ghost view's shaders, so test_ghost_edges.html builds its materials
         // from the shipped strings.
         nkd_ghost_edges:   "./src/ghost_edges.ts",

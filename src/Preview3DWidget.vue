@@ -27,6 +27,8 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { ViewHelper } from 'three/examples/jsm/helpers/ViewHelper.js'
 import { RectAreaLightUniformsLib } from 'three/examples/jsm/lights/RectAreaLightUniformsLib.js'
 import { RectAreaLightHelper } from 'three/examples/jsm/helpers/RectAreaLightHelper.js'
+import EdgeRuler from './components/EdgeRuler.vue'
+import type { RulerScale } from './ruler'
 import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 
 // Scrub-drag number field, the only control that works on a LiteGraph canvas: HORIZONTAL
@@ -98,8 +100,8 @@ const DragNumber = defineComponent({
             [
               Number.isFinite(p.modelValue) ? p.modelValue.toFixed(p.decimals) : '0',
               p.resetTo != null && p.modelValue !== p.resetTo
-                ? h('span', {
-                    class: 'nkd-drag-reset',
+                ? h('i', {
+                    class: 'pi pi-replay nkd-drag-reset',
                     title: 'Reset',
                     // stopPropagation so the reset click doesn't start a scrub-drag or open edit.
                     onPointerdown: (e: PointerEvent) => {
@@ -107,7 +109,7 @@ const DragNumber = defineComponent({
                       e.preventDefault()
                       emit('update:modelValue', clamp(p.resetTo as number))
                     },
-                  }, '↺')
+                  })
                 : null,
             ]
           )
@@ -138,7 +140,56 @@ const viewWrap = ref<HTMLDivElement | null>(null)
 // viewport-shaped box would frame something other than what the node actually outputs.
 const fitW = ref(0)
 const fitH = ref(0)
-const toolsRow = ref<HTMLElement | null>(null)
+// The stage margins around the export frame, popped out: room for the edge rulers (with their
+// numbers) and the floating columns, so none of them ever sits on the picture. ONE constant
+// feeds both the wrapper's padding and resize()'s fit — they cannot disagree.
+const FRAME_MARGIN = { x: 132, top: 34, bottom: 78 }
+const stagePad = { padding: `${FRAME_MARGIN.top}px ${FRAME_MARGIN.x}px ${FRAME_MARGIN.bottom}px` }
+// Edge rulers. Lens and Roll count in their own units, a tick per mm / per degree; Dolly is a
+// distance, with no natural step, so it counts in doublings.
+const LENS_RULER: RulerScale = { unitPx: 8, minor: 1, major: 10, decimals: 0, min: 2, max: 2000 }
+const ROLL_RULER: RulerScale = { unitPx: 8, minor: 1, major: 10, decimals: 0, min: -180, max: 180 }
+const DOLLY_RULER: RulerScale = { unitPx: 60, log: true, min: 0.01, max: 10000 }
+const helpOpen = ref(false)
+// [section, [what, keys, note?][]] — only what the viewer really does.
+const SHORTCUTS: [string, [string, string[], string?][]][] = [
+  ['View', [
+    ['Orbit', [], 'drag'],
+    ['Pan', [], 'right-drag'],
+    ['Dolly', [], 'wheel or middle-drag'],
+    ['Slow, precise move', ['Shift'], 'while dragging'],
+    ['Axis view (orthographic)', [], 'click an axis of the corner gizmo'],
+    ['Save / overwrite a camera', ['Shift'], 'click a slot 1–4'],
+    ['Go back to a camera', [], 'click its slot'],
+  ]],
+  ['Object', [
+    ['World / local axes', ['Q']],
+    ['Move', ['W']],
+    ['Rotate', ['E']],
+    ['Scale', ['R']],
+    ['Hide the gizmo', [], 'press its key again'],
+    ['Move or turn the origin only', ['Alt'], 'drag the gizmo'],
+    ['Fine gizmo drag', ['Shift'], 'drag the gizmo'],
+  ]],
+  ['Tools', [
+    ['Paint the 3D mask', [], 'drag'],
+    ['Erase the mask', ['Alt'], 'drag'],
+    ['Place a pin', [], 'click the model'],
+    ['Delete a pin', [], 'right-click it'],
+    ['Fine pin drag', ['Shift'], 'drag a pin'],
+    ['Orbit while painting or pinning', [], 'right-drag'],
+    ['Resize the crop box', [], 'drag a face dot'],
+  ]],
+  ['Rulers and fields', [
+    ['Change a ruler', [], 'drag its scale'],
+    ['Fine steps (×0.1)', ['Shift'], 'drag'],
+    ['Reset', [], 'double-click'],
+    ['Step a focused ruler', ['←', '→']],
+    ['Type an exact value', [], 'click a number field'],
+    ['Shortcuts', ['?']],
+    ['Close', ['Esc']],
+  ]],
+]
 const showGrid = ref(true)
 // On: the floor (shadow catcher, contact shadow, grid) hides what goes through it, which reads
 // right for an object standing on it. Off: the whole object shows over the floor.
@@ -156,10 +207,6 @@ let gizmoDragging = false
 let orbiting = false // a camera drag is live: Shift damps its pointer, same as the gizmo's
 let detachFine: (() => void) | null = null
 let detachGizmoFine: (() => void) | null = null
-// One tab open at a time: each panel is one row of chrome, and remeasureChrome in main.ts
-// only counts the first .nkd-panel it finds.
-const activePanel = ref<'' | 'light' | 'object' | 'occlude' | 'depth'>('')
-const togglePanel = (p: 'light' | 'object' | 'occlude' | 'depth') => { activePanel.value = activePanel.value === p ? '' : p }
 
 // Look-dev state. It lives here rather than in node widgets on purpose: the render — and
 // the capture taken from it — happens in this browser, so a light change needs no round
@@ -485,10 +532,10 @@ const hasSceneDepth = ref(false) // mirrors sceneDepthTexture for the template (
  *  render loop and the light-joystick redraw asked `tab` alone. Identical while tabs were the only
  *  way to show a panel, and silently wrong the moment the sidebar showed all four at once (the
  *  depth preview never painted, and the light sphere stayed blank until you dragged it). */
-const objectPanelOpen = computed(() => popped.value || activePanel.value === 'object')
-const lightPanelOpen = computed(() => popped.value || activePanel.value === 'light')
-const depthPanelOpen = computed(() => popped.value || activePanel.value === 'depth')
-const occludePanelOpen = computed(() => popped.value || activePanel.value === 'occlude')
+const objectPanelOpen = computed(() => popped.value)
+const lightPanelOpen = computed(() => popped.value)
+const depthPanelOpen = computed(() => popped.value)
+const occludePanelOpen = computed(() => popped.value)
 
 const DEPTH_FRAG = `
 uniform sampler2D depthMap;
@@ -1729,9 +1776,10 @@ function resize() {
   // the renderer needs the number NOW — reading it back off the element would race Vue's
   // style flush, and the fitted size is what we just decided anyway.
   if (popped.value && viewWrap.value) {
-    // The tools row shares the wrapper with the picture; the picture gets what is left.
-    const bw = viewWrap.value.clientWidth
-    const bh = viewWrap.value.clientHeight - (toolsRow.value?.offsetHeight ?? 0)
+    // clientWidth includes the padding that holds the rulers and floats; the picture gets
+    // what is left. Floored so a tiny window degrades to a small frame, never a negative one.
+    const bw = Math.max(64, viewWrap.value.clientWidth - 2 * FRAME_MARGIN.x)
+    const bh = Math.max(64, viewWrap.value.clientHeight - FRAME_MARGIN.top - FRAME_MARGIN.bottom)
     if (bw > 1 && bh > 1) {
       const s = Math.min(bw / props.aspect.w, bh / props.aspect.h)
       fitW.value = Math.floor(props.aspect.w * s)
@@ -2147,6 +2195,22 @@ function setFocal(mm: number) {
   // it. The field has already clamped the value, so this cannot show an unreachable one.
   focal.value = mm
 }
+/** Distance from the camera to the point it orbits. No state of its own: it IS the camera
+ *  position (already serialised), so this ref is only a mirror for the ruler, refreshed on
+ *  every OrbitControls change. */
+const dolly = ref(1)
+function syncDolly() { if (controls) dolly.value = camera.position.distanceTo(controls.target) }
+function setDolly(d: number) {
+  if (!controls || camLocked.value || !(d > 0)) return
+  const dir = camera.position.clone().sub(controls.target)
+  if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1)
+  camera.position.copy(controls.target).addScaledVector(dir.normalize(), d)
+  controls.update() // fires 'change': lighting, wake and the mirror all follow
+  dolly.value = d   // what was asked, not the re-measured distance (same reason as setFocal)
+}
+const nodeLine = computed(() =>
+  `${focal.value.toFixed(0)} mm · roll ${roll.value.toFixed(0)}° · camera ${camLocked.value ? 'locked' : 'free'}`)
+
 /** camera.fov is the truth; refresh the mm mirror from it. Must run whenever the ASPECT
  *  changes too, not just the angle: the same fov on a different format is a different
  *  focal length. */
@@ -4352,14 +4416,23 @@ function releaseWheel(e: PointerEvent) {
 function onViewLeave() { pointerInView = false; if (brushRing) brushRing.visible = false }
 function onGizmoKey(ev: KeyboardEvent) {
   if (!popped.value && !pointerInView) return
-  if (ev.repeat || ev.ctrlKey || ev.altKey || ev.metaKey || ev.shiftKey) return
-  const key = (ev.key || '').toLowerCase()
-  const mode = GIZMO_KEYS[key]
-  if (!mode && key !== 'q') return
   // Typing a value into a DragNumber must stay typing — 'w' is a character there, not a tool.
   const el = document.activeElement as HTMLElement | null
   if (el && (el.isContentEditable || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
              el.tagName === 'SELECT')) return
+  // The shortcuts sheet: '?' (which needs Shift on most layouts, so it is read before the
+  // modifier guard) toggles it, and Esc closes IT rather than the whole viewer — this listener
+  // was added before the modal's own Esc handler on the same target, so it runs first.
+  if (popped.value && !ev.repeat && (ev.key === '?' || (ev.key === 'Escape' && helpOpen.value))) {
+    ev.preventDefault()
+    ev.stopImmediatePropagation()
+    helpOpen.value = ev.key === '?' ? !helpOpen.value : false
+    return
+  }
+  if (ev.repeat || ev.ctrlKey || ev.altKey || ev.metaKey || ev.shiftKey) return
+  const key = (ev.key || '').toLowerCase()
+  const mode = GIZMO_KEYS[key]
+  if (!mode && key !== 'q') return
   ev.preventDefault()
   ev.stopPropagation()
   if (mode) toggleGizmoMode(mode)
@@ -4454,6 +4527,7 @@ onMounted(() => {
   // The key light's world position depends on the camera yaw — track it while orbiting.
   controls.addEventListener('change', applyLighting)
   controls.addEventListener('change', () => wake())
+  controls.addEventListener('change', syncDolly)
   // Shift = tenth-speed orbit/pan/dolly, the same modifier as every slider and the gizmo. It
   // rides the SAME pointer damping the gizmo uses (see below) — OrbitControls reads clientX/Y
   // out of the event exactly like TransformControls does, so one shadowing covers both.
@@ -4542,6 +4616,16 @@ onBeforeUnmount(cleanup)
  *  fit can measure anything (a fit against a 0-wide box is the documented NaN/blank trap). */
 function setPopped(b: boolean) {
   popped.value = b
+  if (!b) {
+    // Back on the node there is no button to leave a tool with, so leave them here: a brush
+    // or a pin tool left armed would hijack the left button of a view that shows no sign of
+    // it. None of the three is serialised state; the crop is, and stays.
+    helpOpen.value = false
+    if (maskPaint.value) toggleMaskPaint()
+    if (pinMode.value) togglePins()
+    setGizmoMode('off') // also releases a light or aim-target gizmo
+  }
+  syncDolly()
   requestAnimationFrame(() => requestAnimationFrame(() => resize()))
 }
 
@@ -4553,58 +4637,16 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
        every wheel over a node to the graph zoom (only while focus is inside the element). -->
   <div class="nkd-p3d" :class="{ 'nkd-popped': popped }" tabindex="-1" data-capture-wheel="true"
        @pointerenter="claimWheel" @pointerleave="releaseWheel">
-    <div class="nkd-bar">
-      <!-- Outside the tabs' v-if: an action, wanted on any panel and popped out too. -->
-      <button @click="fitToGround"
-              title="Fit to ground: normalise the scale and drop the model's floor centre on the origin.">Fit</button>
-      <!-- The tabs only exist to ration a node's width. In the sidebar every panel is already
-           on screen, so they would just be four buttons that do nothing, eating viewport height. -->
-      <template v-if="!popped">
-        <button :class="{ on: activePanel === 'object' }" @click="togglePanel('object')">Object</button>
-        <button :class="{ on: activePanel === 'light' }" @click="togglePanel('light')">Light</button>
-        <button :class="{ on: activePanel === 'depth' }" @click="togglePanel('depth')"
-          title="Depth output: near/far range, live preview and Auto Z">Depth</button>
-        <button :class="{ on: activePanel === 'occlude' }" @click="togglePanel('occlude')"
-          title="Occlusion: the scene's depth hiding the object, and the depth_slice mask of the object's own depth">Occlude</button>
-      </template>
-      <label class="nkd-barfield" :title="hasCamera
-        ? 'Focal length, 35mm-equivalent. A solved camera drives this — the next run puts its lens back.'
-        : 'Focal length in 35mm-equivalent mm (full-frame 36mm back), the same figure the fSpy node solves. Short = wide and exaggerated, long = compressed. Drag to scrub, click to type.'">Lens
-        <DragNumber :model-value="focal" :step="0.5" :min="2" :max="2000" :decimals="1"
-                    :reset-to="defaultFocal" @update:model-value="setFocal" />mm
-      </label>
-      <label class="nkd-barfield" title="Camera roll (dutch angle), in degrees. Tilts the horizon; orbiting keeps it.">Roll
-        <DragNumber :model-value="roll" :step="0.25" :min="-180" :max="180" :decimals="1"
-                    :reset-to="0" @update:model-value="applyRoll" />
-      </label>
-      <input type="color" class="nkd-color" :value="bgColor"
-             @input="setBgColor(($event.target as HTMLInputElement).value)"
-             title="Backdrop colour, exported in the image output — it is what shows through the holes of a mesh with alpha (MoGe, DA3). A wired bg_image covers it.">
-      <span v-if="status" class="nkd-status">{{ status }}</span>
-    </div>
-    <!-- Panels stay BETWEEN the bar and the view in DOM order, so the stacked node layout is
-         byte-for-byte what it was. Popped out, this wrapper becomes the right-hand sidebar and
-         every panel shows at once — the tabs only exist because a node is too narrow for that. -->
-    <div class="nkd-side">
-    <!-- Order here IS the sidebar order, and it matches the tab order: transform, light, depth,
-         occlude. Done by moving the block rather than with CSS `order`, so what the DOM reads
-         is what the screen shows. Harmless for the node, where only one panel exists at a time. -->
-    <div v-if="objectPanelOpen" class="nkd-panel" @pointerdown.stop @wheel.stop>
+    <!-- Modal-first: every control lives in the viewer. On the node there is the live view, the
+         button that opens the viewer and one status line — so the node's height is width × aspect
+         plus that line, and never moves. The sidebar comes first in the DOM and lands in the
+         right-hand grid column. Order is transform, light, depth, occlude, scene. -->
+    <div v-if="popped" class="nkd-side">
+    <div v-if="objectPanelOpen" class="nkd-card" @pointerdown.stop @wheel.stop>
+      <div class="nkd-cardhead"><i class="pi pi-box" />Object
+      </div>
+      <div class="nkd-panel">
       <div class="nkd-obj">
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Gizmo</span>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'translate' }" @click="toggleGizmoMode('translate')">Move</button>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'rotate' }" @click="toggleGizmoMode('rotate')">Rotate</button>
-          <button class="nkd-gizmo" :class="{ on: gizmoMode === 'scale' }" @click="toggleGizmoMode('scale')">Scale</button>
-        </div>
-        <div class="nkd-obj-row">
-          <span class="nkd-obj-tag">Axes</span>
-          <button class="nkd-gizmo" :class="{ on: gizmoSpace === 'world' }" @click="setGizmoSpace('world')"
-                  title="Gizmo handles follow the WORLD axes. Toggle with Q over the viewport.">World</button>
-          <button class="nkd-gizmo" :class="{ on: gizmoSpace === 'local' }" @click="setGizmoSpace('local')"
-                  title="Gizmo handles follow the OBJECT's own axes — which is also how the Rot fields compose. Toggle with Q over the viewport.">Local</button>
-          <span class="nkd-obj-hint" v-if="gizmoMode === 'scale'">Scale is always local</span>
-        </div>
         <div class="nkd-obj-row">
           <span class="nkd-obj-tag">Mirror</span>
           <button v-for="ax in (['X', 'Y', 'Z'] as const)" :key="ax" class="nkd-gizmo"
@@ -4643,8 +4685,11 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <DragNumber :model-value="objScale" :step="0.005" :min="0.001" :decimals="3" :reset-to="1" @update:model-value="(v: number) => { objScale = v; applyObjectTransform() }" />
         </div>
       </div>
+      </div>
     </div>
-    <div v-if="lightPanelOpen" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+    <div v-if="lightPanelOpen" class="nkd-card" @pointerdown.stop @wheel.stop>
+      <div class="nkd-cardhead"><i class="pi pi-sun" />Light</div>
+      <div class="nkd-panel nkd-panel-col">
       <div class="nkd-light-main">
       <div class="nkd-sphere-box">
         <canvas ref="sphereCv" width="92" height="92" class="nkd-sphere" @pointerdown="onSphereDown" />
@@ -4681,7 +4726,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         <div v-for="(l, i) in lights" :key="l.id" class="nkd-light-item">
           <div class="nkd-obj-row">
             <button class="nkd-gizmo" :class="{ on: selectedLightId === l.id }" @click="selectLight(l.id)">Fill {{ i + 1 }}</button>
-            <button class="nkd-obj-reset" @click="removeLight(l.id)" title="Delete light">✕</button>
+            <button class="nkd-obj-reset" @click="removeLight(l.id)" title="Delete light"><i class="pi pi-times" /></button>
           </div>
           <template v-if="selectedLightId === l.id">
             <div class="nkd-obj-row">
@@ -4689,14 +4734,14 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
               <DragNumber :model-value="l.x" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.x = v; applyLightCfg(l) }" />
               <DragNumber :model-value="l.y" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.y = v; applyLightCfg(l) }" />
               <DragNumber :model-value="l.z" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.z = v; applyLightCfg(l) }" />
-              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoLightId === l.id }" @click="gizmoLight(l.id)" title="Move light in the viewport">⤢</button>
+              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoLightId === l.id }" @click="gizmoLight(l.id)" title="Move light in the viewport"><i class="pi pi-arrows-alt" /></button>
             </div>
             <div class="nkd-obj-row">
               <span class="nkd-obj-tag">Aim</span>
               <DragNumber :model-value="l.tx" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.tx = v; applyLightCfg(l) }" />
               <DragNumber :model-value="l.ty" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.ty = v; applyLightCfg(l) }" />
               <DragNumber :model-value="l.tz" :step="0.05" :reset-to="0" @update:model-value="(v: number) => { l.tz = v; applyLightCfg(l) }" />
-              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoTargetId === l.id }" @click="gizmoLightTarget(l.id)" title="Move aim target in the viewport">⤢</button>
+              <button class="nkd-gizmo nkd-gizmo-icon" :class="{ on: gizmoTargetId === l.id }" @click="gizmoLightTarget(l.id)" title="Move aim target in the viewport"><i class="pi pi-arrows-alt" /></button>
             </div>
             <div class="nkd-sliders">
               <label>Int<input type="range" min="0" max="150" step="1" v-model.number="l.intensity" @input="applyLightCfg(l)"><span>{{ l.intensity.toFixed(0) }}</span></label>
@@ -4710,8 +4755,15 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           </template>
         </div>
       </div>
+      </div>
     </div>
-    <div v-if="depthPanelOpen" class="nkd-panel nkd-panel-col" @pointerdown.stop @wheel.stop>
+    <div v-if="depthPanelOpen" class="nkd-card" @pointerdown.stop @wheel.stop>
+      <div class="nkd-cardhead"><i class="pi pi-sliders-h" />Depth
+        <button class="nkd-cardbtn" :class="{ on: autoZ }" @click="toggleAutoZ" :title="hasSceneDepth
+          ? 'Keep the range fitted to the injected map against the fSpy ground plane, re-fitting as the camera moves. Off freezes the last fit.'
+          : 'Keep the range fitted to the object\'s own distance span, re-fitting as the camera moves. Off freezes the last fit.'">Auto Z</button>
+      </div>
+      <div class="nkd-panel nkd-panel-col">
       <div class="nkd-obj-row">
         <span class="nkd-obj-tag">{{ autoZ ? 'Offset' : 'Range' }}</span>
         <label class="nkd-barfield" :title="autoZ
@@ -4726,9 +4778,6 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           <DragNumber :model-value="autoZ ? farOff : dFarUI" :step="0.1" :min="autoZ ? -1e6 : 0.03"
                       :reset-to="autoZ ? 0 : null" @update:model-value="setDepthFar" />
         </label>
-        <button class="nkd-gizmo" :class="{ on: autoZ }" @click="toggleAutoZ" :title="hasSceneDepth
-          ? 'Keep the range fitted to the injected map against the fSpy ground plane, re-fitting as the camera moves. Off freezes the last fit.'
-          : 'Keep the range fitted to the object\'s own distance span, re-fitting as the camera moves. Off freezes the last fit.'">Auto Z</button>
       </div>
       <div class="nkd-obj-row nkd-obj-wrap">
         <label class="nkd-check" title="Show the depth pass itself in the viewport — the exact render the depth output gets">
@@ -4759,8 +4808,11 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         <span v-if="rangeHint" class="nkd-depth-warn">{{ rangeHint }}</span>
         <span v-else-if="!hasSceneDepth && !depthManual && !autoZ">auto-fit to model — Near/Far unused</span>
       </div>
+      </div>
     </div>
-    <div v-if="occludePanelOpen" class="nkd-panel" @pointerdown.stop @wheel.stop>
+    <div v-if="occludePanelOpen" class="nkd-card" @pointerdown.stop @wheel.stop>
+      <div class="nkd-cardhead"><i class="pi pi-clone" />Occlude</div>
+      <div class="nkd-panel">
       <div class="nkd-sliders">
         <div class="nkd-subhead">Scene — the photo's depth hides the object</div>
         <span v-if="!hasSceneDepth" class="nkd-depth-warn">connect scene_depth to use it</span>
@@ -4774,155 +4826,214 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         <label title="Near end of the band. 1 is the object's nearest point, 0 its farthest">Near<input type="range" min="0" max="1" step="0.01" data-default="1" v-model.number="sliceNear" @change="notifyStateChanged()"><span>{{ sliceNear.toFixed(2) }}</span></label>
         <label title="Far end of the band. Near 1 / Far 0 keeps the whole silhouette; 1 / 0.5 only its front half">Far<input type="range" min="0" max="1" step="0.01" data-default="0" v-model.number="sliceFar" @change="notifyStateChanged()"><span>{{ sliceFar.toFixed(2) }}</span></label>
       </div>
+      </div>
+    </div>
+    <div class="nkd-card" @pointerdown.stop>
+      <div class="nkd-cardhead"><i class="pi pi-image" />Scene</div>
+      <div class="nkd-panel">
+        <div class="nkd-obj-row">
+          <span class="nkd-obj-tag">Backdrop</span>
+          <input type="color" class="nkd-color" :value="bgColor"
+                 @input="setBgColor(($event.target as HTMLInputElement).value)"
+                 title="Backdrop colour, exported in the image output — it is what shows through the holes of a mesh with alpha (MoGe, DA3). A wired bg_image covers it.">
+          <span class="nkd-obj-hint">exported behind the model</span>
+        </div>
+      </div>
     </div>
     </div>
-    <div class="nkd-viewwrap" ref="viewWrap">
-    <!-- The view controls used to float over the canvas. Framing a shot with a strip of
-         buttons across the top of the picture is confusing, so they sit on their own
-         solid row: what the camera sees is the whole box below. -->
-    <div class="nkd-tools" ref="toolsRow">
-      <div class="nkd-overlay" @pointerdown.stop>
-        <!-- PrimeIcons, not emoji: ComfyUI already ships the font, so these are
-             monochrome, inherit the button colour and match the host UI. A colour
-             emoji ignores `color` and reads as a sticker next to the others. -->
-        <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid">
-          <i class="pi pi-th-large" />
-        </button>
-        <button :class="{ on: floorClip }" @click="setFloorClip(!floorClip); notifyStateChanged()"
-                :title="floorClip ? 'The floor hides what goes through it. Click to show the whole object.'
-                                  : 'The whole object shows through the floor. Click to let the floor hide it.'">
-          <i class="pi pi-minus"></i>
-        </button>
-        <button v-if="hasBgImage" :class="{ on: showBg }" @click="toggleBg"
-                :title="showBg
-                  ? 'Backdrop image shown — click to hide it here AND in the export; its colours keep lighting the model'
-                  : 'Backdrop image hidden (viewport and export) — it still lights the model. Click to show it'">
-          <i :class="showBg ? 'pi pi-image' : 'pi pi-eye-slash'" />
-        </button>
-        <button :disabled="camLocked" @click="frameModel"
-                :title="camLocked ? 'Camera locked — unlock to reframe' : 'Frame model'">
-          <i class="pi pi-expand" />
-        </button>
-        <button :class="{ on: camLocked }" @click="toggleCamLock"
-                :title="camLocked
-                  ? (hasCamera ? 'Camera locked to the solved camera — click to orbit freely'
-                               : 'Camera locked — click to orbit freely')
-                  : 'Camera free — click to lock it'">
-          <i :class="camLocked ? 'pi pi-lock' : 'pi pi-lock-open'" />
-        </button>
-        <button :class="{ on: pinMode }" @click="togglePins"
-                title="Match perspective: click the model to pin a point and drag it to its place in the image. The object stays still and the camera moves. Shift drags finer, right-click on a pin deletes it, right-drag orbits. While there are pins a wired camera is only the starting point.">
-          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M1 6h14M8 6 1 2M8 6 1 14M8 6l7-4M8 6l7 8" /><circle cx="8" cy="6" r="1.6" fill="currentColor" stroke="none" /></svg>
-        </button>
-        <template v-if="pinMode">
-          <button :class="{ on: pinLens }" @click="pinLens = !pinLens; notifyStateChanged()"
-                  :title="`Solve the lens too, from ${PIN_MIN_FOR_LENS} pins on. Off keeps the current focal length.`">
-            <i class="pi pi-camera" />
-          </button>
-          <button :disabled="!pins.length" @click="clearPins" title="Remove every pin. The camera stays where it is.">
-            <i class="pi pi-times" />
-          </button>
-          <button :class="{ on: ghostView }" @click="ghostView = !ghostView; notifyStateChanged()"
-                  title="Ghost view: the object see-through with its contours in yellow (outline, parts covering parts, sharp turns), so you can lay its edges on the photo's. Only while pinning; it never reaches the outputs.">
-            <i class="pi pi-clone" />
-          </button>
-          <template v-if="ghostView">
-            <button :class="{ on: ghostBack && !modelIsSplatRef }" :disabled="modelIsSplatRef" @click="ghostBack = !ghostBack; notifyStateChanged()"
-                    :title="modelIsSplatRef ? 'Hidden contours need a surface to see through: splats have none.' : 'Hidden contours: the edges behind the visible surface, dashed in blue.'">
-              <i class="pi pi-eye" />
-            </button>
-            <label class="nkd-ghostfield" title="How much of the object shows through.">Opacity
-              <input type="range" min="0" max="1" step="0.05" data-default="0.35" v-model.number="ghostOpacity" @change="notifyStateChanged()">
-            </label>
-            <label class="nkd-ghostfield" title="Which contours get a line. Low keeps the outline and the strong edges; high adds the subtle turns of the surface. Splats only have outlines and depth steps: they carry no surface to show a crease.">Detail
-              <input type="range" min="0" max="1" step="0.05" data-default="0.5" v-model.number="ghostDetail" @change="notifyStateChanged()">
-            </label>
-          </template>
+    <!-- Popped out this is the stage: the export frame is fitted into it LESS the margins below
+         (resize() subtracts the same FRAME_MARGIN), so the rulers and the floating groups sit
+         around the picture and never on it — what the camera sees is the whole frame. -->
+    <div class="nkd-viewwrap" ref="viewWrap" :style="popped ? stagePad : undefined">
+      <div class="nkd-framebox" :style="popped && fitW ? { width: fitW + 'px', height: fitH + 'px' } : undefined">
+        <div
+          ref="host"
+          class="nkd-view"
+          :style="{ aspectRatio: `${aspect.w} / ${aspect.h}` }"
+          @contextmenu.prevent.stop
+          @pointerenter="onViewEnter"
+          @pointerleave="onViewLeave"
+          @pointerdown.capture="onBrushDown"
+          @pointermove.capture="onBrushMove"
+          @pointerup.capture="onBrushUp"
+          @pointercancel.capture="onBrushUp"
+          :class="{ 'nkd-painting': maskPaint || pinMode }"
+        >
+          <canvas ref="pinCanvas" class="nkd-pins" />
+        </div>
+        <!-- Everything below is a SIBLING of .nkd-view, never a child: its capture-phase brush,
+             crop and pin handlers would take the pointer first. -->
+        <template v-if="popped">
+          <EdgeRuler class="nkd-at-left" vertical side="left" name="Lens" :value="focal" :scale="LENS_RULER"
+                     :text="focal.toFixed(1) + ' mm'" :reset-to="defaultFocal" @input="setFocal"
+                     :title="hasCamera
+                       ? 'Focal length, 35mm-equivalent. A solved camera drives this — the next run puts its lens back.'
+                       : 'Focal length in 35mm-equivalent mm (full-frame 36mm back), the same figure the fSpy node solves. Short = wide and exaggerated, long = compressed.'" />
+          <EdgeRuler class="nkd-at-right" vertical side="right" name="Dolly" :value="dolly" :scale="DOLLY_RULER"
+                     :text="dolly.toFixed(2)" :precision="4" :disabled="camLocked" @input="setDolly"
+                     :title="camLocked ? 'Camera locked — unlock to move it'
+                                       : 'Distance from the camera to the point it orbits, in scene units. Drag up to pull back, down to move in.'" />
+          <EdgeRuler class="nkd-at-bottom" name="Roll" :value="roll" :scale="ROLL_RULER"
+                     :text="roll.toFixed(1) + '°'" :reset-to="0" @input="applyRoll"
+                     title="Camera roll (dutch angle), in degrees. Tilts the horizon; orbiting keeps it." />
         </template>
-        <!-- Gizmo controls, mirrored from the Object panel: same call, same toggle-off, one state.
-             Reaching them without opening a panel is the point — the panel covers the model.
-             Left to right they follow the KEYS: Q W E R. -->
-        <span class="nkd-ovsep" />
-        <button :class="{ on: gizmoSpace === 'local' }" @click="toggleGizmoSpace"
-                :title="(gizmoSpace === 'world'
-                  ? 'Gizmo axes: WORLD — click for the object\'s own axes'
-                  : 'Gizmo axes: LOCAL, the object\'s own — click for world axes')
-                  + ' — Q (hover the viewport). Does not affect Scale: three always orients scale to the object.'">
-          <i :class="gizmoSpace === 'world' ? 'pi pi-globe' : 'pi pi-box'" />
-        </button>
-        <!-- Saved viewpoints. Working on a matched perspective and needing another angle to
-             move something is the case this exists for: park the view, go, come back. -->
-        <span class="nkd-ovsep" />
-        <button v-for="(slot, i) in camSlots" :key="i" class="nkd-camslot" :class="{ on: !!slot }"
-                :title="slot
-                  ? `Camera ${i + 1} — click to go back to it, Shift+click to overwrite with the current view`
-                  : `Camera ${i + 1} is empty — click to save the current view here`"
-                @click="$event.shiftKey ? saveCamSlot(i) : recallCamSlot(i)">{{ i + 1 }}</button>
-        <span class="nkd-ovsep" />
-        <button :class="{ on: gizmoMode === 'translate' }" title="Move gizmo — W (hover the viewport)"
-                @click="toggleGizmoMode('translate')">
-          <i class="pi pi-arrows-alt" />
-        </button>
-        <button :class="{ on: gizmoMode === 'rotate' }" title="Rotate gizmo — E (hover the viewport)"
-                @click="toggleGizmoMode('rotate')">
-          <i class="pi pi-refresh" />
-        </button>
-        <button :class="{ on: gizmoMode === 'scale' }" title="Scale gizmo — R (hover the viewport)"
-                @click="toggleGizmoMode('scale')">
-          <i class="pi pi-arrow-up-right-and-arrow-down-left-from-center" />
+        <button v-else class="nkd-open" @pointerdown.stop @click="emit('popout')"
+                title="Open the viewer: every control lives there. Same scene, nothing reloads.">
+          <i class="pi pi-window-maximize" /><span>Open Viewer</span>
         </button>
       </div>
-      <div class="nkd-overlay" @pointerdown.stop>
-        <span class="nkd-ovsep" />
-        <button :class="{ on: maskPaint }" @click="toggleMaskPaint" :disabled="modelIsSplat"
-                title="Paint a 3D mask on the model: where an inpaint may touch. Left drag paints, Alt or right-drag erases, right drag orbits. Exported as paint_mask (this view) and mask3d (for the bake).">
-          <i class="pi pi-pencil" />
-        </button>
-        <template v-if="maskPaint">
-          <input class="nkd-brush" type="range" min="4" max="200" step="1" v-model.number="brushRadius"
-                 :title="`Brush radius: ${brushRadius}px`" />
-          <button :disabled="!maskHasPaint" @click="clearMask" title="Clear the 3D mask">
-            <i class="pi pi-times" />
+
+      <template v-if="popped">
+        <span v-if="status" class="nkd-status nkd-at-status">{{ status }}</span>
+
+        <!-- Left: tools that act on the OBJECT. Top to bottom the first four follow the KEYS: Q W E R. -->
+        <div class="nkd-float nkd-col nkd-at-l" @pointerdown.stop>
+          <button :class="{ on: gizmoSpace === 'local' }" @click="toggleGizmoSpace"
+                  :title="(gizmoSpace === 'world'
+                    ? 'Gizmo axes: WORLD — click for the object\'s own axes'
+                    : 'Gizmo axes: LOCAL, the object\'s own — click for world axes')
+                    + ' — Q. Does not affect Scale: three always orients scale to the object.'">
+            <i :class="gizmoSpace === 'world' ? 'pi pi-globe' : 'pi pi-box'" />
           </button>
-        </template>
-        <span class="nkd-ovsep" />
-        <button :class="{ on: cropOn }" @click="toggleCrop"
-                title="Crop volume: keep only what is inside the box and hide the rest. Monocular scene models (MoGe, SHARP) throw their background out towards infinity, so the bounding box is enormous and Frame model is useless; cut it away and the framing has something sane to measure. Drag the dots on each face to pull that face in, or shape the box with W move, E rotate and R scale. Changes the rendered outputs, not the geometry on the model output.">
-          <i class="pi pi-eraser" />
-        </button>
-        <template v-if="cropOn">
-          <button @click="fitCrop" title="Box back to the whole model, upright: the starting point to shrink">
+          <button :class="{ on: gizmoMode === 'translate' }" title="Move gizmo — W. Hold Alt to move the origin without the object."
+                  @click="toggleGizmoMode('translate')"><i class="pi pi-arrows-alt" /></button>
+          <button :class="{ on: gizmoMode === 'rotate' }" title="Rotate gizmo — E. Hold Alt to turn the origin without the object."
+                  @click="toggleGizmoMode('rotate')"><i class="pi pi-refresh" /></button>
+          <button :class="{ on: gizmoMode === 'scale' }" title="Scale gizmo — R"
+                  @click="toggleGizmoMode('scale')"><i class="pi pi-arrow-up-right-and-arrow-down-left-from-center" /></button>
+          <span class="nkd-sep" />
+          <button :class="{ on: maskPaint }" @click="toggleMaskPaint" :disabled="modelIsSplat"
+                  title="Paint a 3D mask on the model: where an inpaint may touch. Left drag paints, Alt or right-drag erases, right drag orbits. Exported as paint_mask (this view) and mask3d (for the bake).">
+            <i class="pi pi-pencil" />
+          </button>
+          <button :class="{ on: cropOn }" @click="toggleCrop"
+                  title="Crop volume: keep only what is inside the box and hide the rest. Monocular scene models (MoGe, SHARP) throw their background out towards infinity, so the bounding box is enormous and Frame model is useless; cut it away and the framing has something sane to measure. Drag the dots on each face to pull that face in, or shape the box with W move, E rotate and R scale. Changes the rendered outputs, not the geometry on the model output.">
+            <i class="pi pi-eraser" />
+          </button>
+          <button :class="{ on: pinMode }" @click="togglePins"
+                  title="Match perspective: click the model to pin a point and drag it to its place in the image. The object stays still and the camera moves. Shift drags finer, right-click on a pin deletes it, right-drag orbits. While there are pins a wired camera is only the starting point.">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M1 6h14M8 6 1 2M8 6 1 14M8 6l7-4M8 6l7 8" /><circle cx="8" cy="6" r="1.6" fill="currentColor" stroke="none" /></svg>
+          </button>
+          <span class="nkd-sep" />
+          <button @click="fitToGround"
+                  title="Fit to ground: normalise the scale and drop the model's floor centre on the origin.">
+            <i class="pi pi-home" />
+          </button>
+        </div>
+
+        <!-- The active tool's own options, next to the column that switched it on. -->
+        <div v-if="maskPaint || cropOn || pinMode" class="nkd-float nkd-at-bl" @pointerdown.stop>
+          <template v-if="maskPaint">
+            <label class="nkd-ghostfield" :title="`Brush radius: ${brushRadius}px`">Brush
+              <input class="nkd-brush" type="range" min="4" max="200" step="1" v-model.number="brushRadius" />
+            </label>
+            <button :disabled="!maskHasPaint" @click="clearMask" title="Clear the 3D mask"><i class="pi pi-times" /></button>
+          </template>
+          <template v-if="cropOn">
+            <button @click="fitCrop" title="Box back to the whole model, upright: the starting point to shrink">
+              <i class="pi pi-expand" />
+            </button>
+            <button @click="resetCropRotation" title="Straighten the box back to the model's axes, leaving it where it is">
+              <i class="pi pi-undo" />
+            </button>
+          </template>
+          <template v-if="pinMode">
+            <button :class="{ on: pinLens }" @click="pinLens = !pinLens; notifyStateChanged()"
+                    :title="`Solve the lens too, from ${PIN_MIN_FOR_LENS} pins on. Off keeps the current focal length.`">
+              <i class="pi pi-camera" />
+            </button>
+            <button :disabled="!pins.length" @click="clearPins" title="Remove every pin. The camera stays where it is.">
+              <i class="pi pi-times" />
+            </button>
+            <button :class="{ on: ghostView }" @click="ghostView = !ghostView; notifyStateChanged()"
+                    title="Ghost view: the object see-through with its contours in yellow (outline, parts covering parts, sharp turns), so you can lay its edges on the photo's. Only while pinning; it never reaches the outputs.">
+              <i class="pi pi-clone" />
+            </button>
+            <template v-if="ghostView">
+              <button :class="{ on: ghostBack && !modelIsSplatRef }" :disabled="modelIsSplatRef" @click="ghostBack = !ghostBack; notifyStateChanged()"
+                      :title="modelIsSplatRef ? 'Hidden contours need a surface to see through: splats have none.' : 'Hidden contours: the edges behind the visible surface, dashed in blue.'">
+                <i class="pi pi-eye" />
+              </button>
+              <label class="nkd-ghostfield" title="How much of the object shows through.">Opacity
+                <input type="range" min="0" max="1" step="0.05" data-default="0.35" v-model.number="ghostOpacity" @change="notifyStateChanged()">
+              </label>
+              <label class="nkd-ghostfield" title="Which contours get a line. Low keeps the outline and the strong edges; high adds the subtle turns of the surface. Splats only have outlines and depth steps: they carry no surface to show a crease.">Detail
+                <input type="range" min="0" max="1" step="0.05" data-default="0.5" v-model.number="ghostDetail" @change="notifyStateChanged()">
+              </label>
+            </template>
+          </template>
+        </div>
+
+        <!-- Right: what changes how the scene is SHOWN, and the saved viewpoints. -->
+        <div class="nkd-float nkd-col nkd-at-r" @pointerdown.stop>
+          <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid"><i class="pi pi-th-large" /></button>
+          <button :class="{ on: floorClip }" @click="setFloorClip(!floorClip); notifyStateChanged()"
+                  :title="floorClip ? 'The floor hides what goes through it. Click to show the whole object.'
+                                    : 'The whole object shows through the floor. Click to let the floor hide it.'">
+            <i class="pi pi-minus" />
+          </button>
+          <button v-if="hasBgImage" :class="{ on: showBg }" @click="toggleBg"
+                  :title="showBg
+                    ? 'Backdrop image shown — click to hide it here AND in the export; its colours keep lighting the model'
+                    : 'Backdrop image hidden (viewport and export) — it still lights the model. Click to show it'">
+            <i :class="showBg ? 'pi pi-image' : 'pi pi-eye-slash'" />
+          </button>
+          <span class="nkd-sep" />
+          <!-- Saved viewpoints. Working on a matched perspective and needing another angle to
+               move something is the case this exists for: park the view, go, come back. -->
+          <button v-for="(slot, i) in camSlots" :key="i" class="nkd-camslot" :class="{ on: !!slot }"
+                  :title="slot
+                    ? `Camera ${i + 1} — click to go back to it, Shift+click to overwrite with the current view`
+                    : `Camera ${i + 1} is empty — click to save the current view here`"
+                  @click="$event.shiftKey ? saveCamSlot(i) : recallCamSlot(i)">{{ i + 1 }}</button>
+          <span class="nkd-sep" />
+          <button :class="{ on: helpOpen }" @click="helpOpen = !helpOpen" title="Shortcuts — ?">
+            <i class="pi pi-question" />
+          </button>
+        </div>
+
+        <!-- Bottom right: the camera. The lens stays typeable here — a ruler is for feel, and
+             matching a plate shot on a 24mm wants the exact number. -->
+        <div class="nkd-float nkd-at-br" @pointerdown.stop>
+          <label class="nkd-barfield" title="Focal length in 35mm-equivalent mm. Drag to scrub, click to type.">
+            <DragNumber :model-value="focal" :step="0.5" :min="2" :max="2000" :decimals="1"
+                        :reset-to="defaultFocal" @update:model-value="setFocal" />mm
+          </label>
+          <span class="nkd-sep" />
+          <button :disabled="camLocked" @click="frameModel"
+                  :title="camLocked ? 'Camera locked — unlock to reframe' : 'Frame model'">
             <i class="pi pi-expand" />
           </button>
-          <button @click="resetCropRotation" title="Straighten the box back to the model's axes, leaving it where it is">
-            <i class="pi pi-undo" />
+          <button :class="{ on: camLocked }" @click="toggleCamLock"
+                  :title="camLocked
+                    ? (hasCamera ? 'Camera locked to the solved camera — click to orbit freely'
+                                 : 'Camera locked — click to orbit freely')
+                    : 'Camera free — click to lock it'">
+            <i :class="camLocked ? 'pi pi-lock' : 'pi pi-lock-open'" />
           </button>
-        </template>
+        </div>
+
+        <div v-if="helpOpen" class="nkd-help" @pointerdown.stop @wheel.stop>
+          <div class="nkd-help-head"><b>Shortcuts</b>
+            <span><kbd>?</kbd> or <kbd>Esc</kbd> to close</span></div>
+          <div class="nkd-help-cols">
+            <section v-for="[title, rows] in SHORTCUTS" :key="title">
+              <h4>{{ title }}</h4>
+              <div v-for="[what, keys, note] in rows" :key="what" class="nkd-help-row">
+                <span>{{ what }}</span>
+                <span class="nkd-help-keys">
+                  <template v-for="(k, i) in keys" :key="k"><i v-if="i">+</i><kbd>{{ k }}</kbd></template>
+                  <em v-if="note">{{ note }}</em>
+                </span>
+              </div>
+            </section>
+          </div>
+        </div>
+      </template>
+      <div v-else class="nkd-nodeline">
+        <span><i class="pi pi-camera" />{{ status || nodeLine }}</span>
+        <b>{{ aspect.w }} × {{ aspect.h }}</b>
       </div>
-      <div class="nkd-overlay nkd-overlay-r" @pointerdown.stop>
-        <button v-if="!popped" @click="emit('popout')"
-                title="Open in a large viewer — same scene, nothing reloads">
-          <i class="pi pi-window-maximize" />
-        </button>
-      </div>
-    </div>
-    <div
-      ref="host"
-      class="nkd-view"
-      :style="popped && fitW
-        ? { aspectRatio: `${aspect.w} / ${aspect.h}`, width: fitW + 'px', height: fitH + 'px' }
-        : { aspectRatio: `${aspect.w} / ${aspect.h}` }"
-      @contextmenu.prevent.stop
-      @pointerenter="onViewEnter"
-      @pointerleave="onViewLeave"
-      @pointerdown.capture="onBrushDown"
-      @pointermove.capture="onBrushMove"
-      @pointerup.capture="onBrushUp"
-      @pointercancel.capture="onBrushUp"
-      :class="{ 'nkd-painting': maskPaint || pinMode }"
-    >
-      <canvas ref="pinCanvas" class="nkd-pins" />
-    </div>
     </div>
   </div>
 </template>
@@ -4933,21 +5044,8 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
    depend on the host chain handing a height down — the link that breaks in the wild. */
 .nkd-p3d:focus { outline: none; }
 .nkd-p3d { display: flex; flex-direction: column; width: 100%;
-  box-sizing: border-box; border: 1px solid #2a2d36; border-radius: 6px; overflow: hidden; }
+  box-sizing: border-box; border: 1px solid #2a2d36; border-radius: 8px; overflow: hidden; }
 .nkd-p3d, .nkd-p3d *, .nkd-p3d *::before, .nkd-p3d *::after { box-sizing: border-box; }
-.nkd-bar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 5px 6px;
-  background: #1a1c22; border-bottom: 1px solid #3a3d46; flex: 0 0 auto;
-}
-.nkd-bar button {
-  background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
-  color: #c8d0e0; font-size: 11px; padding: 3px 9px; cursor: pointer;
-  white-space: nowrap; flex: 0 0 auto;
-}
-.nkd-bar button:hover { border-color: #4ab4ff; }
-.nkd-bar button.on { border-color: #4ab4ff; color: #4ab4ff; }
-.nkd-status { color: #ffd166; font-size: 10px; margin-left: auto;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nkd-panel {
   display: flex; align-items: center; gap: 10px;
   padding: 6px; background: #1a1c22; border-bottom: 1px solid #3a3d46; flex: 0 0 auto;
@@ -4971,9 +5069,6 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-obj-row { display: flex; align-items: center; gap: 5px; }
 .nkd-obj-tag { color: rgba(255, 255, 255, 0.45); font-size: 10px; flex: 0 0 34px; }
 .nkd-obj-hint { color: rgba(255, 255, 255, 0.35); font-size: 9px; white-space: nowrap; }
-/* Slots carry a digit, not an icon. Specificity has to match `.nkd-overlay button`, which sets
-   font-size for the glyphs — a bare `.nkd-camslot` would lose to it and leave a 13px digit. */
-.nkd-overlay button.nkd-camslot { font-family: system-ui, sans-serif; font-size: 10px; font-weight: 600; }
 .nkd-obj-row select {
   flex: 1 1 0; min-width: 0; width: 0;
   background: #252830; border: 1px solid #3a3d46; border-radius: 4px;
@@ -5036,60 +5131,169 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
    layout: a first frame sized 1x1 before the element has a width renders a giant square. */
 .nkd-view { position: relative; width: 100%; flex: 0 0 auto; overflow: hidden; background: #111318; font-size: 0; }
 .nkd-pins { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
-
-/* ── Popped out: viewport left, every panel stacked in a sidebar on the right ──────────
-   A grid rather than a row, so the DOM order (bar → panels → view) that the node layout
-   depends on can stay exactly as it is while the pieces land in different cells. */
-.nkd-popped {
-  display: grid; height: 100%; min-height: 0;
-  grid-template-columns: minmax(0, 1fr) 300px;
-  grid-template-rows: auto minmax(0, 1fr);
-}
-/* Everything that is not the picture lives in the right column: the bar on top of the panels,
-   and the viewport spanning both rows so it gets the modal's full height. */
-.nkd-popped .nkd-bar {
-  grid-column: 2; grid-row: 1;
-  border-left: 1px solid #3a3d46; border-bottom: 1px solid #3a3d46;
-}
-.nkd-popped .nkd-side {
-  grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto;
-  background: #1a1c22; border-left: 1px solid #3a3d46;
-}
-.nkd-popped .nkd-viewwrap {
-  grid-column: 1; grid-row: 1 / span 2; min-width: 0; min-height: 0;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-}
-.nkd-popped .nkd-tools { align-self: stretch; }
-/* The status has no room to push to the far edge in a 300px column. */
-.nkd-popped .nkd-status { margin-left: 0; flex: 1 1 100%; }
-/* The panels are dividers in a column now, not a strip above the canvas. */
-.nkd-popped .nkd-side .nkd-panel { border-bottom: 1px solid #2a2d36; }
-.nkd-popped .nkd-side .nkd-panel:last-child { border-bottom: none; }
 .nkd-view :deep(canvas) { width: 100%; height: 100%; display: block; }
-/* In-viewer controls: grid toggle + frame, kept out of the tab bar so it stays panel-only. */
-.nkd-tools {
-  display: flex; align-items: center; gap: 4px; padding: 4px 6px; flex: 0 0 auto;
-  background: #1a1c22; border-bottom: 1px solid #3a3d46;
-}
-.nkd-overlay { display: flex; gap: 4px; align-items: center; }
 .nkd-brush { width: 72px; height: 14px; margin: 0 2px; accent-color: #4ab4ff; }
 .nkd-view.nkd-painting { cursor: crosshair; }
 .nkd-ghostfield { display: flex; align-items: center; gap: 3px; font-size: 10px; color: #8a93a6; }
 .nkd-ghostfield input { width: 56px; height: 14px; margin: 0; accent-color: #ffd900; }
-/* Pop-out sits opposite the view controls: it acts on the WINDOW, not on the scene. */
-.nkd-overlay-r { margin-left: auto; }
-.nkd-ovsep { width: 1px; align-self: stretch; background: #3a3d46; margin: 0 2px; flex: 0 0 auto; }
-.nkd-overlay button {
-  width: 24px; height: 24px; padding: 0; font-size: 13px; line-height: 1;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(26, 28, 34, 0.72); border: 1px solid rgba(90, 100, 120, 0.5);
-  border-radius: 4px; color: #c8d0e0; cursor: pointer;
+
+/* ── The look: floating parts are round, borderless and 86% opaque, sitting around the frame.
+   Shape language after nomadoor's Panorama Studio (MIT); colours are this pack's own. ── */
+.nkd-viewwrap { position: relative; display: flex; flex-direction: column; }
+.nkd-framebox { position: relative; width: 100%; flex: 0 0 auto; }
+.nkd-status { color: #ffd166; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* On the node: the pill over the picture's bottom centre, one status line under it. */
+.nkd-open {
+  position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 3;
+  height: 30px; padding: 0 14px 0 11px; border: 0; border-radius: 999px;
+  background: rgba(26, 28, 34, 0.86); color: #e6eaf2; cursor: pointer; white-space: nowrap;
+  font: 600 12px/1 system-ui, sans-serif; display: inline-flex; align-items: center; gap: 7px;
+  transition: background-color 120ms;
 }
-.nkd-overlay button:hover { border-color: #4ab4ff; color: #4ab4ff; }
-.nkd-overlay button.on { border-color: #4ab4ff; color: #4ab4ff; }
-.nkd-overlay button:disabled { opacity: 0.3; cursor: not-allowed; }
-.nkd-overlay button:disabled:hover { border-color: #3a3d46; color: inherit; }
-/* PrimeIcons glyphs: size them here so the button box stays 24px whatever the
-   host's base font is, and let them inherit the button's colour on hover/on. */
-.nkd-overlay button .pi { font-size: 12px; line-height: 1; color: inherit; }
+.nkd-open:hover { background: rgba(58, 62, 74, 0.92); color: #fff; }
+.nkd-open .pi { font-size: 12px; }
+/* A narrow node keeps the button and drops its label. */
+@container (max-width: 190px) { .nkd-open { width: 30px; padding: 0; justify-content: center; } .nkd-open span { display: none; } }
+.nkd-viewwrap { container-type: inline-size; }
+.nkd-nodeline {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto;
+  height: 26px; padding: 0 8px; background: #1a1c22; font: 11px/1 system-ui, sans-serif; color: #8a93a6;
+}
+.nkd-nodeline span { display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nkd-nodeline .pi { font-size: 11px; }
+.nkd-nodeline b { flex: none; color: #dcdce0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ── Popped out: stage on the left, every panel as a card in the sidebar on the right ── */
+.nkd-popped {
+  display: grid; height: 100%; min-height: 0; border: 0; border-radius: 0;
+  grid-template-columns: minmax(0, 1fr) 320px; grid-template-rows: minmax(0, 1fr);
+}
+.nkd-popped .nkd-side {
+  grid-column: 2; grid-row: 1; min-height: 0; overflow-y: auto;
+  background: #1a1c22; border-left: 1px solid #2a2d36;
+  padding: 8px; display: flex; flex-direction: column; gap: 8px;
+}
+.nkd-popped .nkd-viewwrap {
+  grid-column: 1; grid-row: 1; min-width: 0; min-height: 0; background: #08090b;
+  align-items: center; justify-content: center; container-type: normal;
+}
+.nkd-popped .nkd-framebox { outline: 1px solid rgba(255, 255, 255, 0.3); }
+.nkd-popped .nkd-view { height: 100%; }
+.nkd-card { background: #202229; border-radius: 12px; flex: 0 0 auto; }
+.nkd-cardhead { display: flex; align-items: center; gap: 7px; padding: 9px 12px 2px;
+  color: #fff; font: 600 12px/1 system-ui, sans-serif; }
+.nkd-cardhead .pi { color: #8a93a6; font-size: 12px; }
+.nkd-cardbtn { margin-left: auto; border: 0; border-radius: 999px; background: #2c2e36; color: #c8d0e0;
+  font-size: 10px; padding: 3px 10px; cursor: pointer; }
+.nkd-cardbtn:hover { background: #3a3d48; color: #fff; }
+.nkd-cardbtn.on, .nkd-cardbtn.on:hover { background: #4ab4ff; color: #0c0d10; }
+
+/* ── Sidebar: one rhythm for every card. a 4/8 grid: 24px fields, 20px slider rows, 4px between rows, 8px between blocks, one label column, 11px type,
+   fields and buttons the same height and shape — so the eye reads down a column, not across
+   five different control sizes. Everything is scoped to .nkd-side: the node has none of it. ── */
+.nkd-side { --row: 24px; --lab: 54px; --fill: #2c2e36; --fill-hi: #3a3d48; --dim: #9aa1b2; --fg: #dcdce0;
+  overflow-x: hidden; font: 11px/1.2 system-ui, sans-serif; }
+.nkd-card .nkd-panel { background: none; border: 0; padding: 10px 12px 12px;
+  flex-direction: column; align-items: stretch; gap: 8px; }
+.nkd-side .nkd-cardhead { padding: 11px 12px 0; font-size: 13px; min-height: 22px; }
+.nkd-side .nkd-cardbtn { height: 22px; padding: 0 12px; font-size: 11px; }
+/* minmax(0, 1fr): an `auto` track sizes to its widest row and pushed the sliders out of the card. */
+.nkd-side .nkd-obj, .nkd-side .nkd-sliders, .nkd-side .nkd-lights { gap: 4px; grid-template-columns: minmax(0, 1fr); }
+.nkd-side .nkd-obj-row { gap: 4px; min-height: var(--row); }
+.nkd-side .nkd-obj-tag { flex: 0 0 var(--lab); font-size: 11px; color: var(--dim); }
+.nkd-side .nkd-obj-hint { font-size: 10px; color: #6f7686; white-space: normal; line-height: 1.3; }
+.nkd-side .nkd-panel label { font-size: 11px; color: var(--dim); gap: 6px; min-height: 20px; }
+.nkd-side .nkd-panel label > span { color: var(--fg); min-width: 0; text-align: right; font-variant-numeric: tabular-nums; }
+/* A slider row is label · track · value on the SAME three columns in every card. The bare text
+   node of the label is the first grid item, which is what lines the tracks up. */
+.nkd-side .nkd-sliders > label:not(.nkd-check) {
+  display: grid; grid-template-columns: var(--lab) minmax(0, 1fr) 34px; align-items: center; column-gap: 6px; }
+.nkd-side .nkd-check { gap: 8px; cursor: pointer; }
+.nkd-side input[type='checkbox'] { width: 14px; height: 14px; margin: 0; flex: 0 0 auto; accent-color: #4ab4ff; cursor: pointer; }
+/* Fields, buttons and selects: one height, one fill, no outline until they are being edited. */
+.nkd-side .nkd-obj-row :deep(.nkd-drag), .nkd-side .nkd-barfield :deep(.nkd-drag) {
+  height: var(--row); line-height: calc(var(--row) - 2px); padding: 0 8px; border: 1px solid transparent; border-radius: 6px;
+  background: var(--fill); color: var(--fg); font-size: 11px; font-variant-numeric: tabular-nums; }
+.nkd-side .nkd-obj-row :deep(.nkd-drag:hover), .nkd-side .nkd-barfield :deep(.nkd-drag:hover) { background: var(--fill-hi); border-color: transparent; }
+.nkd-side .nkd-obj-row :deep(.nkd-drag-edit:focus), .nkd-side .nkd-barfield :deep(.nkd-drag-edit:focus) { border-color: #4ab4ff; background: #17181d; }
+.nkd-side :deep(.nkd-drag-reset) { font-size: 9px; right: 5px; color: #6f7686; }
+.nkd-side .nkd-barfield { flex: 1 1 0; min-width: 0; gap: 6px; color: var(--dim); font-size: 11px; }
+.nkd-side .nkd-barfield :deep(.nkd-drag) { flex: 1 1 0; width: auto; min-width: 0; }
+.nkd-side .nkd-gizmo, .nkd-side .nkd-obj-reset, .nkd-side .nkd-obj-row select {
+  height: var(--row); border: 0; border-radius: 6px; background: var(--fill); color: var(--fg); font-size: 11px; padding: 0 8px; }
+.nkd-side .nkd-gizmo:hover, .nkd-side .nkd-obj-reset:hover, .nkd-side .nkd-obj-row select:hover { background: var(--fill-hi); }
+.nkd-side .nkd-gizmo.on { background: #4ab4ff; color: #0c0d10; }
+.nkd-side .nkd-gizmo-icon, .nkd-side .nkd-obj-reset { flex: 0 0 var(--row); width: var(--row); padding: 0; }
+.nkd-side button .pi { font-size: 10px; }
+.nkd-side .nkd-color { width: 34px; height: var(--row); border: 0; border-radius: 6px; background: var(--fill); padding: 2px; }
+/* Sliders: a thin neutral track and a small thumb, instead of the browser's fat blue one. */
+.nkd-side input[type='range'] { -webkit-appearance: none; appearance: none; height: 16px; margin: 0; background: transparent; cursor: pointer; }
+.nkd-side input[type='range']::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: #3a3d48; }
+.nkd-side input[type='range']::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px;
+  border-radius: 50%; background: #c8d0e0; border: 0; }
+.nkd-side input[type='range']:hover::-webkit-slider-thumb { background: #fff; }
+.nkd-side input[type='range']::-moz-range-track { height: 4px; border-radius: 2px; background: #3a3d48; }
+.nkd-side input[type='range']::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #c8d0e0; border: 0; }
+.nkd-side input[type='range']:disabled { opacity: 0.3; cursor: default; }
+/* Light: the direction ball on its own line, the sliders the card's full width under it. */
+.nkd-side .nkd-light-main { flex-direction: column; align-items: stretch; gap: 8px; }
+.nkd-side .nkd-sphere-box { align-self: center; font-size: 10px; gap: 4px; color: var(--dim); }
+.nkd-side .nkd-lights { border-top: 1px solid #2f313a; padding-top: 10px; margin-top: 2px; }
+.nkd-side .nkd-light-item { border: 0; border-radius: 8px; background: #262830; padding: 8px; gap: 4px; }
+/* Depth: the toggles in two even columns rather than a ragged wrapped line. */
+.nkd-side .nkd-obj-wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 8px; }
+.nkd-side .nkd-depth-info { flex-direction: column; align-items: flex-start; gap: 3px; font-size: 10px; color: #6f7686; min-height: 0; }
+.nkd-side .nkd-subhead { font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; color: #6f7686;
+  opacity: 1; border: 0; margin-top: 8px; }
+.nkd-side .nkd-subhead:first-child { margin-top: 0; }
+
+/* Floating groups. */
+.nkd-float { position: absolute; z-index: 3; display: inline-flex; align-items: center; gap: 2px; padding: 5px;
+  background: rgba(26, 28, 34, 0.86); border-radius: 999px; }
+.nkd-float.nkd-col { flex-direction: column; border-radius: 20px; }
+.nkd-float button {
+  width: 30px; height: 30px; padding: 0; border: 0; border-radius: 999px; flex: 0 0 auto;
+  background: transparent; color: #c8d0e0; cursor: pointer; line-height: 1;
+  display: flex; align-items: center; justify-content: center; transition: background-color 120ms;
+}
+.nkd-float button .pi { font-size: 13px; line-height: 1; color: inherit; }
+.nkd-float button:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.nkd-float button.on { background: #4ab4ff; color: #0c0d10; }
+.nkd-float button:disabled { opacity: 0.3; cursor: not-allowed; background: transparent; color: #c8d0e0; }
+/* Slots carry a digit, not an icon. */
+.nkd-float button.nkd-camslot { font: 600 11px/1 system-ui, sans-serif; }
+.nkd-float button.nkd-camslot.on { background: rgba(74, 180, 255, 0.22); color: #4ab4ff; }
+.nkd-sep { width: 16px; height: 1px; background: rgba(255, 255, 255, 0.14); margin: 3px 0; flex: 0 0 auto; }
+.nkd-float:not(.nkd-col) .nkd-sep { width: 1px; height: 16px; margin: 0 3px; }
+.nkd-at-l { left: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-at-r { right: 14px; top: 50%; transform: translateY(-50%); }
+.nkd-at-br { right: 14px; bottom: 14px; padding-left: 12px; }
+.nkd-at-bl { left: 14px; bottom: 14px; padding: 5px 8px; gap: 4px; }
+.nkd-at-status { position: absolute; left: 16px; top: 10px; right: 16px; font-size: 11px; }
+.nkd-float .nkd-barfield { color: #c8d0e0; font-size: 11px; }
+.nkd-float .nkd-barfield :deep(.nkd-drag) { background: transparent; border-color: transparent; color: #fff;
+  font-weight: 600; flex: 0 0 58px; width: 58px; }
+.nkd-float .nkd-barfield :deep(.nkd-drag:hover) { border-color: rgba(255, 255, 255, 0.25); }
+
+/* The rulers ride on the frame's edges, in the stage margins. */
+.nkd-at-left { right: calc(100% + 14px); top: 50%; height: min(240px, calc(100% - 110px)); transform: translateY(-50%); }
+.nkd-at-right { left: calc(100% + 14px); top: 50%; height: min(240px, calc(100% - 110px)); transform: translateY(-50%); }
+.nkd-at-bottom { top: calc(100% + 10px); left: 50%; width: min(320px, calc(100% - 190px)); transform: translateX(-50%); }
+
+/* Shortcuts sheet: over the stage, the right column stays reachable to close it. */
+.nkd-help { position: absolute; z-index: 4; inset: 14px 66px 14px 14px; overflow: auto;
+  background: rgba(27, 28, 30, 0.97); border-radius: 12px; padding: 16px 20px;
+  color: #dcdce0; font: 12px/1.3 system-ui, sans-serif; }
+.nkd-help-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; color: #8e8f93; }
+.nkd-help-head b { color: #fff; font-size: 15px; font-weight: 600; }
+.nkd-help-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px 40px; }
+.nkd-help h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
+.nkd-help-row { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 6px 0; border-top: 1px solid #2a2b2d; }
+.nkd-help-keys { display: inline-flex; align-items: center; gap: 5px; color: #8e8f93; white-space: nowrap; }
+.nkd-help-keys i, .nkd-help-keys em { font-style: normal; }
+.nkd-help kbd { font: 600 11px/1 system-ui, sans-serif; color: #dcdce0; background: #2c2c2e;
+  border-radius: 5px; padding: 4px 7px; min-width: 22px; text-align: center; display: inline-block; }
 </style>
