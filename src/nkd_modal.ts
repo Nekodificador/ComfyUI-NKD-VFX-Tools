@@ -230,6 +230,10 @@ const CSS = `
 .nkd-ui-range::-moz-range-progress { height: 4px; border-radius: 2px; background: #7f8aa3; }
 .nkd-ui-range::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #c8d0e0; border: 0; }
 .nkd-ui-range:disabled { opacity: 0.3; cursor: default; }
+/* A slider inside a floating bar: label, track, value in a line. */
+.nkd-ui-barfield { display: inline-flex; align-items: center; gap: 8px; padding: 0 6px; color: #9aa1b2; white-space: nowrap; }
+.nkd-ui-barfield > span:last-child:not(:first-child) { color: #dcdce0; font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
+.nkd-ui-barfield .nkd-ui-range { width: 140px; }
 
 /* Shortcuts sheet, over the stage. */
 .nkd-ui-help { position: absolute; z-index: 4; overflow: auto; background: rgba(27,28,30,0.97); border-radius: 12px;
@@ -538,6 +542,13 @@ export type NkdSliderCfg = {
   /** Render the value beside the track. Give it units — a bare number next to a
    *  slider called "Feather" does not say pixels, and pixels is the question. */
   format?: (v: number) => string;
+  /** Value a double-click restores. Omit and double-click does nothing, rather
+   *  than guessing that the value it opened with was the default. */
+  def?: number;
+  /** Build it with the UI kit's look instead of the footer's. `"row"` is a sidebar-card
+   *  row (label · track · value; the track fills it and `width` is ignored). `"bar"` is an
+   *  inline group for a floating bar, where `width` is the track's. */
+  kit?: "row" | "bar";
 };
 
 export type NkdSlider = HTMLLabelElement & {
@@ -564,19 +575,20 @@ export type NkdSlider = HTMLLabelElement & {
 export function nkdSlider(label: string, cfg: NkdSliderCfg,
                           onInput: (v: number) => void, title?: string): NkdSlider {
   const wrap = document.createElement("label") as NkdSlider;
-  wrap.className = "nkd-modal-lbl";
+  const kit = !!cfg.kit;
+  wrap.className = cfg.kit === "row" ? "nkd-ui-row" : cfg.kit === "bar" ? "nkd-ui-barfield" : "nkd-modal-lbl";
   if (title) wrap.title = title;
 
   const rng = document.createElement("input");
   rng.type = "range";
-  rng.className = "nkd-modal-rng";
+  rng.className = kit ? "nkd-ui-range" : "nkd-modal-rng";
   rng.min = String(cfg.min); rng.max = String(cfg.max);
   rng.step = "any";                            // we quantize; the browser must not
   rng.value = String(cfg.value);
-  if (cfg.width) rng.style.width = `${cfg.width}px`;
+  if (cfg.width && cfg.kit !== "row") rng.style.width = `${cfg.width}px`;
 
   const out = cfg.format ? document.createElement("span") : null;
-  if (out) out.className = "nkd-modal-num";
+  if (out && !kit) out.className = "nkd-modal-num";
 
   const fine = cfg.fine ?? cfg.step / 10;
   const clamp = (v: number) => Math.max(cfg.min, Math.min(cfg.max, v));
@@ -586,7 +598,11 @@ export function nkdSlider(label: string, cfg: NkdSliderCfg,
     // leaves 0.30000000000000004 in a readout.
     return Math.round(Math.round(clamp(v) / q) * q * 1e6) / 1e6;
   };
-  const show = (v: number) => { if (out) out.textContent = cfg.format!(v); };
+  const show = (v: number) => {
+    if (out) out.textContent = cfg.format!(v);
+    // The kit track is filled up to the thumb.
+    if (kit) rng.style.setProperty("--nkd-pct", `${((v - cfg.min) / (cfg.max - cfg.min || 1)) * 100}%`);
+  };
   const apply = (v: number, soft: boolean) => {
     const q = quantize(v, soft);
     rng.value = String(q);
@@ -637,10 +653,19 @@ export function nkdSlider(label: string, cfg: NkdSliderCfg,
     apply(parseFloat(rng.value) + dir * q, e.shiftKey);
   });
 
+  // Double-click restores the default — the same gesture the pack's sliders in
+  // other packs use, driven from `def` rather than from a data attribute
+  // because here the caller is already handing us a config object.
+  rng.addEventListener("dblclick", (e) => {
+    if (cfg.def == null || rng.disabled) return;
+    e.preventDefault();
+    apply(cfg.def, false);
+  });
+
   // A span, not a bare text node, so callers can align a column of sliders
   // by giving every label the same width (see the face rig's panel).
   const txt = document.createElement("span");
-  txt.className = "nkd-modal-lbl-txt";
+  if (!kit) txt.className = "nkd-modal-lbl-txt";
   txt.textContent = label;
   wrap.append(txt, rng);
   if (out) wrap.appendChild(out);
