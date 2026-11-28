@@ -4639,7 +4639,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 <template>
   <!-- data-capture-wheel + focus: the frontend's own opt-out for Nodes 2.0, which otherwise sends
        every wheel over a node to the graph zoom (only while focus is inside the element). -->
-  <div class="nkd-p3d" :class="{ 'nkd-popped': popped }" tabindex="-1" data-capture-wheel="true"
+  <div class="nkd-p3d nkd-ui" :class="{ 'nkd-popped': popped }" tabindex="-1" data-capture-wheel="true"
        @pointerenter="claimWheel" @pointerleave="releaseWheel">
     <!-- Modal-first: every control lives in the viewer. On the node there is the live view, the
          button that opens the viewer and one status line — so the node's height is width × aspect
@@ -4881,7 +4881,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                      :text="roll.toFixed(1) + '°'" :reset-to="0" @input="applyRoll"
                      title="Camera roll (dutch angle), in degrees. Tilts the horizon; orbiting keeps it." />
         </template>
-        <button v-else class="nkd-open" @pointerdown.stop @click="emit('popout')"
+        <button v-else class="nkd-ui-pill" @pointerdown.stop @click="emit('popout')"
                 title="Open the viewer: every control lives there. Same scene, nothing reloads.">
           <i class="pi pi-window-maximize" /><span>Open Viewer</span>
         </button>
@@ -4891,7 +4891,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         <span v-if="status" class="nkd-status nkd-at-status">{{ status }}</span>
 
         <!-- Left: tools that act on the OBJECT. Top to bottom the first four follow the KEYS: Q W E R. -->
-        <div class="nkd-float nkd-col nkd-at-l" @pointerdown.stop>
+        <div class="nkd-ui-float col nkd-at-l" @pointerdown.stop>
           <button :class="{ on: gizmoSpace === 'local' }" @click="toggleGizmoSpace"
                   :title="(gizmoSpace === 'world'
                     ? 'Gizmo axes: WORLD — click for the object\'s own axes'
@@ -4905,7 +4905,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                   @click="toggleGizmoMode('rotate')"><i class="pi pi-refresh" /></button>
           <button :class="{ on: gizmoMode === 'scale' }" title="Scale gizmo — R"
                   @click="toggleGizmoMode('scale')"><i class="pi pi-arrow-up-right-and-arrow-down-left-from-center" /></button>
-          <span class="nkd-sep" />
+          <span class="nkd-ui-sep" />
           <button :class="{ on: maskPaint }" @click="toggleMaskPaint" :disabled="modelIsSplat"
                   title="Paint a 3D mask on the model: where an inpaint may touch. Left drag paints, Alt or right-drag erases, right drag orbits. Exported as paint_mask (this view) and mask3d (for the bake).">
             <i class="pi pi-pencil" />
@@ -4918,7 +4918,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                   title="Match perspective: click the model to pin a point and drag it to its place in the image. The object stays still and the camera moves. Shift drags finer, right-click on a pin deletes it, right-drag orbits. While there are pins a wired camera is only the starting point.">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M1 6h14M8 6 1 2M8 6 1 14M8 6l7-4M8 6l7 8" /><circle cx="8" cy="6" r="1.6" fill="currentColor" stroke="none" /></svg>
           </button>
-          <span class="nkd-sep" />
+          <span class="nkd-ui-sep" />
           <button @click="fitToGround"
                   title="Fit to ground: normalise the scale and drop the model's floor centre on the origin.">
             <i class="pi pi-home" />
@@ -4926,7 +4926,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         </div>
 
         <!-- The active tool's own options, next to the column that switched it on. -->
-        <div v-if="maskPaint || cropOn || pinMode" class="nkd-float nkd-at-bl" @pointerdown.stop>
+        <div v-if="maskPaint || cropOn || pinMode" class="nkd-ui-float nkd-at-bl" @pointerdown.stop>
           <template v-if="maskPaint">
             <label class="nkd-ghostfield" :title="`Brush radius: ${brushRadius}px`">Brush
               <input class="nkd-brush" type="range" min="4" max="200" step="1" v-model.number="brushRadius" />
@@ -4972,7 +4972,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
         </div>
 
         <!-- Right: what changes how the scene is SHOWN, and the saved viewpoints. -->
-        <div class="nkd-float nkd-col nkd-at-r" @pointerdown.stop>
+        <div class="nkd-ui-float col nkd-at-r" @pointerdown.stop>
           <button :class="{ on: showGrid }" @click="toggleGrid" title="Toggle grid"><i class="pi pi-th-large" /></button>
           <button :class="{ on: floorClip }" @click="setFloorClip(!floorClip); notifyStateChanged()"
                   :title="floorClip ? 'The floor hides what goes through it. Click to show the whole object.'
@@ -4985,7 +4985,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                     : 'Backdrop image hidden (viewport and export) — it still lights the model. Click to show it'">
             <i :class="showBg ? 'pi pi-image' : 'pi pi-eye-slash'" />
           </button>
-          <span class="nkd-sep" />
+          <span class="nkd-ui-sep" />
           <!-- Saved viewpoints. Working on a matched perspective and needing another angle to
                move something is the case this exists for: park the view, go, come back. -->
           <button v-for="(slot, i) in camSlots" :key="i" class="nkd-camslot" :class="{ on: !!slot }"
@@ -4993,7 +4993,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
                     ? `Camera ${i + 1} — click to go back to it, Shift+click to overwrite with the current view`
                     : `Camera ${i + 1} is empty — click to save the current view here`"
                   @click="$event.shiftKey ? saveCamSlot(i) : recallCamSlot(i)">{{ i + 1 }}</button>
-          <span class="nkd-sep" />
+          <span class="nkd-ui-sep" />
           <button :class="{ on: helpOpen }" @click="helpOpen = !helpOpen" title="Shortcuts — ?">
             <i class="pi pi-question" />
           </button>
@@ -5001,12 +5001,12 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 
         <!-- Bottom right: the camera. The lens stays typeable here — a ruler is for feel, and
              matching a plate shot on a 24mm wants the exact number. -->
-        <div class="nkd-float nkd-at-br" @pointerdown.stop>
+        <div class="nkd-ui-float nkd-at-br" @pointerdown.stop>
           <label class="nkd-barfield" title="Focal length in 35mm-equivalent mm. Drag to scrub, click to type.">
             <DragNumber :model-value="focal" :step="0.5" :min="2" :max="2000" :decimals="1"
                         :reset-to="defaultFocal" @update:model-value="setFocal" />mm
           </label>
-          <span class="nkd-sep" />
+          <span class="nkd-ui-sep" />
           <button :disabled="camLocked" @click="frameModel"
                   :title="camLocked ? 'Camera locked — unlock to reframe' : 'Frame model'">
             <i class="pi pi-expand" />
@@ -5020,13 +5020,13 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           </button>
         </div>
 
-        <div v-if="helpOpen" class="nkd-help" @pointerdown.stop @wheel.stop>
-          <div class="nkd-help-head"><b>Shortcuts</b>
+        <div v-if="helpOpen" class="nkd-ui-help nkd-help" @pointerdown.stop @wheel.stop>
+          <div class="nkd-ui-help-head"><b>Shortcuts</b>
             <span><kbd>?</kbd> or <kbd>Esc</kbd> to close</span></div>
-          <div class="nkd-help-cols">
+          <div class="nkd-ui-help-cols">
             <section v-for="[title, rows] in SHORTCUTS" :key="title">
               <h4>{{ title }}</h4>
-              <div v-for="[what, keys, note] in rows" :key="what" class="nkd-help-row">
+              <div v-for="[what, keys, note] in rows" :key="what" class="nkd-ui-help-row">
                 <span>{{ what }}</span>
                 <span class="nkd-help-keys">
                   <template v-for="(k, i) in keys" :key="k"><i v-if="i">+</i><kbd>{{ k }}</kbd></template>
@@ -5037,7 +5037,7 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
           </div>
         </div>
       </template>
-      <div v-else class="nkd-nodeline">
+      <div v-else class="nkd-ui-line">
         <span><i class="pi pi-camera" />{{ status || nodeLine }}</span>
         <b>{{ aspect.w }} × {{ aspect.h }}</b>
       </div>
@@ -5153,26 +5153,9 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-status { color: #ffd166; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* On the node: the pill over the picture's bottom centre, one status line under it. */
-.nkd-open {
-  position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); z-index: 3;
-  height: 30px; padding: 0 14px 0 11px; border: 0; border-radius: 999px;
-  background: rgba(26, 28, 34, 0.86); color: #e6eaf2; cursor: pointer; white-space: nowrap;
-  font: 600 12px/1 system-ui, sans-serif; display: inline-flex; align-items: center; gap: 7px;
-  transition: background-color 120ms;
-}
-.nkd-open:hover { background: rgba(58, 62, 74, 0.92); color: #fff; }
-.nkd-open .pi { font-size: 12px; }
 /* A narrow node keeps the button and drops its label. */
-@container (max-width: 190px) { .nkd-open { width: 30px; padding: 0; justify-content: center; } .nkd-open span { display: none; } }
+@container (max-width: 190px) { .nkd-ui-pill { width: 30px; padding: 0; justify-content: center; } .nkd-ui-pill span { display: none; } }
 .nkd-viewwrap { container-type: inline-size; }
-.nkd-nodeline {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto;
-  height: 26px; padding: 0 8px; background: #1a1c22; font: 11px/1 system-ui, sans-serif; color: #8a93a6;
-}
-.nkd-nodeline span { display: inline-flex; align-items: center; gap: 5px; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nkd-nodeline .pi { font-size: 11px; }
-.nkd-nodeline b { flex: none; color: #dcdce0; font-weight: 600; font-variant-numeric: tabular-nums; }
 
 /* ── Popped out: stage on the left, every panel as a card in the sidebar on the right ── */
 .nkd-popped {
@@ -5259,32 +5242,20 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-side .nkd-subhead:first-child { margin-top: 0; }
 
 /* Floating groups. */
-.nkd-float { position: absolute; z-index: 3; display: inline-flex; align-items: center; gap: 2px; padding: 5px;
-  background: rgba(26, 28, 34, 0.86); border-radius: 999px; }
-.nkd-float.nkd-col { flex-direction: column; border-radius: 20px; }
-.nkd-float button {
-  width: 30px; height: 30px; padding: 0; border: 0; border-radius: 999px; flex: 0 0 auto;
-  background: transparent; color: #c8d0e0; cursor: pointer; line-height: 1;
-  display: flex; align-items: center; justify-content: center; transition: background-color 120ms;
-}
-.nkd-float button .pi { font-size: 13px; line-height: 1; color: inherit; }
-.nkd-float button:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
-.nkd-float button.on { background: #4ab4ff; color: #0c0d10; }
-.nkd-float button:disabled { opacity: 0.3; cursor: not-allowed; background: transparent; color: #c8d0e0; }
+/* The floats, the pill, the status line and the shortcuts sheet are the shared kit's
+   (.nkd-ui-*, nkd_modal.ts). Only what is this viewer's own is styled here. */
 /* Slots carry a digit, not an icon. */
-.nkd-float button.nkd-camslot { font: 600 11px/1 system-ui, sans-serif; }
-.nkd-float button.nkd-camslot.on { background: rgba(74, 180, 255, 0.22); color: #4ab4ff; }
-.nkd-sep { width: 16px; height: 1px; background: rgba(255, 255, 255, 0.14); margin: 3px 0; flex: 0 0 auto; }
-.nkd-float:not(.nkd-col) .nkd-sep { width: 1px; height: 16px; margin: 0 3px; }
+.nkd-ui-float button.nkd-camslot { font: 600 11px/1 system-ui, sans-serif; }
+.nkd-ui-float button.nkd-camslot.on { background: rgba(74, 180, 255, 0.22); color: #4ab4ff; }
 .nkd-at-l { left: 14px; top: 50%; transform: translateY(-50%); }
 .nkd-at-r { right: 14px; top: 50%; transform: translateY(-50%); }
 .nkd-at-br { right: 14px; bottom: 14px; padding-left: 12px; }
 .nkd-at-bl { left: 14px; bottom: 14px; padding: 5px 8px; gap: 4px; }
 .nkd-at-status { position: absolute; left: 16px; top: 10px; right: 16px; font-size: 11px; }
-.nkd-float .nkd-barfield { color: #c8d0e0; font-size: 11px; }
-.nkd-float .nkd-barfield :deep(.nkd-drag) { background: transparent; border-color: transparent; color: #fff;
+.nkd-ui-float .nkd-barfield { color: #c8d0e0; font-size: 11px; }
+.nkd-ui-float .nkd-barfield :deep(.nkd-drag) { background: transparent; border-color: transparent; color: #fff;
   font-weight: 600; flex: 0 0 58px; width: 58px; }
-.nkd-float .nkd-barfield :deep(.nkd-drag:hover) { border-color: rgba(255, 255, 255, 0.25); }
+.nkd-ui-float .nkd-barfield :deep(.nkd-drag:hover) { border-color: rgba(255, 255, 255, 0.25); }
 
 /* The rulers ride on the frame's edges, in the stage margins. */
 .nkd-at-left { right: calc(100% + 14px); top: 50%; height: min(240px, calc(100% - 110px)); transform: translateY(-50%); }
@@ -5292,17 +5263,6 @@ defineExpose({ capture, loadScene, serialise, deserialise, cleanup, forceResize,
 .nkd-at-bottom { top: calc(100% + 10px); left: 50%; width: min(320px, calc(100% - 190px)); transform: translateX(-50%); }
 
 /* Shortcuts sheet: over the stage, the right column stays reachable to close it. */
-.nkd-help { position: absolute; z-index: 4; inset: 14px 66px 14px 14px; overflow: auto;
-  background: rgba(27, 28, 30, 0.97); border-radius: 12px; padding: 16px 20px;
-  color: #dcdce0; font: 12px/1.3 system-ui, sans-serif; }
-.nkd-help-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; color: #8e8f93; }
-.nkd-help-head b { color: #fff; font-size: 15px; font-weight: 600; }
-.nkd-help-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px 40px; }
-.nkd-help h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; color: #fff; }
-.nkd-help-row { display: flex; justify-content: space-between; align-items: center; gap: 12px;
-  padding: 6px 0; border-top: 1px solid #2a2b2d; }
-.nkd-help-keys { display: inline-flex; align-items: center; gap: 5px; color: #8e8f93; white-space: nowrap; }
+.nkd-help { inset: 14px 66px 14px 14px; }
 .nkd-help-keys i, .nkd-help-keys em { font-style: normal; }
-.nkd-help kbd { font: 600 11px/1 system-ui, sans-serif; color: #dcdce0; background: #2c2c2e;
-  border-radius: 5px; padding: 4px 7px; min-width: 22px; text-align: center; display: inline-block; }
 </style>

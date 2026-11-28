@@ -156,8 +156,10 @@ comfyApp.registerExtension({
         pop = nkdPopOut(modal, container, { placeholder: "Open in the editor — close it to come back" });
         // Light edits are live in the preview; this re-runs the node so the real output (and
         // everything downstream) matches what you see. Upstream stays cached.
-        modal.footerLeft.appendChild(nkdButton("Run node", () => { void queueNode(nodeRef, "NKD Relight"); },
-          "Queue this node now — lights are already live in the preview"));
+        const runBtn = nkdButton("Run node", () => { void queueNode(nodeRef, "NKD Relight"); },
+          "Queue this node now — lights are already live in the preview");
+        runBtn.classList.add("run");   // it queues the node: ComfyUI's Run yellow
+        modal.footerLeft.appendChild(runBtn);
         modal.addPrimary("Done");
         instance.setPopped(true);
       };
